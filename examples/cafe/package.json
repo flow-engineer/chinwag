@@ -1,0 +1,14 @@
+{
+  "name": "parley-example-cafe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pip, an ordering assistant for a café: Parley's first example agent.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/main.ts",
+    "typecheck": "../../node_modules/.bin/tsc --noEmit -p ."
+  }
+}

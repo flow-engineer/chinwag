@@ -1,0 +1,406 @@
+// Parley's own state in the database: who each person is and on which channels, every
+// conversation's history, the inbox of events not yet handled, background tools in flight,
+// scheduled messages and their runs, nudges, and what each person asked not to be messaged about.
+// The author's data never lives here. Every row carries the agent's id, so one database can hold
+// several agents.
+
+import type { Database, Row } from "./db.ts";
+import type { ChatMessage } from "./types.ts";
+
+const MIGRATIONS: string[] = [
+  `CREATE TABLE conversations (
+     agent_id TEXT NOT NULL, id TEXT NOT NULL, person_key TEXT NOT NULL, time_zone TEXT,
+     turn_open INTEGER NOT NULL DEFAULT 0, message_count INTEGER NOT NULL DEFAULT 0,
+     recent_channels TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL,
+     PRIMARY KEY (agent_id, id));
+   CREATE UNIQUE INDEX conversations_person ON conversations (agent_id, person_key);
+   CREATE TABLE identities (
+     agent_id TEXT NOT NULL, channel TEXT NOT NULL, address TEXT NOT NULL, conversation_id TEXT NOT NULL,
+     verified_by TEXT NOT NULL, last_message_at INTEGER,
+     PRIMARY KEY (agent_id, channel, address));
+   CREATE TABLE messages (
+     agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, seq INTEGER NOT NULL, entry TEXT NOT NULL, at INTEGER NOT NULL,
+     PRIMARY KEY (agent_id, conversation_id, seq));
+   CREATE TABLE inbox (
+     id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+     kind TEXT NOT NULL, payload TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL);
+   CREATE INDEX inbox_open ON inbox (agent_id, conversation_id, done);
+   CREATE TABLE background_tools (
+     agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, task_id TEXT NOT NULL, call_id TEXT NOT NULL,
+     tool TEXT NOT NULL, started_at INTEGER NOT NULL,
+     PRIMARY KEY (agent_id, conversation_id, task_id));
+   CREATE TABLE schedules (
+     agent_id TEXT NOT NULL, id TEXT NOT NULL, conversation_id TEXT NOT NULL, channel TEXT NOT NULL,
+     instruction TEXT NOT NULL, fixed_text INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL, rule TEXT NOT NULL,
+     time_zone TEXT NOT NULL, next_run_at INTEGER, run_count INTEGER NOT NULL DEFAULT 0, max_runs INTEGER,
+     ends_on TEXT, status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, origin TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY (agent_id, id));
+   CREATE INDEX schedules_due ON schedules (agent_id, status, next_run_at);
+   CREATE TABLE schedule_runs (
+     agent_id TEXT NOT NULL, id TEXT NOT NULL, schedule_id TEXT NOT NULL, due_at INTEGER NOT NULL,
+     ran_at INTEGER NOT NULL, outcome TEXT NOT NULL, reason TEXT,
+     PRIMARY KEY (agent_id, id));
+   CREATE TABLE nudges (
+     agent_id TEXT NOT NULL, id TEXT NOT NULL, conversation_id TEXT NOT NULL, channel TEXT NOT NULL,
+     body TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, idempotency_key TEXT, created_at INTEGER NOT NULL,
+     PRIMARY KEY (agent_id, id));
+   CREATE UNIQUE INDEX nudges_key ON nudges (agent_id, idempotency_key);
+   CREATE TABLE no_contact (
+     agent_id TEXT NOT NULL, id TEXT NOT NULL, conversation_id TEXT NOT NULL, rule TEXT NOT NULL,
+     until INTEGER, created_at INTEGER NOT NULL,
+     PRIMARY KEY (agent_id, id));`,
+];
+
+export interface ConversationRow {
+  id: string;
+  personKey: string;
+  timeZone: string | null;
+  turnOpen: boolean;
+  messageCount: number;
+  recentChannels: string[];
+}
+
+export interface IdentityRow {
+  channel: string;
+  address: string;
+  conversationId: string;
+  verifiedBy: string;
+  lastMessageAt: number | null;
+}
+
+export interface InboxRow {
+  id: number;
+  kind: "message" | "note" | "schedule" | "nudge";
+  payload: Record<string, unknown>;
+}
+
+export interface ScheduleRow {
+  id: string;
+  conversationId: string;
+  channel: string;
+  instruction: string;
+  fixedText: boolean;
+  mode: "message" | "check";
+  rule: Record<string, unknown>;
+  timeZone: string;
+  nextRunAt: number | null;
+  runCount: number;
+  maxRuns: number | null;
+  endsOn: string | null;
+  status: "active" | "done" | "cancelled";
+  version: number;
+  origin: "person" | "api";
+  createdAt: number;
+}
+
+export interface NudgeRow {
+  id: string;
+  conversationId: string;
+  channel: string;
+  body: Record<string, unknown>;
+  status: string;
+  reason: string | null;
+  idempotencyKey: string | null;
+}
+
+export interface NoContactRow {
+  id: string;
+  rule: string;
+  until: number | null;
+}
+
+const json = (value: unknown) => JSON.stringify(value);
+const parse = <T>(text: unknown, fallback: T): T => {
+  try {
+    return typeof text === "string" ? (JSON.parse(text) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+
+export class Store {
+  readonly db: Database;
+  readonly agentId: string;
+  private ready: Promise<void> | null = null;
+
+  constructor(db: Database, agentId: string) {
+    this.db = db;
+    this.agentId = agentId;
+  }
+
+  /** Creates or upgrades Parley's tables; safe to call any number of times. */
+  migrate(): Promise<void> {
+    this.ready ??= (async () => {
+      await this.db.run("CREATE TABLE IF NOT EXISTS parley_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+      const done = new Set((await this.db.query("SELECT version FROM parley_migrations")).map((r) => Number(r.version)));
+      for (const [i, sql] of MIGRATIONS.entries()) {
+        if (done.has(i + 1)) continue;
+        await this.db.transaction(async (tx) => {
+          for (const statement of sql.split(";").map((s) => s.trim()).filter(Boolean)) await tx.run(statement);
+          await tx.run("INSERT INTO parley_migrations (version, applied_at) VALUES (?, ?)", [i + 1, Date.now()]);
+        });
+      }
+    })();
+    return this.ready;
+  }
+
+  // People and their channels.
+
+  async identity(channel: string, address: string): Promise<IdentityRow | null> {
+    const [row] = await this.db.query("SELECT * FROM identities WHERE agent_id = ? AND channel = ? AND address = ?", [this.agentId, channel, address]);
+    return row ? identityOf(row) : null;
+  }
+
+  async identities(conversationId: string): Promise<IdentityRow[]> {
+    const rows = await this.db.query("SELECT * FROM identities WHERE agent_id = ? AND conversation_id = ?", [this.agentId, conversationId]);
+    return rows.map(identityOf);
+  }
+
+  async conversationByKey(personKey: string): Promise<ConversationRow | null> {
+    const [row] = await this.db.query("SELECT * FROM conversations WHERE agent_id = ? AND person_key = ?", [this.agentId, personKey]);
+    return row ? conversationOf(row) : null;
+  }
+
+  async conversation(id: string): Promise<ConversationRow | null> {
+    const [row] = await this.db.query("SELECT * FROM conversations WHERE agent_id = ? AND id = ?", [this.agentId, id]);
+    return row ? conversationOf(row) : null;
+  }
+
+  async allConversations(): Promise<ConversationRow[]> {
+    return (await this.db.query("SELECT * FROM conversations WHERE agent_id = ?", [this.agentId])).map(conversationOf);
+  }
+
+  async createConversation(id: string, personKey: string): Promise<void> {
+    await this.db.run("INSERT INTO conversations (agent_id, id, person_key, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, id, personKey, Date.now()]);
+  }
+
+  async addIdentity(conversationId: string, channel: string, address: string, verifiedBy: string): Promise<void> {
+    await this.db.run(
+      "INSERT INTO identities (agent_id, channel, address, conversation_id, verified_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+      [this.agentId, channel, address, conversationId, verifiedBy],
+    );
+  }
+
+  async touchIdentity(channel: string, address: string, at: number): Promise<void> {
+    await this.db.run("UPDATE identities SET last_message_at = ? WHERE agent_id = ? AND channel = ? AND address = ?", [at, this.agentId, channel, address]);
+  }
+
+  async updateConversation(id: string, fields: { turnOpen?: boolean; messageCount?: number; recentChannels?: string[]; timeZone?: string }): Promise<void> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (fields.turnOpen !== undefined) sets.push("turn_open = ?"), params.push(fields.turnOpen ? 1 : 0);
+    if (fields.messageCount !== undefined) sets.push("message_count = ?"), params.push(fields.messageCount);
+    if (fields.recentChannels !== undefined) sets.push("recent_channels = ?"), params.push(json(fields.recentChannels));
+    if (fields.timeZone !== undefined) sets.push("time_zone = ?"), params.push(fields.timeZone);
+    if (!sets.length) return;
+    await this.db.run(`UPDATE conversations SET ${sets.join(", ")} WHERE agent_id = ? AND id = ?`, [...params, this.agentId, id]);
+  }
+
+  // History.
+
+  async history(conversationId: string): Promise<ChatMessage[]> {
+    const rows = await this.db.query("SELECT entry FROM messages WHERE agent_id = ? AND conversation_id = ? ORDER BY seq", [this.agentId, conversationId]);
+    return rows.map((r) => parse<ChatMessage>(r.entry, { role: "user", content: "" }));
+  }
+
+  /** Appends history entries from `seq` on, and marks inbox rows handled, together. */
+  async appendHistory(conversationId: string, seq: number, entries: ChatMessage[], doneInbox: number[] = []): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      for (const [i, entry] of entries.entries()) {
+        await tx.run("INSERT INTO messages (agent_id, conversation_id, seq, entry, at) VALUES (?, ?, ?, ?, ?)", [this.agentId, conversationId, seq + i, json(entry), Date.now()]);
+      }
+      for (const id of doneInbox) await tx.run("UPDATE inbox SET done = 1 WHERE agent_id = ? AND id = ?", [this.agentId, id]);
+    });
+  }
+
+  // The inbox.
+
+  async addInbox(conversationId: string, kind: InboxRow["kind"], payload: Record<string, unknown>, db: Omit<Database, "transaction"> = this.db): Promise<number> {
+    const [row] = await db.query("INSERT INTO inbox (agent_id, conversation_id, kind, payload, at) VALUES (?, ?, ?, ?, ?) RETURNING id", [this.agentId, conversationId, kind, json(payload), Date.now()]);
+    return Number(row.id);
+  }
+
+  async openInbox(conversationId: string): Promise<InboxRow[]> {
+    const rows = await this.db.query("SELECT id, kind, payload FROM inbox WHERE agent_id = ? AND conversation_id = ? AND done = 0 ORDER BY id", [this.agentId, conversationId]);
+    return rows.map((r) => ({ id: Number(r.id), kind: r.kind as InboxRow["kind"], payload: parse(r.payload, {}) }));
+  }
+
+  async doneInbox(ids: number[]): Promise<void> {
+    for (const id of ids) await this.db.run("UPDATE inbox SET done = 1 WHERE agent_id = ? AND id = ?", [this.agentId, id]);
+  }
+
+  // Background tools.
+
+  async addTask(conversationId: string, taskId: string, callId: string, tool: string, startedAt: number): Promise<void> {
+    await this.db.run("INSERT INTO background_tools (agent_id, conversation_id, task_id, call_id, tool, started_at) VALUES (?, ?, ?, ?, ?, ?)", [this.agentId, conversationId, taskId, callId, tool, startedAt]);
+  }
+
+  async removeTask(conversationId: string, taskId: string): Promise<void> {
+    await this.db.run("DELETE FROM background_tools WHERE agent_id = ? AND conversation_id = ? AND task_id = ?", [this.agentId, conversationId, taskId]);
+  }
+
+  async tasks(conversationId: string): Promise<Array<{ taskId: string; tool: string; startedAt: number }>> {
+    const rows = await this.db.query("SELECT task_id, tool, started_at FROM background_tools WHERE agent_id = ? AND conversation_id = ?", [this.agentId, conversationId]);
+    return rows.map((r) => ({ taskId: String(r.task_id), tool: String(r.tool), startedAt: Number(r.started_at) }));
+  }
+
+  /** Conversations with something left to do after a restart. */
+  async unfinished(): Promise<string[]> {
+    const rows = await this.db.query(
+      `SELECT id FROM conversations WHERE agent_id = ? AND (turn_open = 1
+         OR id IN (SELECT conversation_id FROM inbox WHERE agent_id = ? AND done = 0)
+         OR id IN (SELECT conversation_id FROM background_tools WHERE agent_id = ?))`,
+      [this.agentId, this.agentId, this.agentId],
+    );
+    return rows.map((r) => String(r.id));
+  }
+
+  // Scheduled messages.
+
+  async addSchedule(s: Omit<ScheduleRow, "version" | "runCount" | "status" | "createdAt">): Promise<void> {
+    await this.db.run(
+      `INSERT INTO schedules (agent_id, id, conversation_id, channel, instruction, fixed_text, mode, rule, time_zone, next_run_at, max_runs, ends_on, status, origin, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+      [this.agentId, s.id, s.conversationId, s.channel, s.instruction, s.fixedText ? 1 : 0, s.mode, json(s.rule), s.timeZone, s.nextRunAt, s.maxRuns, s.endsOn, s.origin, Date.now()],
+    );
+  }
+
+  async schedules(conversationId: string): Promise<ScheduleRow[]> {
+    const rows = await this.db.query("SELECT * FROM schedules WHERE agent_id = ? AND conversation_id = ? AND status = 'active' ORDER BY next_run_at", [this.agentId, conversationId]);
+    return rows.map(scheduleOf);
+  }
+
+  async cancelSchedule(conversationId: string, id: string): Promise<boolean> {
+    const changed = await this.db.run("UPDATE schedules SET status = 'cancelled', version = version + 1 WHERE agent_id = ? AND conversation_id = ? AND id = ? AND status = 'active'", [this.agentId, conversationId, id]);
+    return changed > 0;
+  }
+
+  async dueSchedules(now: number, limit = 50): Promise<ScheduleRow[]> {
+    const rows = await this.db.query("SELECT * FROM schedules WHERE agent_id = ? AND status = 'active' AND next_run_at <= ? ORDER BY next_run_at LIMIT ?", [this.agentId, now, limit]);
+    return rows.map(scheduleOf);
+  }
+
+  /**
+   * Moves a due schedule on and records its run, in one transaction, only if no one else did first
+   * (the version must still match). A delivered run also gets its inbox row. Returns the inbox
+   * row's id, 0 for a run recorded without one, or null when another runner had it.
+   */
+  async claimRun(
+    s: ScheduleRow,
+    next: { nextRunAt: number | null; status: ScheduleRow["status"] },
+    run: { id: string; outcome: string; reason?: string; ranAt: number },
+    inbox?: Record<string, unknown>,
+  ): Promise<number | null> {
+    return this.db.transaction(async (tx) => {
+      const changed = await tx.run(
+        "UPDATE schedules SET next_run_at = ?, status = ?, run_count = run_count + 1, version = version + 1 WHERE agent_id = ? AND id = ? AND version = ?",
+        [next.nextRunAt, next.status, this.agentId, s.id, s.version],
+      );
+      if (!changed) return null;
+      await tx.run("INSERT INTO schedule_runs (agent_id, id, schedule_id, due_at, ran_at, outcome, reason) VALUES (?, ?, ?, ?, ?, ?, ?)", [this.agentId, run.id, s.id, s.nextRunAt, run.ranAt, run.outcome, run.reason ?? null]);
+      return inbox ? this.addInbox(s.conversationId, "schedule", inbox, tx) : 0;
+    });
+  }
+
+  async settleRun(id: string, outcome: string, reason?: string): Promise<void> {
+    await this.db.run("UPDATE schedule_runs SET outcome = ?, reason = ? WHERE agent_id = ? AND id = ?", [outcome, reason ?? null, this.agentId, id]);
+  }
+
+  async runs(scheduleId: string): Promise<Array<{ id: string; dueAt: number; outcome: string; reason: string | null }>> {
+    const rows = await this.db.query("SELECT * FROM schedule_runs WHERE agent_id = ? AND schedule_id = ? ORDER BY due_at", [this.agentId, scheduleId]);
+    return rows.map((r) => ({ id: String(r.id), dueAt: Number(r.due_at), outcome: String(r.outcome), reason: (r.reason as string | null) ?? null }));
+  }
+
+  // Nudges.
+
+  async nudgeByKey(key: string): Promise<NudgeRow | null> {
+    const [row] = await this.db.query("SELECT * FROM nudges WHERE agent_id = ? AND idempotency_key = ?", [this.agentId, key]);
+    return row ? nudgeOf(row) : null;
+  }
+
+  async nudge(id: string): Promise<NudgeRow | null> {
+    const [row] = await this.db.query("SELECT * FROM nudges WHERE agent_id = ? AND id = ?", [this.agentId, id]);
+    return row ? nudgeOf(row) : null;
+  }
+
+  /** Records a nudge and, unless it is already settled (refused), its inbox row, together. */
+  async addNudge(n: NudgeRow): Promise<number> {
+    return this.db.transaction(async (tx) => {
+      await tx.run(
+        "INSERT INTO nudges (agent_id, id, conversation_id, channel, body, status, reason, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [this.agentId, n.id, n.conversationId, n.channel, json(n.body), n.status, n.reason, n.idempotencyKey, Date.now()],
+      );
+      return n.status === "queued" ? this.addInbox(n.conversationId, "nudge", { nudge: n.id, channel: n.channel, ...n.body }, tx) : 0;
+    });
+  }
+
+  async settleNudge(id: string, status: string, reason?: string): Promise<void> {
+    await this.db.run("UPDATE nudges SET status = ?, reason = ? WHERE agent_id = ? AND id = ?", [status, reason ?? null, this.agentId, id]);
+  }
+
+  // What a person asked not to be messaged about.
+
+  async addNoContact(conversationId: string, id: string, rule: string, until: number | null): Promise<void> {
+    await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, created_at) VALUES (?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, Date.now()]);
+  }
+
+  async removeNoContact(conversationId: string, id: string): Promise<boolean> {
+    return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND id = ?", [this.agentId, conversationId, id])) > 0;
+  }
+
+  /** The rules still in force at `now` (a rule with an `until` in the past has ended). */
+  async noContact(conversationId: string, now: number): Promise<NoContactRow[]> {
+    const rows = await this.db.query("SELECT id, rule, until FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND (until IS NULL OR until > ?) ORDER BY created_at", [this.agentId, conversationId, now]);
+    return rows.map((r) => ({ id: String(r.id), rule: String(r.rule), until: num(r.until) }));
+  }
+}
+
+function conversationOf(r: Row): ConversationRow {
+  return {
+    id: String(r.id),
+    personKey: String(r.person_key),
+    timeZone: (r.time_zone as string | null) ?? null,
+    turnOpen: Number(r.turn_open) === 1,
+    messageCount: Number(r.message_count),
+    recentChannels: parse<string[]>(r.recent_channels, []),
+  };
+}
+
+function identityOf(r: Row): IdentityRow {
+  return { channel: String(r.channel), address: String(r.address), conversationId: String(r.conversation_id), verifiedBy: String(r.verified_by), lastMessageAt: num(r.last_message_at) };
+}
+
+function scheduleOf(r: Row): ScheduleRow {
+  return {
+    id: String(r.id),
+    conversationId: String(r.conversation_id),
+    channel: String(r.channel),
+    instruction: String(r.instruction),
+    fixedText: Number(r.fixed_text) === 1,
+    mode: r.mode as ScheduleRow["mode"],
+    rule: parse(r.rule, {}),
+    timeZone: String(r.time_zone),
+    nextRunAt: num(r.next_run_at),
+    runCount: Number(r.run_count),
+    maxRuns: num(r.max_runs),
+    endsOn: (r.ends_on as string | null) ?? null,
+    status: r.status as ScheduleRow["status"],
+    version: Number(r.version),
+    origin: r.origin as ScheduleRow["origin"],
+    createdAt: Number(r.created_at),
+  };
+}
+
+function nudgeOf(r: Row): NudgeRow {
+  return {
+    id: String(r.id),
+    conversationId: String(r.conversation_id),
+    channel: String(r.channel),
+    body: parse(r.body, {}),
+    status: String(r.status),
+    reason: (r.reason as string | null) ?? null,
+    idempotencyKey: (r.idempotency_key as string | null) ?? null,
+  };
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@parley/simulators",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chat platform simulators (SMS, WhatsApp, iMessage, Telegram, web) for Parley agents.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "../node_modules/.bin/tsc --noEmit -p ."
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@parley/testing",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Parley's test engine: specs, the cloud tunnel client, and (next) the simulated person, tools and judge.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "../node_modules/.bin/tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  }
+}

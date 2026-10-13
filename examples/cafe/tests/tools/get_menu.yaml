@@ -1,0 +1,14 @@
+tool: get_menu
+behaviour: |
+  Returns the whole menu every time. If the scenario's world says what is on the menu, answer
+  with that; otherwise use the menu below.
+responses:
+  - when: Always
+    latency_ms: 150
+    input: {}
+    output:
+      menu:
+        - { item: Latte, sizes: { small: 4.0, large: 4.8 }, milks: [whole, oat, almond], allergens: ["dairy (unless plant milk)"] }
+        - { item: Cold brew, sizes: { small: 4.5, large: 5.2 }, milks: [], allergens: [] }
+        - { item: Almond croissant, sizes: { one: 4.25 }, milks: [], allergens: [gluten, nuts, dairy, egg] }
+      note: This is the whole menu.

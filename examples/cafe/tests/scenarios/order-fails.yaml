@@ -1,0 +1,26 @@
+id: order-fails
+title: The point of sale is down when the order is placed
+channels: [sms]
+
+person:
+  persona: Jo, polite, a regular; writes full sentences.
+  goal: Order a small cold brew for pickup under the name Jo.
+  knows:
+    - Their name is Jo.
+
+opening:
+  - say: "Hi, could I order a small cold brew for pickup please? Name's Jo."
+
+world: |
+  The menu is as in tests/tools/get_menu.yaml. The café's point of sale is down this morning and
+  stays down for the whole conversation.
+
+max_turns: 6
+
+expect:
+  outcome:
+    - No order is placed.
+  judge:
+    - Jo is told plainly that the order could not go through, without technical detail.
+    - The agent does not claim the order was placed.
+    - Jo is offered a way forward (try again shortly, or order at the counter).

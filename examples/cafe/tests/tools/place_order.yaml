@@ -1,0 +1,29 @@
+# Everything place_order can do, for the tool simulator. During a test no real tool runs: a model
+# plays the tool. On each call it reads the scenario's world and picks the response (and how long
+# the call takes) that fits, from the kinds below. Scenarios never set responses or latencies;
+# they describe the situation ("the point of sale is slow this morning") and the simulator plays
+# it, possibly differently on each call, as a real system would.
+#
+#   behaviour    what the tool does, in plain words, beyond its description
+#   responses    the kinds of response it gives, each with an example and how long it takes
+#                (recorded from real calls once observability records them; by hand until then)
+tool: place_order
+behaviour: |
+  Order numbers are BL- followed by four digits and go up by one per order. ready_by is about
+  ten minutes after the order is placed. Fails if an item, size or milk is not on the menu.
+responses:
+  - when: The order goes through (usual)
+    latency_ms: 4800
+    input:
+      name: Sam
+      items: [{ item: Latte, size: large, milk: oat, quantity: 1 }]
+    output: { order_id: BL-1040, ready_by: "2026-10-11T15:42:00Z", pay_at_pickup: true }
+  - when: The point of sale is busy; the order still goes through
+    latency_ms: 11000
+    output: { order_id: BL-1041, ready_by: "2026-10-11T15:55:00Z", pay_at_pickup: true }
+  - when: The point of sale is down
+    latency_ms: 3000
+    error: Point of sale unavailable
+  - when: Something in the order is not on the menu
+    latency_ms: 600
+    error: "Unknown item: Matcha latte"

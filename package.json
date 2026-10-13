@@ -1,0 +1,26 @@
+{
+  "name": "parley",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An open-source runtime for chat agents that feel like a person texting back.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:changed": "node scripts/test-changed.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "openai": "^7.32.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}

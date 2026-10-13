@@ -1,0 +1,30 @@
+# A spec: one situation to put the agent in, and what has to be true at the end.
+id: latte-correction
+title: Orders a latte, corrects the milk mid-thought, confirms
+channels: [whatsapp]         # each platform it runs on, with that simulator's rules
+
+person:                      # played by a model that sees only what a person would see
+  persona: Sam, in a hurry on the way to work; types in short bursts, no capitals.
+  goal: Get a large oat latte for pickup, under the name Sam.
+  knows:                     # told only if the agent asks
+    - Their name is Sam.
+
+opening:                     # the first messages, sent exactly like this; then the person plays on
+  - say: "can i get a large latte"
+  - say: "oat milk actually"
+    after_ms: 1200
+
+world: |                     # what is true in this test; the tool simulator plays the tools from it
+  The menu is as in tests/tools/get_menu.yaml. Oat milk is in stock. The café is busy this
+  morning, so the point of sale is slow to take orders, but they go through.
+
+max_turns: 8
+
+expect:
+  outcome:                   # judged against what the tools did (the simulator's log)
+    - Exactly one order is placed, for one large latte with oat milk, under the name Sam.
+  judge:                     # read by the judge from the transcript, each pass or fail with a reason
+    - The order read back to Sam uses oat milk, not whole milk.
+    - The agent asks Sam to confirm before placing the order.
+    - Sam is told the order number and when it will be ready.
+    - Prices match the menu.

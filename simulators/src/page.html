@@ -1,0 +1,792 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}} · Parley playground</title>
+<style>
+  :root {
+    --bg: #f4f4f1; --panel: #ffffff; --ink: #1c1c1a; --quiet: #6b6b66; --line: #e2e1dc; --accent: #2f6fed;
+    --good: #2e8b57; --warn: #b7791f; --fold: #8a5cf6; --bad: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --quiet: #9a9a94; --line: #33332f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--ink); }
+  button { font: inherit; }
+  .top { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  .top h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .top h1 small { color: var(--quiet); font-weight: 400; }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+  .tab { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--ink); cursor: pointer; }
+  .tab img { width: 16px; height: 16px; }
+  .tab small { color: var(--quiet); font-size: 11px; }
+  .tab[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .spacer { flex: 1; }
+  .ghost { padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); cursor: pointer; }
+  main { display: grid; grid-template-columns: minmax(0, 400px) minmax(0, 1fr); gap: 16px; padding: 16px; height: calc(100vh - 58px); }
+  @media (max-width: 820px) { main { grid-template-columns: 1fr; height: auto; } .side { height: 520px; } .phone { height: 680px; } }
+
+  /* The phone */
+  .phone { border-radius: 28px; overflow: hidden; display: flex; flex-direction: column; min-height: 0; border: 1px solid var(--line); box-shadow: 0 2px 10px rgba(0,0,0,.06); position: relative; }
+  .bar { display: flex; align-items: center; gap: 10px; padding: 12px 14px; }
+  .avatar { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-weight: 600; flex: none; }
+  .who { display: flex; flex-direction: column; min-width: 0; }
+  .who b { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .who span { font-size: 12.5px; opacity: .85; }
+  .thread { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+  .row { display: flex; flex-direction: column; max-width: 80%; position: relative; margin-top: 4px; }
+  .row.me { align-self: flex-end; align-items: flex-end; }
+  .row.them { align-self: flex-start; align-items: flex-start; }
+  .bubble { padding: 6px 9px 6px 10px; border-radius: 18px; white-space: pre-wrap; word-wrap: break-word; position: relative; min-width: 48px; }
+  .quote { border-left: 4px solid; border-radius: 6px; padding: 4px 8px; margin: 0 0 4px; font-size: 12.5px; background: rgba(0,0,0,.05); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+  .quote b { display: block; font-size: 12px; }
+  .stamp { float: right; margin: 6px 0 -4px 10px; font-size: 11px; opacity: .6; white-space: nowrap; }
+  .ticks { font-size: 12px; letter-spacing: -3px; margin-left: 3px; }
+  .ticks.read { color: #53bdeb; opacity: 1; }
+  .meta { font-size: 10.5px; opacity: .65; margin: 2px 6px 0; }
+  .meta.carrier { font-style: italic; }
+  .reacts { display: flex; gap: 2px; margin-top: -6px; margin-bottom: 2px; z-index: 1; }
+  .react { background: #fff; border-radius: 999px; padding: 0 5px; font-size: 13px; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .actions { position: absolute; top: 2px; display: none; gap: 2px; z-index: 2; }
+  .row.them .actions { right: -64px; } .row.me .actions { left: -64px; }
+  .row:hover .actions, .row:focus-within .actions { display: flex; }
+  .actions button { border: 0; background: rgba(0,0,0,.08); border-radius: 999px; width: 28px; height: 28px; cursor: pointer; font-size: 14px; color: #333; }
+  .picker { position: absolute; bottom: 100%; display: flex; gap: 2px; background: #fff; padding: 4px 6px; border-radius: 999px; box-shadow: 0 2px 10px rgba(0,0,0,.2); z-index: 3; }
+  .row.them .picker { left: 0; } .row.me .picker { right: 0; }
+  .picker button { border: 0; background: none; font-size: 20px; cursor: pointer; padding: 2px; color: #111; }
+  .picker button.word { font-size: 12px; padding: 4px 6px; border-radius: 999px; background: #f2f2f7; margin: 0 1px; }
+  .btns { display: flex; flex-direction: column; gap: 2px; margin-top: 2px; width: 100%; min-width: 220px; }
+  .fields { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+  .fields span { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px dashed currentColor; opacity: .75; }
+  .btns button { border: 0; padding: 8px; cursor: pointer; text-align: center; }
+  /* A link in a custom UI's params, as that UI would show it (the agent's card rules). */
+  .linkcard { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; min-width: 220px; max-width: 280px; padding: 10px 12px; border-radius: 14px; border: 1px solid rgba(0,0,0,.1); background: #fff; color: #111; text-align: left; cursor: pointer; }
+  .linkcard b { font-size: 14px; color: #2f6fed; }
+  .linkcard.call b { color: #1e8e3e; }
+  .linkcard small { font-size: 11px; color: #6b6b66; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .screen { position: absolute; inset: 0; z-index: 6; display: none; flex-direction: column; background: #fff; color: #111; }
+  .screen.on { display: flex; }
+  .screen .s-bar { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid #eee; }
+  .screen .s-bar button { border: 0; background: none; font-size: 18px; cursor: pointer; }
+  .screen .s-body { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 20px; text-align: center; }
+  .screen code { font-size: 12px; word-break: break-all; color: #6b6b66; }
+  .screen.call { background: #1f2a24; color: #fff; }
+  .screen.call .s-bar { border-color: rgba(255,255,255,.1); } .screen.call .s-bar button { color: #fff; }
+  .screen.call .face { width: 96px; height: 96px; border-radius: 50%; background: #3c5a4a; display: grid; place-items: center; font-size: 40px; }
+  .screen.call code { color: #b9c9bf; }
+  .screen .end { border: 0; border-radius: 999px; padding: 12px 28px; background: #d93025; color: #fff; cursor: pointer; font-size: 15px; }
+  /* Debug mode: the agent's tool calls, inline where they happened; never shown otherwise. */
+  .toolcall { align-self: center; width: 92%; margin: 6px 0; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,.92); color: #333; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; box-shadow: 0 0 0 1px rgba(0,0,0,.08); }
+  body:not(.debug) .toolcall { display: none; }
+  .toolcall .tc-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .toolcall .tc-head b { font-weight: 600; }
+  .toolcall .st { color: #6b6b66; }
+  .toolcall .st.bg { color: #8a6d1f; } .toolcall .st.bad { color: #a33; }
+  .toolcall details { margin-top: 4px; } .toolcall summary { cursor: pointer; color: #6b6b66; }
+  .toolcall pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; background: #f6f6f4; padding: 6px 8px; border-radius: 6px; }
+  .toolcall ul { margin: 4px 0 0; padding-left: 16px; }
+  /* Embedded (a dashboard shows just the phone) and replay (a saved conversation, read only). */
+  .embed .top, .embed .side { display: none; }
+  .embed main { grid-template-columns: 1fr; height: 100vh; padding: 0; }
+  .embed .phone { border-radius: 0; border: 0; box-shadow: none; height: 100vh; }
+  .replay .compose, .replay .replying, .replay #reset { display: none; }
+  .ghost[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .sysnote { align-self: center; font-size: 11.5px; padding: 4px 10px; border-radius: 8px; margin: 6px 0; max-width: 90%; text-align: center; }
+  .sysnote.bad { background: #fdecea; color: var(--bad); }
+  .dots { display: inline-flex; gap: 4px; padding: 10px 12px; border-radius: 18px; align-self: flex-start; align-items: center; margin-top: 4px; }
+  .dots i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .4; animation: blink 1.2s infinite; }
+  .dots i:nth-child(2) { animation-delay: .2s; } .dots i:nth-child(3) { animation-delay: .4s; }
+  .dots .status { font-size: 12.5px; margin-left: 6px; opacity: .85; }
+  @keyframes blink { 0%, 60%, 100% { opacity: .25; } 30% { opacity: .9; } }
+  .replying { display: none; margin: 0 10px; padding: 6px 8px; border-left: 4px solid; border-radius: 6px; font-size: 12.5px; position: relative; }
+  .replying.on { display: block; }
+  .replying button { position: absolute; right: 4px; top: 2px; border: 0; background: none; cursor: pointer; font-size: 14px; }
+  .compose { display: flex; gap: 8px; padding: 8px 10px 10px; align-items: center; }
+  .compose input { flex: 1; padding: 9px 14px; border-radius: 999px; border: 1px solid rgba(0,0,0,.12); font: inherit; outline: none; background: #fff; color: #111; min-width: 0; }
+  .compose button { border: 0; border-radius: 999px; width: 38px; height: 38px; font-size: 16px; cursor: pointer; color: #fff; flex: none; }
+  .counter { font-size: 11px; opacity: .6; min-width: 44px; text-align: right; }
+  .sheet { position: absolute; inset: auto 0 0 0; background: #fff; color: #111; border-radius: 16px 16px 0 0; box-shadow: 0 -4px 20px rgba(0,0,0,.2); padding: 8px 0 12px; display: none; max-height: 70%; overflow-y: auto; z-index: 5; }
+  .sheet.on { display: block; }
+  .sheet h3 { margin: 4px 16px 8px; font-size: 15px; text-align: center; }
+  .sheet label { display: flex; gap: 10px; align-items: center; padding: 10px 16px; border-top: 1px solid #f0f0f0; cursor: pointer; }
+  .sheet label small { display: block; color: #667781; }
+  .sheet .send { display: block; margin: 10px auto 0; border: 0; border-radius: 999px; padding: 10px 24px; background: #00a884; color: #fff; cursor: pointer; }
+
+  /* SMS (Android Messages) */
+  .p-sms { background: #fff; color: #111; }
+  .p-sms .bar { background: #fff; border-bottom: 1px solid #eee; }
+  .p-sms .avatar { background: #e8def8; color: #4a3c75; }
+  .p-sms .me .bubble { background: #d3e3fd; color: #041e49; }
+  .p-sms .them .bubble { background: #f1f3f4; color: #111; }
+  .p-sms .compose button { background: #0b57d0; }
+  .p-sms .sysnote:not(.bad) { color: #5f6368; }
+
+  /* WhatsApp */
+  .p-whatsapp { background: #efeae2; color: #111; }
+  .p-whatsapp .bar { background: #008069; color: #fff; }
+  .p-whatsapp .avatar { background: #dfe5e7; color: #54656f; }
+  .p-whatsapp .bubble { border-radius: 8px; box-shadow: 0 1px .5px rgba(11,20,26,.13); }
+  .p-whatsapp .me .bubble { background: #d9fdd3; }
+  .p-whatsapp .them .bubble { background: #fff; }
+  .p-whatsapp .quote { border-color: #06cf9c; }
+  .p-whatsapp .quote b { color: #06cf9c; }
+  .p-whatsapp .them .quote { border-color: #53bdeb; } .p-whatsapp .them .quote b { color: #027eb5; }
+  .p-whatsapp .btns button { background: #fff; color: #027eb5; border-radius: 8px; box-shadow: 0 1px .5px rgba(11,20,26,.13); }
+  .p-whatsapp .sysnote:not(.bad) { background: #fff7d6; color: #54656f; }
+  .p-whatsapp .replying { background: #f0f2f5; border-color: #06cf9c; color: #54656f; }
+  .p-whatsapp .compose { background: #f0f2f5; }
+  .p-whatsapp .compose button { background: #00a884; }
+
+  /* Not yet modelled in full */
+  .p-imessage { background: #fff; color: #111; }
+  .p-imessage .bar { background: #f6f6f6; border-bottom: 1px solid #e5e5e5; flex-direction: column; gap: 2px; }
+  .p-imessage .bar .who { align-items: center; }
+  .p-imessage .avatar { background: linear-gradient(#a5abb8, #858994); color: #fff; }
+  .p-imessage .me .bubble { background: #0a84ff; color: #fff; }
+  .p-imessage .them .bubble { background: #e9e9eb; color: #111; }
+  .p-imessage .dots { background: #e9e9eb; color: #555; }
+  .p-imessage .compose button { background: #0a84ff; }
+  .p-telegram { background: #c8dcea; color: #111; }
+  .p-telegram .bar { background: #fff; border-bottom: 1px solid #ddd; }
+  .p-telegram .avatar { background: #3390ec; color: #fff; }
+  .p-telegram .bubble { border-radius: 14px; }
+  .p-telegram .me .bubble { background: #e3fee0; }
+  .p-telegram .them .bubble { background: #fff; }
+  .p-telegram .compose { background: #fff; }
+  .p-telegram .compose button { background: #3390ec; }
+  .p-web { background: #fafaf8; color: #111; }
+  .p-web .bar { background: #fff; border-bottom: 1px solid #eee; }
+  .p-web .avatar { background: #2f6fed; color: #fff; }
+  .p-web .me .bubble { background: #2f6fed; color: #fff; }
+  .p-web .them .bubble { background: #ecebe6; color: #111; }
+  .p-web .dots { background: #ecebe6; color: #444; }
+  .p-web .compose button { background: #2f6fed; }
+
+  /* Side panel */
+  .side { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 16px; min-height: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
+  .card h2 { font-size: 13px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
+  .card h2 span { font-weight: 400; color: var(--quiet); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--quiet); font-weight: 500; }
+  td.msg { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+  .metrics { max-height: 220px; overflow-y: auto; }
+  .log { flex: 1; overflow-y: auto; padding: 6px 14px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .log div { display: grid; grid-template-columns: 70px 1fr; gap: 8px; border-bottom: 1px dashed var(--line); padding: 2px 0; }
+  .log .t { color: var(--quiet); }
+  .tag { font-weight: 600; } .tag.inline { color: var(--good); } .tag.bg { color: var(--warn); } .tag.fold, .tag.ack { color: var(--fold); } .tag.bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>{{title}} <small>· Parley playground</small></h1>
+  <div class="tabs" id="tabs" role="group" aria-label="Platform"></div>
+  <div class="spacer"></div>
+  <button class="ghost" id="debug" type="button" aria-pressed="false" title="Show the agent's tool calls in the conversation">Debug</button>
+  <button class="ghost" id="reset" type="button">New conversation</button>
+</div>
+<main>
+  <section class="phone" id="phone" aria-label="Simulator">
+    <div class="bar" id="bar">
+      <div class="avatar" id="avatar"></div>
+      <div class="who"><b id="name">{{title}}</b><span id="sub"></span></div>
+    </div>
+    <div class="thread" id="thread" aria-live="polite"></div>
+    <div class="replying" id="replying"><b>Replying to</b><div id="replyingText"></div><button type="button" id="cancelReply" aria-label="Cancel reply">✕</button></div>
+    <form class="compose" id="form">
+      <input id="text" autocomplete="off" placeholder="Message" aria-label="Message">
+      <span class="counter" id="counter"></span>
+      <button type="submit" aria-label="Send">➤</button>
+    </form>
+    <div class="sheet" id="sheet" role="dialog" aria-label="Choose an option"></div>
+    <div class="screen" id="screen" role="dialog" aria-label="Opened link"></div>
+  </section>
+  <div class="side">
+    <section class="card">
+      <h2>Per turn <span id="status"></span></h2>
+      <div class="metrics">
+        <table>
+          <thead><tr><th>You sent</th><th>Acknowledged</th><th>Last message</th><th>Model calls</th></tr></thead>
+          <tbody id="turns"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Trace</h2>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+</main>
+<script>
+  const BOOT = "{{boot}}";
+  // Where the simulators are mounted ("" on their own port, "/simulator" inside the test cloud).
+  const BASE = "{{base}}";
+  const params = new URLSearchParams(location.search);
+  // ?replay=<url of a saved run> shows that conversation read only; ?embed=1 shows only the phone.
+  const REPLAY = params.get("replay");
+  let replayData = null;
+  if (REPLAY) document.body.classList.add("replay");
+  if (params.get("embed") === "1") document.body.classList.add("embed");
+  const person = params.get("person") || "demo";
+  let title = document.getElementById("name").textContent;
+  const $ = (id) => document.getElementById(id);
+  const TAPBACKS = [["❤️", "Loved"], ["👍", "Liked"], ["👎", "Disliked"], ["😂", "Laughed at"], ["‼️", "Emphasized"], ["❓", "Questioned"]];
+  let platforms = [];
+  let cards = [];
+  let current = null;
+  let source = null;
+  let typingEl = null;
+  let statusText = null;
+  let turns = [];
+  let replyTo = null;      // { id, text, fromAgent }
+  const rows = new Map();  // message id → row element
+
+  const query = () => `?platform=${current.id}&person=${encodeURIComponent(person)}`;
+  const fmt = (ms) => ms == null ? "…" : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+  const clock = (at) => new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const subtitle = () => ({ sms: person, whatsapp: "online", imessage: "iMessage", telegram: "bot", web: "Usually replies instantly" })[current.id];
+
+  // WhatsApp's own formatting: *bold*, _italic_, ~strike~, ```mono```.
+  function whatsappHtml(text) {
+    const esc = text.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    return esc
+      .replace(/```([\s\S]+?)```/g, "<code>$1</code>")
+      .replace(/(^|[\s(])\*(\S(?:[^*\n]*\S)?)\*(?=[\s).,!?:;]|$)/g, "$1<b>$2</b>")
+      .replace(/(^|[\s(])_(\S(?:[^_\n]*\S)?)_(?=[\s).,!?:;]|$)/g, "$1<i>$2</i>")
+      .replace(/(^|[\s(])~(\S(?:[^~\n]*\S)?)~(?=[\s).,!?:;]|$)/g, "$1<s>$2</s>");
+  }
+
+  function setPlatform(id) {
+    current = platforms.find((p) => p.id === id) || platforms[0];
+    if (!REPLAY && !params.has("embed")) { try { localStorage.setItem("parley.platform", current.id); } catch {} }
+    for (const b of document.querySelectorAll(".tab")) b.setAttribute("aria-pressed", String(b.dataset.id === current.id));
+    $("phone").className = "phone p-" + current.id;
+    $("avatar").textContent = title.trim().charAt(0).toUpperCase();
+    $("sub").textContent = subtitle();
+    $("thread").innerHTML = "";
+    $("log").innerHTML = "";
+    rows.clear();
+    turns = [];
+    renderTurns();
+    typingEl = null;
+    statusText = null;
+    setReply(null);
+    $("sheet").classList.remove("on");
+    $("text").placeholder = current.id === "sms" ? "Text message" : "Message";
+    updateCounter();
+    if (!current.complete) sysnote("This simulator doesn't model every feature of the real platform yet.");
+    connect();
+  }
+
+  function sysnote(text, bad) {
+    const el = document.createElement("div");
+    el.className = "sysnote" + (bad ? " bad" : "");
+    el.textContent = text;
+    insert(el);
+  }
+
+  function insert(el) {
+    const thread = $("thread");
+    thread.insertBefore(el, typingEl && typingEl.isConnected ? typingEl : null);
+    thread.scrollTop = thread.scrollHeight;
+  }
+
+  function quoteEl(id) {
+    const target = rows.get(id);
+    if (!target) return null;
+    const q = document.createElement("div");
+    q.className = "quote";
+    const who = document.createElement("b");
+    who.textContent = target.classList.contains("me") ? "You" : title;
+    q.append(who, document.createTextNode(target.dataset.text));
+    return q;
+  }
+
+  function addMessage(line) {
+    const mine = line.kind === "in";
+    const row = document.createElement("div");
+    row.className = "row " + (mine ? "me" : "them");
+    row.dataset.text = line.text;
+    row.dataset.at = String(line.at);
+    if (line.id) { row.dataset.id = line.id; rows.set(line.id, row); }
+    const b = document.createElement("div");
+    b.className = "bubble";
+    if (line.replyTo) { const q = quoteEl(line.replyTo); if (q) b.appendChild(q); }
+    const body = document.createElement("span");
+    if (current.formatting === "whatsapp") body.innerHTML = whatsappHtml(line.text);
+    else body.textContent = line.text;
+    b.appendChild(body);
+    if (current.id === "whatsapp") {
+      const stamp = document.createElement("span");
+      stamp.className = "stamp";
+      stamp.textContent = clock(line.at);
+      if (mine) { const t = document.createElement("span"); t.className = "ticks"; t.textContent = line.id ? "✓✓" : "✓"; stamp.appendChild(t); }
+      b.appendChild(stamp);
+    }
+    row.appendChild(b);
+    if (line.buttons) {
+      const btns = document.createElement("div");
+      btns.className = "btns";
+      for (const label of line.buttons) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = "↩ " + label;
+        btn.addEventListener("click", () => send(label, { choice: { title: label }, replyTo: line.id }));
+        btns.appendChild(btn);
+      }
+      row.appendChild(btns);
+    }
+    if (line.list) {
+      const btns = document.createElement("div");
+      btns.className = "btns";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "☰ " + line.list.button;
+      btn.addEventListener("click", () => openList(line));
+      btns.appendChild(btn);
+      row.appendChild(btns);
+    }
+    if (line.fields) {
+      // The channel's own params: a link shows as the app would show it (a card), anything else as a chip.
+      const fields = document.createElement("div");
+      fields.className = "fields";
+      for (const [name, value] of Object.entries(line.fields)) {
+        const url = typeof value === "string" ? value : value && typeof value.url === "string" ? value.url : null;
+        if (url && /^[a-z][a-z0-9+.-]*:/i.test(url)) { row.appendChild(linkCard(name, url)); continue; }
+        const chip = document.createElement("span");
+        const shown = value && typeof value === "object" ? (value.screen ?? value.url ?? JSON.stringify(value)) : String(value);
+        chip.textContent = `→ ${name}: ${shown}`;
+        chip.title = JSON.stringify(value);
+        fields.appendChild(chip);
+      }
+      if (fields.children.length) row.appendChild(fields);
+    }
+    const reacts = document.createElement("div");
+    reacts.className = "reacts";
+    row.appendChild(reacts);
+    if (current.id !== "whatsapp") {
+      const meta = document.createElement("div");
+      meta.className = "meta" + (line.carrier ? " carrier" : "");
+      let text = clock(line.at);
+      if (line.sms && (line.sms.segments > 1 || line.sms.encoding === "Unicode")) text += ` · ${line.sms.segments} segment${line.sms.segments > 1 ? "s" : ""}, ${line.sms.encoding}`;
+      if (line.carrier) text += " · sent by the carrier";
+      meta.textContent = text;
+      row.appendChild(meta);
+    }
+    addActions(row, line);
+    insert(row);
+  }
+
+  function linkCard(name, url) {
+    const rule = cards.find((c) => url.includes(c.match)) || { label: "Open in app", kind: "page" };
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "linkcard" + (rule.kind === "call" ? " call" : "");
+    card.title = `${name}: ${url}`;
+    const label = document.createElement("b");
+    label.textContent = (rule.kind === "call" ? "📹 " : "") + rule.label + " ›";
+    const small = document.createElement("small");
+    small.textContent = `${name} · ${url}`;
+    card.append(label, small);
+    card.addEventListener("click", () => openScreen(rule, url));
+    return card;
+  }
+
+  // What opening a link shows. Nothing is really opened: this is the app's own screen, played.
+  function openScreen(rule, url) {
+    const screen = $("screen");
+    screen.innerHTML = "";
+    screen.className = "screen on" + (rule.kind === "call" ? " call" : "");
+    const bar = document.createElement("div");
+    bar.className = "s-bar";
+    const back = document.createElement("button");
+    back.type = "button"; back.textContent = "‹"; back.setAttribute("aria-label", "Back");
+    const name = document.createElement("b");
+    name.textContent = rule.label;
+    bar.append(back, name);
+    const body = document.createElement("div");
+    body.className = "s-body";
+    const close = () => { clearInterval(timer); screen.className = "screen"; };
+    let timer = null;
+    if (rule.kind === "call") {
+      const face = document.createElement("div");
+      face.className = "face"; face.textContent = "👩‍⚕️";
+      const state = document.createElement("div");
+      state.textContent = "Connecting…";
+      const started = Date.now();
+      timer = setInterval(() => {
+        const s = Math.floor((Date.now() - started) / 1000);
+        state.textContent = s < 2 ? "Connecting…" : `In call · ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+      }, 500);
+      const end = document.createElement("button");
+      end.type = "button"; end.className = "end"; end.textContent = "End call";
+      end.addEventListener("click", close);
+      body.append(face, state, end);
+    } else {
+      const text = document.createElement("div");
+      text.textContent = `The app opens this screen.`;
+      body.appendChild(text);
+    }
+    const code = document.createElement("code");
+    code.textContent = url;
+    body.appendChild(code);
+    back.addEventListener("click", close);
+    screen.append(bar, body);
+  }
+
+  function addActions(row, line) {
+    const mine = line.kind === "in";
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    if (current.replies && line.id) {
+      const reply = document.createElement("button");
+      reply.type = "button"; reply.title = "Reply"; reply.textContent = "↩";
+      reply.addEventListener("click", () => setReply({ id: line.id, text: line.text, fromAgent: !mine }));
+      actions.appendChild(reply);
+    }
+    if (!mine && current.personReactions && line.id) {
+      const react = document.createElement("button");
+      react.type = "button"; react.title = "React"; react.textContent = "☺";
+      react.addEventListener("click", () => togglePicker(row, current.personReactions.map((e) => [e, e]), (emoji) => {
+        fetch(BASE + "/api/reactions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ platform: current.id, person, messageId: line.id, emoji }) });
+      }));
+      actions.appendChild(react);
+    }
+    if (!mine && current.tapbacksAsText) {
+      const tap = document.createElement("button");
+      tap.type = "button"; tap.title = "Tapback from an iPhone (arrives as a text)"; tap.textContent = "❤︎";
+      tap.addEventListener("click", () => togglePicker(row, TAPBACKS, (_e, word) => send(`${word} “${line.text}”`), true));
+      actions.appendChild(tap);
+    }
+    if (actions.children.length) row.appendChild(actions);
+  }
+
+  function togglePicker(row, options, pick, words) {
+    const open = row.querySelector(".picker");
+    document.querySelectorAll(".picker").forEach((p) => p.remove());
+    if (open) return;
+    const picker = document.createElement("div");
+    picker.className = "picker";
+    for (const [emoji, word] of options) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = emoji;
+      b.title = word;
+      b.addEventListener("click", () => { picker.remove(); pick(emoji, word); });
+      picker.appendChild(b);
+    }
+    row.appendChild(picker);
+  }
+
+  function openList(line) {
+    const sheet = $("sheet");
+    sheet.innerHTML = "";
+    const h = document.createElement("h3");
+    h.textContent = line.list.button;
+    sheet.appendChild(h);
+    let picked = null;
+    for (const r of line.list.rows) {
+      const label = document.createElement("label");
+      const radio = document.createElement("input");
+      radio.type = "radio"; radio.name = "row";
+      radio.addEventListener("change", () => { picked = r; });
+      const text = document.createElement("div");
+      text.textContent = r.title;
+      if (r.description) { const s = document.createElement("small"); s.textContent = r.description; text.appendChild(s); }
+      label.append(radio, text);
+      sheet.appendChild(label);
+    }
+    const go = document.createElement("button");
+    go.type = "button"; go.className = "send"; go.textContent = "Send";
+    go.addEventListener("click", () => { if (!picked) return; sheet.classList.remove("on"); send(picked.title, { choice: { id: picked.id, title: picked.title }, replyTo: line.id }); });
+    sheet.appendChild(go);
+    sheet.classList.add("on");
+  }
+
+  function setReply(r) {
+    replyTo = r;
+    $("replying").classList.toggle("on", !!r);
+    $("replyingText").textContent = r ? r.text : "";
+    if (r) $("text").focus();
+  }
+
+  function addReaction(line) {
+    const row = rows.get(line.messageId);
+    if (!row) return;
+    const pill = document.createElement("span");
+    pill.className = "react";
+    pill.textContent = line.emoji;
+    row.querySelector(".reacts").appendChild(pill);
+  }
+
+  function markRead(ids) {
+    for (const id of ids) {
+      const t = rows.get(id)?.querySelector(".ticks");
+      if (t) { t.textContent = "✓✓"; t.classList.add("read"); }
+    }
+  }
+
+  function showTyping(on) {
+    if (!current.typing) return;
+    if (current.id === "whatsapp" || current.id === "telegram") { $("sub").textContent = on ? "typing…" : subtitle(); return; }
+    if (on) {
+      if (!typingEl) {
+        typingEl = document.createElement("div");
+        typingEl.className = "dots";
+        typingEl.innerHTML = "<i></i><i></i><i></i><span class='status'></span>";
+      }
+      typingEl.querySelector(".status").textContent = statusText || "";
+      $("thread").appendChild(typingEl);
+      $("thread").scrollTop = $("thread").scrollHeight;
+    } else if (typingEl) typingEl.remove();
+  }
+
+  function showStatus(text) {
+    statusText = text;
+    if (text) showTyping(true);
+    else if (typingEl) typingEl.querySelector(".status").textContent = "";
+  }
+
+  // Per-turn metrics: a turn starts with a message from the person; a double text sent before any
+  // acknowledgement joins it, and timings count from their latest message.
+  function startTurn(text, at) {
+    const open = turns.at(-1);
+    if (open && open.ack == null) { open.texts.push(text); open.from = at; }
+    else turns.push({ texts: [text], from: at, ack: null, done: null, calls: 0 });
+    renderTurns();
+  }
+  function onSeen(kind, at) {
+    const t = turns.at(-1);
+    if (!t) return;
+    if (t.ack == null) t.ack = at - t.from;
+    if (kind === "message") t.done = at - t.from;
+    renderTurns();
+  }
+  function renderTurns() {
+    $("turns").innerHTML = "";
+    for (const t of turns) {
+      const tr = document.createElement("tr");
+      for (const [i, v] of [t.texts.join(" / "), fmt(t.ack), fmt(t.done), String(t.calls)].entries()) {
+        const td = document.createElement("td");
+        if (i === 0) td.className = "msg";
+        td.textContent = v;
+        tr.appendChild(td);
+      }
+      $("turns").appendChild(tr);
+    }
+  }
+
+  const toolEls = new Map();
+  function addTool(line) {
+    const el = document.createElement("div");
+    el.className = "toolcall";
+    toolEls.set(line.callId, el);
+    drawTool(el, line);
+    insert(el);
+  }
+  function updateTool(line) {
+    const el = toolEls.get(line.callId);
+    if (el) drawTool(el, line);
+  }
+  function drawTool(el, line) {
+    el.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "tc-head";
+    const name = document.createElement("b");
+    name.textContent = "🔧 " + line.tool;
+    const st = document.createElement("span");
+    st.className = "st" + (line.status === "background" ? " bg" : line.status === "failed" ? " bad" : "");
+    st.textContent = { running: "running…", background: `still running after ${fmt(line.ms)}, moved to the background`, done: `answered in ${fmt(line.ms)}`, failed: `failed after ${fmt(line.ms)}` }[line.status] || line.status;
+    head.append(name, st);
+    if (line.played) { const p = document.createElement("span"); p.className = "st"; p.textContent = `· played as “${line.played}”`; head.appendChild(p); }
+    el.appendChild(head);
+    const block = (label, value, open) => {
+      const d = document.createElement("details");
+      if (open) d.open = true;
+      const sm = document.createElement("summary");
+      sm.textContent = label;
+      const pre = document.createElement("pre");
+      let text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      try { if (typeof value === "string") text = JSON.stringify(JSON.parse(value), null, 2); } catch {}
+      pre.textContent = text;
+      d.append(sm, pre);
+      el.appendChild(d);
+    };
+    block("input", line.input ?? {}, false);
+    if (line.output !== undefined) block(line.status === "failed" ? "error" : "output", line.output, false);
+    if (line.changes && line.changes.length) {
+      const ul = document.createElement("ul");
+      for (const c of line.changes) { const li = document.createElement("li"); li.textContent = c; ul.appendChild(li); }
+      el.appendChild(ul);
+    }
+  }
+  function setDebug(on) {
+    document.body.classList.toggle("debug", on);
+    $("debug").setAttribute("aria-pressed", String(on));
+    try { localStorage.setItem("parley.debug", on ? "1" : "0"); } catch {}
+  }
+
+  function showLine(line, live) {
+    if (line.kind === "tool") { addTool(line); return; }
+    if (line.kind === "in") { addMessage(line); startTurn(line.text, line.at); }
+    else if (line.kind === "out") { addMessage(line); if (!line.carrier) onSeen("message", line.at); }
+    else if (line.kind === "reaction") { addReaction(line); if (line.by === "agent") onSeen("reaction", line.at); }
+    else if (line.kind === "read") markRead(line.messageIds);
+    else if (line.kind === "undelivered") sysnote(`Not delivered: “${line.text.slice(0, 60)}” (${line.reason})`, true);
+  }
+
+  function trace(e) {
+    const t = turns.at(-1);
+    if (t && (e.type === "model.call" || e.type === "model.restarted")) { t.calls++; renderTurns(); }
+    let tag = "", cls = "", text = e.type;
+    if (e.type === "tool.end") { tag = "inline"; cls = "inline"; text = `${e.tool} answered in ${e.ms} ms`; }
+    else if (e.type === "tool.detached") { tag = "background"; cls = "bg"; text = `${e.tool} still running after ${e.ms} ms (${e.task})`; }
+    else if (e.type === "task.done") { tag = "done"; cls = "bg"; text = `${e.tool} finished after ${e.ms} ms (${e.task})`; }
+    else if (e.type === "model.restarted") { tag = "folded"; cls = "fold"; text = "new message arrived, step restarted with it"; }
+    else if (e.type === "ack.required") { tag = "held"; cls = "ack"; text = `${e.held.join(", ")} held until they're acknowledged`; }
+    else if (e.type === "model.call") { text = `model ${e.ms} ms` + (e.toolCalls.length ? ` → ${e.toolCalls.join(", ")}` : " → (nothing)"); }
+    else if (e.type === "message.in") { text = `in [${e.messageId}]: ${e.text}`; }
+    else if (e.type === "message.out") { text = `out: ${e.text}` + (e.buttons ? ` [${e.buttons.join(" | ")}]` : "") + (e.list ? ` [list: ${e.list.rows.length} rows]` : "") + (e.fields ? ` [${Object.keys(e.fields).join(", ")}]` : ""); }
+    else if (e.type === "reaction") { text = `reacted ${e.emoji} to ${e.messageId}`; }
+    else if (e.type === "reaction.in") { text = `they reacted ${e.emoji}`; }
+    else if (e.type === "status") { text = `status: ${e.text}`; }
+    else if (e.type === "text.hidden") { text = `(not shown) ${e.text}`; }
+    else if (e.type === "skill.loaded") { text = `loaded skill ${e.skill}`; }
+    else if (e.type === "turn.end") { text = `turn done in ${e.ms} ms`; }
+    else if (e.type === "tool.start") { text = `${e.tool} started`; }
+    else if (e.type === "message.undelivered") { tag = "not delivered"; cls = "bad"; text = e.reason; }
+    const row = document.createElement("div");
+    const ts = document.createElement("span");
+    ts.className = "t";
+    ts.textContent = new Date(e.at).toLocaleTimeString([], { hour12: false });
+    const what = document.createElement("span");
+    if (tag) { const b = document.createElement("span"); b.className = "tag " + cls; b.textContent = tag + " "; what.appendChild(b); }
+    what.appendChild(document.createTextNode(text));
+    row.append(ts, what);
+    $("log").appendChild(row);
+    $("log").scrollTop = $("log").scrollHeight;
+  }
+
+  async function connect() {
+    if (source) source.close();
+    if (replayData) { showReplay(replayData); return; }
+    const { lines } = await (await fetch(BASE + "/api/transcript" + query())).json();
+    for (const l of lines) showLine(l, false);
+    source = new EventSource(BASE + "/api/events" + query());
+    source.onmessage = (ev) => {
+      const d = JSON.parse(ev.data);
+      if (d.type === "hello") { if (d.boot !== BOOT) location.reload(); }
+      else if (d.type === "line") showLine(d.line, true);
+      else if (d.type === "lineUpdate") updateTool(d.line);
+      else if (d.type === "id") giveId(d.at, d.messageId);
+      else if (d.type === "status") { if (current.status) { showStatus(d.text); if (d.text) onSeen("status", d.at); } }
+      else if (d.type === "typing") showTyping(d.on);
+      else if (d.type === "trace") trace(d.event);
+      else if (d.type === "reset") setPlatform(current.id);
+    };
+  }
+
+  /** A saved run: its transcript, and (cloud tests) its simulated tool calls with what they played and changed. */
+  function showReplay(data) {
+    sysnote("Replay of a saved conversation");
+    let lines = data.transcript || data.lines || [];
+    if (Array.isArray(data.toolCalls) && data.toolCalls.length) {
+      lines = lines.filter((l) => l.kind !== "tool").concat(data.toolCalls.map((c, i) => ({
+        kind: "tool", callId: `replay-${i}`, tool: c.tool, input: c.input, at: c.at,
+        status: c.ok ? "done" : "failed", ms: c.latencyMs, output: c.ok ? c.output : c.error, played: c.kind, changes: c.changes,
+      })));
+    }
+    lines.sort((a, b) => a.at - b.at);
+    for (const l of lines) showLine(l, false);
+  }
+
+  async function send(text, extra = {}) {
+    const body = { platform: current.id, person, text, ...extra };
+    if (!body.replyTo && replyTo) body.replyTo = replyTo.id;
+    setReply(null);
+    await fetch(BASE + "/api/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  }
+
+  // The person's message is shown at once; the agent's id for it (for ticks, replies and
+  // reactions) arrives a moment later.
+  function giveId(at, id) {
+    const row = [...document.querySelectorAll(".row.me")].reverse().find((r) => r.dataset.at === String(at) && !r.dataset.id);
+    if (!row || !id) return;
+    row.dataset.id = id;
+    rows.set(id, row);
+    const ticks = row.querySelector(".ticks");
+    if (ticks && !ticks.classList.contains("read")) ticks.textContent = "✓✓";
+    row.querySelector(".actions")?.remove();
+    addActions(row, { kind: "in", id, text: row.dataset.text });
+  }
+  function updateCounter() {
+    const text = $("text").value;
+    if (current?.id !== "sms" || !text) { $("counter").textContent = ""; return; }
+    const gsm = /^[\x20-\x7E\n\r£¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ¡ÄÖÑÜ§¿äöñüà€]*$/.test(text);
+    const len = [...text].length, single = gsm ? 160 : 70, multi = gsm ? 153 : 67;
+    const segs = len <= single ? 1 : Math.ceil(len / multi);
+    const left = (len <= single ? single : segs * multi) - len;
+    $("counter").textContent = segs > 1 ? `${left}/${segs}` : String(left);
+  }
+
+  async function refreshStatus() {
+    try {
+      const s = await (await fetch(BASE + "/api/status")).json();
+      $("status").textContent = s.busy ? `busy · ${s.backgroundTasks} in background` : `idle ${Math.round(s.idleForMs / 1000)} s`;
+    } catch {}
+  }
+
+  $("form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = $("text").value.trim();
+    if (!text) return;
+    $("text").value = "";
+    updateCounter();
+    send(text);
+  });
+  $("text").addEventListener("input", updateCounter);
+  $("cancelReply").addEventListener("click", () => setReply(null));
+  $("reset").addEventListener("click", () => fetch(BASE + "/api/reset" + query(), { method: "POST" }));
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".picker") && !e.target.closest(".actions")) document.querySelectorAll(".picker").forEach((p) => p.remove());
+  });
+
+  (async () => {
+    ({ platforms, cards } = await (await fetch(BASE + "/api/platforms")).json());
+    for (const p of platforms) {
+      const b = document.createElement("button");
+      b.className = "tab";
+      b.type = "button";
+      b.dataset.id = p.id;
+      const img = document.createElement("img");
+      img.src = `https://cdn.simpleicons.org/${p.icon}`;
+      img.alt = "";
+      b.append(img, document.createTextNode(p.name));
+      if (!p.complete) { const s = document.createElement("small"); s.textContent = "partial"; b.appendChild(s); }
+      b.addEventListener("click", () => setPlatform(p.id));
+      $("tabs").appendChild(b);
+    }
+    let debug = params.get("debug") === "1";
+    if (!params.has("debug")) { try { debug = localStorage.getItem("parley.debug") === "1"; } catch {} }
+    setDebug(debug);
+    $("debug").addEventListener("click", () => setDebug(!document.body.classList.contains("debug")));
+    if (REPLAY) {
+      replayData = await (await fetch(REPLAY)).json();
+      // The agent's own name in the replay's header, when the saved run has one.
+      if (replayData.agentTitle) { title = replayData.agentTitle; $("name").textContent = title; document.title = `${title} · replay`; }
+      for (const b of document.querySelectorAll(".tab")) b.disabled = true;
+      setPlatform(replayData.channel || replayData.platform || "sms");
+      return;
+    }
+    let saved = params.get("platform");
+    if (!saved) { try { saved = localStorage.getItem("parley.platform"); } catch {} }
+    setPlatform(saved || "sms");
+    setInterval(refreshStatus, 1000);
+    refreshStatus();
+  })();
+</script>
+</body>
+</html>
