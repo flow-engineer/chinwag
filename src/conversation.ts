@@ -34,7 +34,7 @@ import type { z } from "zod";
 import type { Emit } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
-import type { ConversationRow, InboxRow, Store } from "./store.ts";
+import type { ConversationRow, InboxRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
 import { render, toSpec, type Tool } from "./tools.ts";
 import type { ChannelInfo, ChatMessage, Deliver, Incoming, Model, Outbound, ToolCall, ToolSpec } from "./types.ts";
@@ -56,7 +56,7 @@ export interface ConversationSettings {
   maxRestarts: number;
   talk: TalkSettings;
   emit: Emit;
-  store: Store;
+  store: StoreApi;
   /** Resolves once the store's tables exist. */
   ready: Promise<void>;
   now: () => number;
@@ -186,6 +186,8 @@ export class Conversation {
   private saved = 0;
   /** A turn was cut off by a restart: it runs again with the history so far. */
   private resumeTurn = false;
+  /** Forgotten: nothing more runs, is sent or is kept. */
+  private closed = false;
 
   constructor(id: string, personKey: string, settings: ConversationSettings, existing: ConversationRow | null = null) {
     this.id = id;
@@ -331,8 +333,24 @@ export class Conversation {
     return this.writes;
   }
 
+  /**
+   * The person was forgotten: a step in flight is cut off, nothing waiting runs, nothing more is
+   * sent or kept. Tools already running finish on their own, and their results go nowhere.
+   */
+  close(): void {
+    this.closed = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.pending = [];
+    this.notes = [];
+    this.direct = [];
+    this.stepAbort?.abort();
+    this.wakeTools?.();
+  }
+
   /** Runs `work` after every earlier write to the store, in order. */
   persist(work: () => Promise<unknown>): Promise<void> {
+    if (this.closed) return this.writes;
     const next = this.writes.then(work).then(
       () => undefined,
       (error) => console.warn(`parley: could not save conversation ${this.id}:`, error),
@@ -384,6 +402,7 @@ export class Conversation {
   }
 
   private schedule(delayMs: number): void {
+    if (this.closed) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -397,6 +416,7 @@ export class Conversation {
     try {
       await this.loaded;
       for (;;) {
+        if (this.closed) break;
         if (this.pending.length || this.notes.some((n) => !n.wait) || this.resumeTurn) {
           this.resumeTurn = false;
           await this.turn();
@@ -482,6 +502,8 @@ export class Conversation {
     }
     const context = this.settings.context ? await this.settings.context(this.id) : "";
     const rules = rulesSection(await store.noContact(this.id, this.settings.now()), this.timeZone ?? this.settings.timeZone ?? "UTC");
+    // A message that came while those loaded had no step to restart: it joins the first one.
+    this.absorb();
     let restarts = 0;
     let reminded = false;
     let followedUp = false;
@@ -489,6 +511,7 @@ export class Conversation {
     let acted = false;
     this.sentThisTurn.clear();
     for (let step = 0; step < this.settings.maxSteps; step++) {
+      if (this.closed) return;
       // The channels can grow mid-turn (they wrote on another one), so each step offers what is there now.
       const views = this.views();
       const several = views.length > 1;
@@ -724,6 +747,7 @@ export class Conversation {
 
   /** Hand one outbound to a channel; returns why it failed, or null. */
   private async send(channel: string, outbound: Outbound): Promise<string | null> {
+    if (this.closed) return "this person was forgotten";
     const link = this.channels.get(channel);
     if (!link) return `no way to reach them on ${channel} right now`;
     try {
@@ -793,6 +817,10 @@ export class Conversation {
       }
       const open = live.filter(({ i }) => results[i] === undefined);
       if (!open.length) break;
+      if (this.closed) {
+        for (const { i } of open) results[i] = "";
+        break;
+      }
       const now = Date.now();
       const all: Detach | null = this.pending.length ? "message" : firstDoneAt !== null && now - firstDoneAt >= this.settings.partialAfterMs ? "partial" : null;
       if (all) {
@@ -883,6 +911,84 @@ export function windowClosed(link: { info: ChannelInfo; lastMessageAt: number | 
   const hours = link.info.replyWindowHours;
   if (!hours) return false;
   return link.lastMessageAt === null || now - link.lastMessageAt > hours * 3_600_000;
+}
+
+/** One line of a conversation as the person saw it, read back from the history (the playground shows these). */
+export type TranscriptEntry =
+  | { kind: "in"; channel: string; id: string; text: string; at: number; choice?: boolean }
+  | {
+      kind: "out";
+      channel: string;
+      text: string;
+      at: number;
+      replyTo?: string;
+      buttons?: string[];
+      list?: { button: string; rows: Array<{ id: string; title: string; description?: string }> };
+      /** The channel's own params the agent filled in. */
+      fields?: Record<string, unknown>;
+    }
+  | { kind: "reaction"; channel: string; messageId: string; emoji: string; at: number }
+  | { kind: "tool"; callId: string; tool: string; input: unknown; output: string; ok: boolean; at: number };
+
+const SEND_KEYS = new Set(["text", "reply_to", "buttons", "list", "confirm"]);
+
+/**
+ * The history as the person saw it: their messages (with the ids describe() wrote), what the agent
+ * delivered with its send tools and reactions, and its other tool calls with their results.
+ * Parley's notes and the agent's plain text never reached the person and are left out. `only` is
+ * the channel of untagged messages (an agent with one channel does not tag them).
+ */
+export function transcriptOf(history: Array<{ entry: ChatMessage; at: number }>, only: string): TranscriptEntry[] {
+  const lines: TranscriptEntry[] = [];
+  const results = new Map<string, { content: string; at: number }>();
+  for (const { entry, at } of history) if (entry.role === "tool") results.set(entry.toolCallId, { content: entry.content, at });
+  const channelOf = new Map<string, string>();
+  for (const { entry, at } of history) {
+    if (entry.role === "user") {
+      const starts = [...entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)(?=[,\]])/gm)];
+      starts.forEach((m, i) => {
+        const channel = m[1] ?? only;
+        const rest = entry.content.slice(m.index! + m[0].length, i + 1 < starts.length ? starts[i + 1].index! - 1 : undefined);
+        const tapped = rest.indexOf(", tapped] ");
+        const text = rest.startsWith("] ") ? rest.slice(2) : tapped >= 0 ? rest.slice(tapped + 10) : rest.slice(rest.indexOf('"] ') + 3);
+        channelOf.set(m[2], channel);
+        lines.push({ kind: "in", channel, id: m[2], text, at, ...(tapped >= 0 ? { choice: true } : {}) });
+      });
+      continue;
+    }
+    if (entry.role !== "assistant") continue;
+    for (const call of entry.toolCalls ?? []) {
+      const result = results.get(call.id);
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(call.arguments || "{}");
+      } catch {}
+      if (call.name.startsWith("send_")) {
+        let delivered: { delivered?: boolean; channel?: string } = {};
+        try {
+          delivered = JSON.parse(result?.content ?? "");
+        } catch {}
+        if (!delivered.delivered || !delivered.channel) continue;
+        const fields = Object.fromEntries(Object.entries(args).filter(([k, v]) => !SEND_KEYS.has(k) && v !== undefined && v !== null && v !== ""));
+        lines.push({
+          kind: "out",
+          channel: delivered.channel,
+          text: String(args.text ?? ""),
+          at: result!.at,
+          ...(typeof args.reply_to === "string" ? { replyTo: args.reply_to } : {}),
+          ...(Array.isArray(args.buttons) && args.buttons.length ? { buttons: args.buttons as string[] } : {}),
+          ...(args.list ? { list: args.list as never } : {}),
+          ...(Object.keys(fields).length ? { fields } : {}),
+        });
+      } else if (call.name === REACT) {
+        const channel = channelOf.get(String(args.message_id));
+        if (result?.content === "" && channel) lines.push({ kind: "reaction", channel, messageId: String(args.message_id), emoji: String(args.emoji), at: result.at });
+      } else if (call.name !== UPDATE && result) {
+        lines.push({ kind: "tool", callId: call.id, tool: call.name, input: args, output: result.content, ok: !result.content.startsWith("Failed:"), at: result.at });
+      }
+    }
+  }
+  return lines;
 }
 
 /** How a message from the person reads to the agent, after its id: "[m5] text", with any quote or tap. */

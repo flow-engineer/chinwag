@@ -1,36 +1,60 @@
-// The simulators: one page with a simulator per platform (SMS, WhatsApp, iMessage, Telegram, web),
-// all talking to the same agent with that platform's rules. Nothing is really sent. Parley's local
-// playground and the test cloud both run it. Its JSON API is also the test API: a harness or a
-// coding agent can play the person through it.
+// The simulators: a simulator per platform (SMS, WhatsApp, iMessage, Telegram, web), each with that
+// platform's rules. Nothing is really sent. They run in two ways.
 //
-//   POST /api/messages    {platform, person, text, replyTo?, choice?}  → {messageId, at}
-//   POST /api/reactions   {platform, person, messageId, emoji}          the person reacts to an agent message
-//   GET  /api/events      ?platform&person   server-sent events: what the person sees, plus the trace
-//   GET  /api/transcript  ?platform&person   everything so far, with timestamps
-//   POST /api/reset       ?platform&person   start that conversation over
-//   GET  /api/status                          busy / idle, background tasks
-//   GET  /api/platforms                       each platform's rules, the agent's own platforms, link cards
-//   GET  /person          ?person            one person on each of the agent's own channels, side by side
+// The playground: people test an agent as real users before its numbers are live. Only the
+// agent's `testPeople` can be played, on the agent's own channels, through `agent.simulate()`: the
+// same path as a provider's webhook, so a test person is a real person to the agent (identity,
+// lookups, history, schedules); the simulator is just a different phone. One person is one
+// conversation on every channel, and what is shown is that conversation's history in the agent's
+// store, so it survives restarts. On a deployed agent it needs a token (`handler`).
+//
+//   GET  /?person=<phone>&channel=<name>      the playground; /person shows every channel side by side
+//   POST /api/messages    {channel, person, text, replyTo?, choice?}  → {messageId, at}
+//   POST /api/reactions   {channel, person, messageId, emoji}          the person reacts to an agent message
+//   GET  /api/events      ?channel&person   server-sent events: what the person sees, plus the trace
+//   GET  /api/transcript  ?channel&person   the conversation on that channel, from the store
+//   POST /api/clear       ?person           forget the person: history, schedules, everything
+//   GET  /api/status                         busy / idle, background tasks
+//   GET  /api/platforms                      each platform's rules, the agent's channels and test people, link cards
+//
+// The test cloud (`testCloud: true`, for Parley's test cloud only): generated people per run, any
+// person id, through AgentConnection.receive; the same API with `platform` for `channel`, `person`
+// free, and POST /api/reset to start a conversation over. Its transcript is kept in memory.
 //
 // The person's messages have the agent's ids (m1, m2, ...); the agent's messages get a1, a2, ...
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { ChannelInfo, ChannelSummary, Deliver, EventSink, Incoming, ListRow, Outbound, ParleyEvent } from "../../src/index.ts";
+import type { TLSSocket } from "node:tls";
+import type { ChannelInfo, ChannelSummary, Deliver, EventSink, Incoming, ListRow, Outbound, ParleyEvent, PlaygroundSink, TestPerson, TranscriptEntry } from "../../src/index.ts";
 import { PLATFORMS, channelOf, platform as platformOf, smsSegments, type Platform } from "./platforms.ts";
 
-/** What the simulators need from an agent. Parley's Agent is one as it is. */
+/** What the test cloud's simulators need from an agent. */
 export interface AgentConnection {
   /** A person's message; returns its id, or null when the agent answered it without a turn. */
   receive(conversationId: string, incoming: Incoming, deliver: Deliver, options: { channel: ChannelInfo; channelName?: string }): string | null;
   /**
-   * The agent's own channels, if it has any (Parley's Agent does): a simulator plays the one of
-   * its kind (SMS, WhatsApp, and the web simulator for a custom UI) with its definition.
+   * The agent's own channels, if it has any: a simulator plays the one of its kind (SMS, WhatsApp,
+   * and the web simulator for a custom UI) with its definition.
    */
   channels?(conversationId: string): ChannelSummary[];
   /** The person reacted to one of the agent's messages. */
   reacted(conversationId: string, emoji: string, toText: string): void;
+  status(): { busy: boolean; idleForMs: number; backgroundTasks: number; conversations: number };
+}
+
+/** What the playground needs from an agent. Parley's Agent is one as it is. */
+export interface PlaygroundAgent {
+  testPeople(): TestPerson[];
+  channels(): ChannelSummary[];
+  simulate(input: { person: string; channel: string; message: Incoming }): Promise<{ conversationId: string; messageId: string } | null>;
+  testConversation(phone: string): Promise<string | null>;
+  transcript(conversationId: string): Promise<TranscriptEntry[]>;
+  reacted(conversationId: string, emoji: string, toText: string): void;
+  forgetPerson(conversationId: string): Promise<void>;
+  attachPlayground(sink: PlaygroundSink | null): void;
   status(): { busy: boolean; idleForMs: number; backgroundTasks: number; conversations: number };
 }
 
@@ -39,14 +63,10 @@ export interface SimulatorsOptions {
   title?: string;
   /** The SMS provider's own replies; HELP is usually set to say who the agent is. */
   sms?: { helpReply?: string };
-  /**
-   * One person is one conversation on every platform that plays one of the agent's own channels,
-   * as with real channels that know the person (by phone number, or the owner's `resolve`).
-   * Otherwise each platform is a conversation of its own.
-   */
-  shareConversations?: boolean;
   /** How a custom UI shows the links in its params: the first card whose `match` is in the URL. */
   cards?: LinkCard[];
+  /** The pages' HTML, for a host with no file system (Cloudflare); else read from this folder. */
+  pages?: { page: string; person: string };
 }
 
 export interface LinkCard {
@@ -56,6 +76,24 @@ export interface LinkCard {
   label: string;
   /** What opening it shows: a call screen, or a page of the app (the default). */
   kind?: "call" | "page";
+}
+
+type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+type Listening = { close(): Promise<void>; url: string };
+
+export interface Playground {
+  /** Pass to the agent's `events`: the trace and tool calls of test people's conversations. */
+  events: EventSink;
+  /** Serves the playground on 127.0.0.1 only; a token is optional there. */
+  listen(agent: PlaygroundAgent, port: number, options?: { token?: string }): Promise<Listening>;
+  /** The playground as a request handler under `base`, for a deployed agent's own server: a token is required. */
+  handler(agent: PlaygroundAgent, options: { token: string; base?: string }): Handler;
+}
+
+export interface TestCloudSimulators {
+  events: EventSink;
+  listen(agent: AgentConnection, port: number): Promise<Listening>;
+  handler(agent: AgentConnection, base?: string): Handler;
 }
 
 export type Line =
@@ -102,37 +140,38 @@ const CARRIER = {
   helpReply: "Reply STOP to unsubscribe. Msg&Data Rates May Apply.",
 };
 
-const PAGE = readFileSync(new URL("./page.html", import.meta.url), "utf8");
-const PERSON_PAGE = readFileSync(new URL("./person.html", import.meta.url), "utf8");
-/** Changes every time the server starts, so an open page from an older run reloads itself. */
-const BOOT = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const MAX_BODY = 16_384;
+/** Wrong tokens one address may try in a window before it is refused for the rest of it. */
+const MAX_FAILURES = 10;
+const FAILURE_WINDOW_MS = 15 * 60_000;
+const COOKIE = "parley_playground";
 
 interface Thread {
   lines: Line[];
   agentCount: number;
+  carrierCount: number;
   optedOut: boolean;
 }
 
-export function simulators(options: SimulatorsOptions = {}) {
+export function simulators(options: SimulatorsOptions & { testCloud: true }): TestCloudSimulators;
+export function simulators(options?: SimulatorsOptions & { testCloud?: false }): Playground;
+export function simulators(options: SimulatorsOptions & { testCloud?: boolean } = {}): Playground | TestCloudSimulators {
+  const cloud = options.testCloud === true;
+  const playPage = options.pages?.page ?? readFileSync(new URL("./page.html", import.meta.url), "utf8");
+  const personPage = options.pages?.person ?? readFileSync(new URL("./person.html", import.meta.url), "utf8");
+  /**
+   * Changes every time the server starts, so an open page from an older run reloads itself. Made
+   * at the first request, not at import: on Cloudflare the clock and random numbers are fixed
+   * until a request runs.
+   */
+  let started = "";
+  const boot = () => (started ||= `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`);
   const clients = new Map<string, Set<ServerResponse>>();
   const threads = new Map<string, Thread>();
-  const generations = new Map<string, number>();
 
-  const key = (platformId: string, person: string) => `${platformId}:${person}`;
-  const conversationId = (platformId: string, person: string, shared = false) => {
-    const base = shared ? `person:${person}` : key(platformId, person);
-    const generation = generations.get(base) ?? 0;
-    return generation ? `${base}#${generation}` : base;
-  };
-  /** The threads a conversation shows in: one per platform, or each platform of a shared one. */
-  const threadsOf = new Map<string, Set<string>>();
-  const targets = (id: string) => threadsOf.get(keyOf(id)) ?? [keyOf(id)];
-  /** The thread key a conversation id belongs to (the part before any #generation). */
-  const keyOf = (id: string) => id.split("#")[0];
   const thread = (k: string) => {
     let t = threads.get(k);
-    if (!t) threads.set(k, (t = { lines: [], agentCount: 0, optedOut: false }));
+    if (!t) threads.set(k, (t = { lines: [], agentCount: 0, carrierCount: 0, optedOut: false }));
     return t;
   };
 
@@ -155,10 +194,6 @@ export function simulators(options: SimulatorsOptions = {}) {
 
   /** Tool calls in progress, by call id, so later events update the same line. */
   const toolLines = new Map<string, Extract<Line, { kind: "tool" }>>();
-
-  const events: EventSink = (event: ParleyEvent) => {
-    for (const k of targets(event.conversationId)) show(k, event);
-  };
 
   function show(k: string, event: ParleyEvent): void {
     if (event.type === "tool.start" && typeof event.callId === "string") {
@@ -233,12 +268,18 @@ export function simulators(options: SimulatorsOptions = {}) {
     }
     if (reply) {
       const sms = smsSegments(reply);
-      emitLine(k, { kind: "out", id: `a${++t.agentCount}`, text: reply, at: Date.now(), carrier: true, sms: { segments: sms.segments, encoding: sms.encoding } });
+      // In the playground the agent's ids come from the store, so the carrier's lines have their own.
+      const id = cloud ? `a${++t.agentCount}` : `c${++t.carrierCount}`;
+      emitLine(k, { kind: "out", id, text: reply, at: Date.now(), carrier: true, sms: { segments: sms.segments, encoding: sms.encoding } });
     }
   }
 
-  function listen(agent: AgentConnection, port: number): Promise<{ close(): Promise<void>; url: string }> {
-    const server = createServer(handler(agent));
+  function page(template: string, base: string): string {
+    return template.replaceAll("{{title}}", escapeHtml(options.title ?? "Agent")).replaceAll("{{boot}}", boot()).replaceAll("{{base}}", base).replaceAll("{{mode}}", cloud ? "cloud" : "playground");
+  }
+
+  function serve(handle: Handler, port: number): Promise<Listening> {
+    const server = createServer(handle);
     return new Promise((resolve) => {
       server.listen(port, "127.0.0.1", () =>
         resolve({
@@ -250,116 +291,332 @@ export function simulators(options: SimulatorsOptions = {}) {
     });
   }
 
-  /**
-   * The simulators as a request handler, served under `base` (such as "/simulator") so another
-   * server can mount them; listen() serves them at the root of their own port.
-   */
-  function handler(agent: AgentConnection, base = "") {
-    return (req: IncomingMessage, res: ServerResponse) =>
-      handle(agent, req, res, base).catch((error) => {
-        console.warn("parley simulators:", error);
-        if (!res.headersSent) res.writeHead(500).end();
-      });
+  const guarded = (work: (req: IncomingMessage, res: ServerResponse) => Promise<void>): Handler => (req, res) =>
+    work(req, res).catch((error) => {
+      console.warn("parley simulators:", error);
+      if (!res.headersSent) res.writeHead(500).end();
+    });
+
+  function events(req: IncomingMessage, res: ServerResponse, k: string): void {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+    res.write(`data: ${JSON.stringify({ type: "hello", boot: boot() })}\n\n`);
+    const set = clients.get(k) ?? new Set();
+    set.add(res);
+    clients.set(k, set);
+    const keepAlive = setInterval(() => res.write(": ping\n\n"), 15_000);
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      set.delete(res);
+    });
   }
 
-  async function handle(agent: AgentConnection, req: IncomingMessage, res: ServerResponse, base = ""): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    // The path inside the simulators, whatever they are mounted under.
-    const path = base && url.pathname.startsWith(base) ? url.pathname.slice(base.length) || "/" : url.pathname;
-    const qp = platformOf(url.searchParams.get("platform"));
-    const qperson = (url.searchParams.get("person") || "demo").slice(0, 128);
-    const qk = key(qp.id, qperson);
-    const shared = (p: Platform, who: string) => Boolean(options.shareConversations && ownChannel(agent, p, conversationId(p.id, who)));
+  /** The person's message as the agent gets it: the text, a quoted message, a tapped button. */
+  function incomingOf(k: string, body: Record<string, unknown> | null, text: string, replies: boolean): { incoming: Incoming; line: Extract<Line, { kind: "in" }> } {
+    const replyId = replies && typeof body?.replyTo === "string" ? body.replyTo : undefined;
+    const quoted = replyId ? findLine(k, replyId) : undefined;
+    const choice = body?.choice && typeof body.choice === "object" ? (body.choice as { id?: string; title?: string }) : undefined;
+    const incoming: Incoming = {
+      text,
+      ...(quoted && (quoted.kind === "in" || quoted.kind === "out") ? { replyTo: { text: quoted.text, fromAgent: quoted.kind === "out" } } : {}),
+      ...(choice?.title ? { choice: { id: choice.id, title: String(choice.title) } } : {}),
+    };
+    const line: Extract<Line, { kind: "in" }> = { kind: "in", id: null, text, at: Date.now(), ...(quoted ? { replyTo: replyId } : {}), ...(choice?.title ? { choice: true } : {}) };
+    return { incoming, line };
+  }
 
-    if (req.method === "GET" && path === "/person") {
-      const page = PERSON_PAGE.replaceAll("{{title}}", escapeHtml(options.title ?? "Agent")).replaceAll("{{base}}", base);
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(page);
-      return;
-    }
-    if (req.method === "GET" && path === "/") {
-      const page = PAGE.replaceAll("{{title}}", escapeHtml(options.title ?? "Agent")).replaceAll("{{boot}}", BOOT).replaceAll("{{base}}", base);
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(page);
-      return;
-    }
-    if (req.method === "GET" && path === "/api/platforms") {
-      const own = PLATFORMS.filter((p) => ownChannel(agent, p, conversationId(p.id, qperson))).map((p) => ({ platform: p.id, channel: ownChannel(agent, p, conversationId(p.id, qperson))!.name }));
-      return json(res, 200, { platforms: PLATFORMS, own, cards: options.cards ?? [] });
-    }
-    if (req.method === "GET" && path === "/api/status") return json(res, 200, agent.status());
-    if (req.method === "GET" && path === "/api/transcript") {
-      const t = thread(qk);
-      return json(res, 200, { platform: qp.id, person: qperson, optedOut: t.optedOut, lines: t.lines });
-    }
-    if (req.method === "POST" && path === "/api/reset") {
-      // A shared conversation starts over on every platform it shows in.
-      const base = shared(qp, qperson) ? `person:${qperson}` : qk;
-      generations.set(base, (generations.get(base) ?? 0) + 1);
-      for (const k of threadsOf.get(base) ?? [qk]) {
-        threads.delete(k);
-        push(k, { type: "reset" });
+  // ---------------------------------------------------------------------------------------------
+  // The test cloud.
+
+  if (cloud) {
+    const generations = new Map<string, number>();
+    const key = (platformId: string, person: string) => `${platformId}:${person}`;
+    const conversationId = (k: string) => {
+      const generation = generations.get(k) ?? 0;
+      return generation ? `${k}#${generation}` : k;
+    };
+    const cloudEvents: EventSink = (event) => show(event.conversationId.split("#")[0], event);
+
+    async function handle(agent: AgentConnection, req: IncomingMessage, res: ServerResponse, base: string): Promise<void> {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const path = inside(url, base);
+      const qp = platformOf(url.searchParams.get("platform"));
+      const qperson = (url.searchParams.get("person") || "demo").slice(0, 128);
+      const qk = key(qp.id, qperson);
+
+      if (req.method === "GET" && path === "/") return html(res, page(playPage, base));
+      if (req.method === "GET" && path === "/api/platforms") {
+        const own = PLATFORMS.filter((p) => ownChannel(agent, p, conversationId(key(p.id, qperson)))).map((p) => ({ platform: p.id, channel: ownChannel(agent, p, conversationId(key(p.id, qperson)))!.name }));
+        return json(res, 200, { platforms: PLATFORMS, own, cards: options.cards ?? [] });
       }
-      threadsOf.delete(base);
-      return json(res, 200, { ok: true });
+      if (req.method === "GET" && path === "/api/status") return json(res, 200, agent.status());
+      if (req.method === "GET" && path === "/api/transcript") {
+        const t = thread(qk);
+        return json(res, 200, { platform: qp.id, person: qperson, optedOut: t.optedOut, lines: t.lines });
+      }
+      if (req.method === "POST" && path === "/api/reset") {
+        generations.set(qk, (generations.get(qk) ?? 0) + 1);
+        threads.delete(qk);
+        push(qk, { type: "reset" });
+        return json(res, 200, { ok: true });
+      }
+      if (req.method === "GET" && path === "/api/events") return events(req, res, qk);
+
+      const body = req.method === "POST" ? await readBody(req) : null;
+      const p = typeof body?.platform === "string" ? platformOf(body.platform) : qp;
+      const person = typeof body?.person === "string" && body.person ? body.person.slice(0, 128) : qperson;
+      const k = key(p.id, person);
+
+      if (req.method === "POST" && path === "/api/reactions") {
+        const messageId = typeof body?.messageId === "string" ? body.messageId : "";
+        const emoji = typeof body?.emoji === "string" ? body.emoji.slice(0, 16) : "";
+        const target = findLine(k, messageId);
+        if (!p.personReactions || !target || target.kind !== "out" || !emoji) {
+          return json(res, 400, { error: "reactions need a platform that has them, an agent message id and an emoji" });
+        }
+        emitLine(k, { kind: "reaction", messageId, emoji, at: Date.now(), by: "person" });
+        agent.reacted(conversationId(k), emoji, target.text);
+        return json(res, 202, { ok: true });
+      }
+
+      if (req.method === "POST" && path === "/api/messages") {
+        const text = typeof body?.text === "string" ? body.text.trim().slice(0, 4_000) : "";
+        if (!text) return json(res, 400, { error: "text is required" });
+        const { incoming, line } = incomingOf(k, body, text, Boolean(p.replies));
+        emitLine(k, line);
+        carrier(p, k, text);
+        const id = conversationId(k);
+        const own = ownChannel(agent, p, id);
+        const messageId = agent.receive(id, incoming, deliverer(p, k), own ? { channel: own.info, channelName: own.name } : { channel: channelOf(p) });
+        line.id = messageId;
+        push(k, { type: "id", at: line.at, messageId });
+        return json(res, 202, { messageId, at: line.at });
+      }
+      res.writeHead(404).end();
     }
-    if (req.method === "GET" && path === "/api/events") {
-      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
-      res.write(`data: ${JSON.stringify({ type: "hello", boot: BOOT })}\n\n`);
-      const set = clients.get(qk) ?? new Set();
-      set.add(res);
-      clients.set(qk, set);
-      const keepAlive = setInterval(() => res.write(": ping\n\n"), 15_000);
-      req.on("close", () => {
-        clearInterval(keepAlive);
-        set.delete(res);
-      });
-      return;
+
+    const testCloud: TestCloudSimulators = {
+      events: cloudEvents,
+      listen: (agent, port) => serve(guarded((req, res) => handle(agent, req, res, "")), port),
+      handler: (agent, base = "") => guarded((req, res) => handle(agent, req, res, base)),
+    };
+    return testCloud;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The playground.
+
+  /** The test person (by phone) each conversation belongs to, so its trace shows in their simulators. */
+  const people = new Map<string, TestPerson>();
+  let playing: PlaygroundAgent | null = null;
+  const threadKey = (channel: string, person: TestPerson) => `${channel}:${person.phone}`;
+
+  const playgroundEvents: EventSink = (event) => {
+    const person = people.get(event.conversationId);
+    if (!person || !playing) return;
+    for (const c of playing.channels()) show(threadKey(c.name, person), event);
+  };
+
+  function attach(agent: PlaygroundAgent): void {
+    playing = agent;
+    agent.attachPlayground(({ conversationId, person, channel, outbound }) => {
+      people.set(conversationId, person);
+      const own = agent.channels().find((c) => c.name === channel);
+      if (own) return deliverer(platformFor(own), threadKey(channel, person))(outbound);
+    });
+  }
+
+  /** The conversation on one channel, rebuilt from the agent's store, with what only the platform showed (the carrier's replies). */
+  async function load(agent: PlaygroundAgent, person: TestPerson, channel: ChannelSummary): Promise<Thread> {
+    const k = threadKey(channel.name, person);
+    const t = thread(k);
+    const id = await agent.testConversation(person.phone);
+    if (id) people.set(id, person);
+    const p = platformFor(channel);
+    let count = 0;
+    const lines: Line[] = [];
+    for (const e of id ? await agent.transcript(id) : []) {
+      if (e.kind === "tool") {
+        lines.push({ kind: "tool", callId: e.callId, tool: e.tool, input: e.input, at: e.at, status: e.ok ? "done" : "failed", output: e.output });
+        continue;
+      }
+      if (e.channel !== channel.name) continue;
+      if (e.kind === "in") lines.push({ kind: "in", id: e.id, text: e.text, at: e.at, ...(e.choice ? { choice: true } : {}) });
+      else if (e.kind === "reaction") lines.push({ kind: "reaction", messageId: e.messageId, emoji: e.emoji, at: e.at, by: "agent" });
+      else {
+        const sms = p.segments ? smsSegments(e.text) : undefined;
+        const { kind: _kind, channel: _channel, ...rest } = e;
+        lines.push({ kind: "out", id: `a${++count}`, ...rest, ...(sms ? { sms: { segments: sms.segments, encoding: sms.encoding } } : {}) });
+      }
+    }
+    const stored = new Set(lines.flatMap((l) => (l.kind === "in" && l.id ? [l.id] : [])));
+    const onlyHere = t.lines.filter((l) => (l.kind === "out" && l.carrier) || (l.kind === "in" && !(l.id && stored.has(l.id))));
+    t.lines = [...lines, ...onlyHere].sort((a, b) => a.at - b.at);
+    t.agentCount = count;
+    return t;
+  }
+
+  async function handle(agent: PlaygroundAgent, req: IncomingMessage, res: ServerResponse, base: string, gate: Gate | null): Promise<void> {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const path = inside(url, base);
+    if (gate && !gate.allows(req, res, url, base)) return;
+
+    if (req.method === "GET" && path === "/") return html(res, page(playPage, base));
+    if (req.method === "GET" && path === "/person") return html(res, page(personPage, base));
+    if (req.method === "GET" && path === "/api/status") return json(res, 200, agent.status());
+    if (req.method === "GET" && path === "/api/platforms") {
+      const channels = agent.channels().map((c) => ({ name: c.name, kind: c.kind, platform: platformFor(c) }));
+      return json(res, 200, { platforms: PLATFORMS, channels, people: agent.testPeople(), cards: options.cards ?? [] });
     }
 
     const body = req.method === "POST" ? await readBody(req) : null;
-    const p = typeof body?.platform === "string" ? platformOf(body.platform) : qp;
-    const person = typeof body?.person === "string" && body.person ? body.person.slice(0, 128) : qperson;
-    const k = key(p.id, person);
+    const asked = (name: string) => (typeof body?.[name] === "string" ? (body[name] as string) : (url.searchParams.get(name) ?? ""));
+    const person = agent.testPeople().find((p) => digits(p.phone) === digits(asked("person")) && digits(p.phone) !== "");
+    if (!person) return json(res, 403, { error: "only this agent's test people can be played: declare them in createAgent({ testPeople })" });
+
+    if (req.method === "POST" && path === "/api/clear") {
+      const id = await agent.testConversation(person.phone);
+      if (id) {
+        await agent.forgetPerson(id);
+        people.delete(id);
+      }
+      for (const c of agent.channels()) {
+        const k = threadKey(c.name, person);
+        threads.delete(k);
+        push(k, { type: "reset" });
+      }
+      return json(res, 200, { ok: true });
+    }
+
+    const channel = agent.channels().find((c) => c.name === asked("channel"));
+    if (!channel) return json(res, 400, { error: "channel must be one of the agent's own channels" });
+    const k = threadKey(channel.name, person);
+    const p = platformFor(channel);
+
+    if (req.method === "GET" && path === "/api/transcript") {
+      const t = await load(agent, person, channel);
+      return json(res, 200, { channel: channel.name, person, optedOut: t.optedOut, lines: t.lines });
+    }
+    if (req.method === "GET" && path === "/api/events") return events(req, res, k);
 
     if (req.method === "POST" && path === "/api/reactions") {
       const messageId = typeof body?.messageId === "string" ? body.messageId : "";
       const emoji = typeof body?.emoji === "string" ? body.emoji.slice(0, 16) : "";
       const target = findLine(k, messageId);
-      if (!p.personReactions || !target || target.kind !== "out" || !emoji) {
+      const id = await agent.testConversation(person.phone);
+      if (!p.personReactions || !target || target.kind !== "out" || !emoji || !id) {
         return json(res, 400, { error: "reactions need a platform that has them, an agent message id and an emoji" });
       }
       emitLine(k, { kind: "reaction", messageId, emoji, at: Date.now(), by: "person" });
-      agent.reacted(conversationId(p.id, person, shared(p, person)), emoji, target.text);
+      agent.reacted(id, emoji, target.text);
       return json(res, 202, { ok: true });
     }
 
     if (req.method === "POST" && path === "/api/messages") {
       const text = typeof body?.text === "string" ? body.text.trim().slice(0, 4_000) : "";
       if (!text) return json(res, 400, { error: "text is required" });
-      const replyId = p.replies && typeof body?.replyTo === "string" ? body.replyTo : undefined;
-      const quoted = replyId ? findLine(k, replyId) : undefined;
-      const choice = body?.choice && typeof body.choice === "object" ? (body.choice as { id?: string; title?: string }) : undefined;
-      const incoming: Incoming = {
-        text,
-        ...(quoted && (quoted.kind === "in" || quoted.kind === "out") ? { replyTo: { text: quoted.text, fromAgent: quoted.kind === "out" } } : {}),
-        ...(choice?.title ? { choice: { id: choice.id, title: String(choice.title) } } : {}),
-      };
-      const at = Date.now();
-      const line: Line = { kind: "in", id: null, text, at, ...(quoted ? { replyTo: replyId } : {}), ...(choice?.title ? { choice: true } : {}) };
+      const { incoming, line } = incomingOf(k, body, text, Boolean(p.replies));
+      console.info(JSON.stringify({ parley: "playground.message", person: person.name, phone: person.phone, channel: channel.name, at: new Date(line.at).toISOString(), ip: req.socket.remoteAddress ?? null }));
       emitLine(k, line);
       carrier(p, k, text);
-      const id = conversationId(p.id, person, shared(p, person));
-      const own = ownChannel(agent, p, id);
-      threadsOf.set(keyOf(id), (threadsOf.get(keyOf(id)) ?? new Set()).add(k));
-      const messageId = agent.receive(id, incoming, deliverer(p, k), own ? { channel: own.info, channelName: own.name } : { channel: channelOf(p) });
-      line.id = messageId;
-      push(k, { type: "id", at, messageId });
-      return json(res, 202, { messageId, at });
+      const taken = await agent.simulate({ person: person.phone, channel: channel.name, message: incoming });
+      if (taken) people.set(taken.conversationId, person);
+      line.id = taken?.messageId ?? null;
+      push(k, { type: "id", at: line.at, messageId: line.id });
+      return json(res, 202, { messageId: line.id, at: line.at });
     }
     res.writeHead(404).end();
   }
 
-  return { events, listen, handler, conversationId };
+  const playground: Playground = {
+    events: playgroundEvents,
+    listen: (agent, port, listenOptions = {}) => {
+      const gate = listenOptions.token === undefined ? null : tokenGate(listenOptions.token);
+      attach(agent);
+      return serve(guarded((req, res) => handle(agent, req, res, "", gate)), port);
+    },
+    handler: (agent, handlerOptions) => {
+      const gate = tokenGate(handlerOptions?.token);
+      attach(agent);
+      const base = handlerOptions.base ?? "";
+      return guarded((req, res) => handle(agent, req, res, base, gate));
+    },
+  };
+  return playground;
 }
+
+interface Gate {
+  /** Lets the request through, or answers it (refused, or the token swapped for a cookie). */
+  allows(req: IncomingMessage, res: ServerResponse, url: URL, base: string): boolean;
+}
+
+/**
+ * The playground's lock on a deployed agent. The token comes once as `?token=` (swapped for an
+ * HttpOnly, SameSite=Strict cookie, and dropped from the URL) or on every API call as
+ * `Authorization: Bearer`. Compared in constant time; wrong tokens are limited per address.
+ */
+function tokenGate(token: string | undefined): Gate {
+  if (typeof token !== "string" || token.length < 32) throw new Error("parley simulators: a deployed playground needs a token of at least 32 characters");
+  const hash = (text: string) => createHash("sha256").update(text).digest();
+  const same = (given: string, wanted: string) => timingSafeEqual(hash(given), hash(wanted));
+  // The cookie holds a value made from the token, not the token itself.
+  const session = hash(`parley-playground:${token}`).toString("hex");
+  const failures = new Map<string, { count: number; until: number }>();
+
+  return {
+    allows(req, res, url, base) {
+      const ip = req.socket.remoteAddress ?? "unknown";
+      const now = Date.now();
+      const failed = failures.get(ip);
+      if (failed && failed.until <= now) failures.delete(ip);
+      const blocked = (failures.get(ip)?.count ?? 0) >= MAX_FAILURES;
+      const fail = () => {
+        for (const [k, v] of failures) if (v.until <= now) failures.delete(k);
+        const entry = failures.get(ip) ?? { count: 0, until: now + FAILURE_WINDOW_MS };
+        entry.count++;
+        failures.set(ip, entry);
+        refuse(res, 401);
+        return false;
+      };
+      const query = url.searchParams.get("token");
+      const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
+      if ((query !== null || bearer !== undefined) && blocked) {
+        refuse(res, 429);
+        return false;
+      }
+      if (query !== null) {
+        if (req.method !== "GET" || !same(query, token)) return fail();
+        url.searchParams.delete("token");
+        const secure = (req.socket as TLSSocket).encrypted || req.headers["x-forwarded-proto"] === "https";
+        const cookie = `${COOKIE}=${session}; Path=${base || "/"}; HttpOnly; SameSite=Strict${secure ? "; Secure" : ""}`;
+        const rest = url.searchParams.toString();
+        res.writeHead(303, { "set-cookie": cookie, location: url.pathname + (rest ? `?${rest}` : ""), "cache-control": "no-store" }).end();
+        return false;
+      }
+      if (bearer !== undefined) return same(bearer, token) ? true : fail();
+      const cookie = (req.headers.cookie ?? "").split(/;\s*/).find((c) => c.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1);
+      if (cookie !== undefined && same(cookie, session)) return true;
+      refuse(res, 401);
+      return false;
+    },
+  };
+}
+
+function refuse(res: ServerResponse, status: 401 | 429): void {
+  const text = status === 429 ? "Too many wrong tokens from this address. Try again later." : "This playground needs its token: open it with ?token=<token>, or send Authorization: Bearer <token>.";
+  res.writeHead(status, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }).end(text);
+}
+
+/** The path inside the simulators, whatever they are mounted under. */
+function inside(url: URL, base: string): string {
+  return base && url.pathname.startsWith(base) ? url.pathname.slice(base.length) || "/" : url.pathname;
+}
+
+/** The simulator that plays one of the agent's channels: SMS, WhatsApp, or the web for a custom UI. */
+function platformFor(channel: ChannelSummary): Platform {
+  return { ...platformOf(channel.kind === "custom" ? "web" : channel.kind), ...channel.info };
+}
+
+const digits = (phone: string) => phone.replace(/[^\d]/g, "");
 
 /** The agent's own channel a simulator plays, if it has one of that kind. */
 function ownChannel(agent: AgentConnection, p: Platform, conversationId: string): ChannelSummary | undefined {
@@ -384,6 +641,10 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown> |
 
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
+}
+
+function html(res: ServerResponse, body: string): void {
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(body);
 }
 
 function escapeHtml(text: string): string {

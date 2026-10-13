@@ -3,13 +3,17 @@
 // wraps a client the app already has. SQL is written once with `?` placeholders; an adapter turns
 // them into its own.
 
-import { DatabaseSync } from "node:sqlite";
+// node:sqlite is loaded when sqlite() is called, not on import, so hosts without it (Cloudflare
+// Workers) can run Parley over their own Database.
+import type { DatabaseSync } from "node:sqlite";
 
 export type Row = Record<string, unknown>;
 
 export interface Database {
   /** The database survives a restart (a file, or a server); in-memory SQLite does not. */
   readonly durable: boolean;
+  /** The SQL it speaks, where engines differ (column types in Parley's tables). Default "sqlite". */
+  readonly dialect?: "sqlite" | "postgres";
   /** Rows of a SELECT, or [] for a statement that returns none. */
   query(sql: string, params?: unknown[]): Promise<Row[]>;
   /** A statement that changes rows; resolves to how many it changed. */
@@ -23,7 +27,8 @@ export interface Database {
  * one at a time per connection: a transaction holds the connection until it ends.
  */
 export function sqlite(path = ":memory:"): Database {
-  const db = new DatabaseSync(path);
+  const { DatabaseSync: Sqlite } = process.getBuiltinModule("node:sqlite");
+  const db = new Sqlite(path);
   if (path !== ":memory:") db.exec("PRAGMA journal_mode = WAL");
   let lock: Promise<unknown> = Promise.resolve();
   const exclusive = <T>(work: () => Promise<T>): Promise<T> => {

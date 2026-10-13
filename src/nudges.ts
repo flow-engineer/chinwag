@@ -6,13 +6,13 @@
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { Store, NoContactRow } from "./store.ts";
+import type { NoContactRow, StoreApi } from "./store.ts";
 import { endOfLocalDay, formatLocal } from "./time.ts";
 import { tool, toSpec, type Tool } from "./tools.ts";
 import type { Model } from "./types.ts";
 
 export interface NoContactScope {
-  store: Store;
+  store: StoreApi;
   conversationId: string;
   now(): number;
   /** The zone an `until` date is read in. */

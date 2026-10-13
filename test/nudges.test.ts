@@ -48,18 +48,18 @@ test("a nudge that arrives during a turn waits for it to end", async () => {
   const h = await withSam();
   await h.message("sms", SAM.address, "what's my plan?");
   const thinking = await h.nextCall(1);
-  const nudge = h.agent.nudge({ to: h.to, text: "Your reading is due." });
+  const nudge = h.agent.nudge({ to: h.to, text: "Your order is ready." });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(h.texts("sms"), ["Hi!"], "not sent mid-turn");
   thinking.answer(respond(call("send_sms", { text: "Your plan: …" })));
   assert.equal((await nudge).status, "sent");
-  assert.deepEqual(h.texts("sms"), ["Hi!", "Your plan: …", "Your reading is due."]);
+  assert.deepEqual(h.texts("sms"), ["Hi!", "Your plan: …", "Your order is ready."]);
 });
 
 test("the same idempotency key sends once", async () => {
   const h = await withSam();
-  const first = await h.agent.nudge({ to: h.to, text: "Reminder", idempotencyKey: "reading-2026-10-12" });
-  const again = await h.agent.nudge({ to: h.to, text: "Reminder", idempotencyKey: "reading-2026-10-12" });
+  const first = await h.agent.nudge({ to: h.to, text: "Reminder", idempotencyKey: "order-1040-ready" });
+  const again = await h.agent.nudge({ to: h.to, text: "Reminder", idempotencyKey: "order-1040-ready" });
   assert.equal(again.id, first.id);
   assert.deepEqual(h.texts("sms"), ["Hi!", "Reminder"]);
 });
@@ -90,10 +90,10 @@ test("a nudge a no-contact rule covers is dropped, and the rules are in the agen
 test("outside WhatsApp's window, text and prompt nudges are refused before any model call; a template goes out", async () => {
   const h = await withSam({ whatsapp: { info: { ...WHATSAPP, replyWindowHours: 24 }, phone: true } });
   h.clock.now += 25 * 3_600_000;
-  const text = await h.agent.nudge({ to: h.to, text: "Reading due" });
+  const text = await h.agent.nudge({ to: h.to, text: "Order ready" });
   assert.equal(text.status, "refused");
   assert.equal(text.reason, "outside_window");
-  assert.equal((await h.agent.nudge({ to: h.to, prompt: "Reading due" })).reason, "outside_window");
+  assert.equal((await h.agent.nudge({ to: h.to, prompt: "Order ready" })).reason, "outside_window");
   assert.equal(h.calls.length, 1, "no model call");
   const template = await h.agent.nudge({ to: h.to, template: { name: "order_ready", variables: { name: "Sam" } } });
   assert.equal(template.status, "sent");
@@ -132,7 +132,7 @@ test("a no-contact rule ends at its until date, and goes when the agent removes 
   await h.conversation.whenIdle();
 
   h.clock.now = Date.UTC(2026, 9, 13, 1); // the day is over (UTC: no zone set)
-  const nudge = h.agent.nudge({ to: h.to, text: "Reading due" });
+  const nudge = h.agent.nudge({ to: h.to, text: "Order ready" });
   const check = await h.nextCall(3);
   assert.doesNotMatch(check.request.messages[0].content as string, /no reminders today/, "the ended rule is gone");
   check.answer(respond(call("decide", { send: true })));

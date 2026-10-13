@@ -105,6 +105,8 @@ const play = simulators({ title: "My agent" });
 await play.listen(buildAgent({ events: [play.events] }), 8788);
 ```
 
+The playground plays only the test people you declare (`testPeople: [{ name, phone }]`) on the agent's own channels. A test person is a real person to the agent: the same identity, `resolve` and history as if they wrote from their phone, one conversation on every channel, and "Clear history" to start again. Replies go back where the person last wrote from, the playground or the real channel. On a deployed agent, mount `play.handler(agent, { token })`: it refuses requests without the token (at least 32 characters), swaps `?token=` for a cookie on the playground's path, and limits wrong tries.
+
 `AGENTS.md` says what the agent is for and what it may and may not do. Leave messaging out of it: Parley adds how to talk on each channel (its send tool, reactions, formatting, acknowledging first). A skill's `SKILL.md` starts with a `name` and `description`; the agent sees every description and loads a skill when it needs it (`inlineSkills: true` puts them all in the prompt instead).
 
 ## Channels and people
@@ -156,7 +158,7 @@ await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt
 
 ## State, restarts and hosting
 
-- Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). For another engine such as Postgres, implement the three-method `Database` interface.
+- Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). Postgres: `postgres(pool)` over your own node-postgres pool. Any other engine: implement the three-method `Database` interface, or pass a whole `store` of your own.
 - After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun.
 - `agent.status()` says whether anything is running and for how long it has been idle, so your platform can stop idle agents and start them on the next message.
 - Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file.
@@ -207,6 +209,8 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `channels` | `whatsapp()`, `sms()`, `customUI()` definitions |
 | `resolve` | Your key for a person from a channel identity, to join channels |
 | `database` | Where state lives (`sqlite()` in memory by default) |
+| `testPeople` | Who the playground may play: `[{ name, phone }]` |
+| `files` | `AGENTS.md` and skills as text, instead of `dir`, where there is no folder to read |
 | `context` | Text added to every turn: who this person is, the time |
 | `intercept` | Answer some messages without the model (STOP, HELP) |
 | `timeZone` | The business's time zone, for schedules when a person's is unknown |

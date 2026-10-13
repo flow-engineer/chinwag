@@ -25,6 +25,10 @@
   .tab[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .spacer { flex: 1; }
   .ghost { padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); cursor: pointer; }
+  select.ghost { max-width: 240px; }
+  .empty { grid-column: 1 / -1; padding: 32px; text-align: center; color: var(--quiet); }
+  .empty code { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+  body:not(.play) .play-only, body.play .cloud-only { display: none; }
   main { display: grid; grid-template-columns: minmax(0, 400px) minmax(0, 1fr); gap: 16px; padding: 16px; height: calc(100vh - 58px); }
   @media (max-width: 820px) { main { grid-template-columns: 1fr; height: auto; } .side { height: 520px; } .phone { height: 680px; } }
 
@@ -185,8 +189,10 @@
   <h1>{{title}} <small>· Parley playground</small></h1>
   <div class="tabs" id="tabs" role="group" aria-label="Platform"></div>
   <div class="spacer"></div>
+  <select class="ghost play-only" id="who" aria-label="Test person" title="Who you are: one of the agent's test people, the same person on every channel"></select>
   <button class="ghost" id="debug" type="button" aria-pressed="false" title="Show the agent's tool calls in the conversation">Debug</button>
-  <button class="ghost" id="reset" type="button">New conversation</button>
+  <button class="ghost cloud-only" id="reset" type="button">New conversation</button>
+  <button class="ghost play-only" id="clear" type="button" title="Forget this person: their history, schedules and everything the agent kept about them">Clear history</button>
 </div>
 <main>
   <section class="phone" id="phone" aria-label="Simulator">
@@ -224,13 +230,20 @@
   const BOOT = "{{boot}}";
   // Where the simulators are mounted ("" on their own port, "/simulator" inside the test cloud).
   const BASE = "{{base}}";
+  // The playground plays the agent's test people on its own channels; the test cloud, generated people on any platform.
+  const PLAY = "{{mode}}" === "playground";
+  if (PLAY) document.body.classList.add("play");
   const params = new URLSearchParams(location.search);
   // ?replay=<url of a saved run> shows that conversation read only; ?embed=1 shows only the phone.
   const REPLAY = params.get("replay");
   let replayData = null;
   if (REPLAY) document.body.classList.add("replay");
   if (params.get("embed") === "1") document.body.classList.add("embed");
-  const person = params.get("person") || "demo";
+  const remember = (k, v) => { if (!params.has("embed")) { try { localStorage.setItem(k, v); } catch {} } };
+  const recall = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+  let person = params.get("person") || (PLAY ? recall("parley.person") : null) || "demo";
+  let people = [];         // the playground: the agent's test people
+  let channels = [];       // the playground: the agent's channels, each with the platform that plays it
   let title = document.getElementById("name").textContent;
   const $ = (id) => document.getElementById(id);
   const TAPBACKS = [["❤️", "Loved"], ["👍", "Liked"], ["👎", "Disliked"], ["😂", "Laughed at"], ["‼️", "Emphasized"], ["❓", "Questioned"]];
@@ -244,7 +257,8 @@
   let replyTo = null;      // { id, text, fromAgent }
   const rows = new Map();  // message id → row element
 
-  const query = () => `?platform=${current.id}&person=${encodeURIComponent(person)}`;
+  const where = () => PLAY ? { channel: current.channel, person } : { platform: current.id, person };
+  const query = () => "?" + new URLSearchParams(where()).toString();
   const fmt = (ms) => ms == null ? "…" : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
   const clock = (at) => new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   const subtitle = () => ({ sms: person, whatsapp: "online", imessage: "iMessage", telegram: "bot", web: "Usually replies instantly" })[current.id];
@@ -260,9 +274,16 @@
   }
 
   function setPlatform(id) {
-    current = platforms.find((p) => p.id === id) || platforms[0];
-    if (!REPLAY && !params.has("embed")) { try { localStorage.setItem("parley.platform", current.id); } catch {} }
-    for (const b of document.querySelectorAll(".tab")) b.setAttribute("aria-pressed", String(b.dataset.id === current.id));
+    if (PLAY) {
+      const ch = channels.find((c) => c.name === id) || channels[0];
+      current = { ...ch.platform, channel: ch.name };
+      remember("parley.channel", ch.name);
+    } else {
+      current = platforms.find((p) => p.id === id) || platforms[0];
+      if (!REPLAY) remember("parley.platform", current.id);
+    }
+    const tab = PLAY ? current.channel : current.id;
+    for (const b of document.querySelectorAll(".tab")) b.setAttribute("aria-pressed", String(b.dataset.id === tab));
     $("phone").className = "phone p-" + current.id;
     $("avatar").textContent = title.trim().charAt(0).toUpperCase();
     $("sub").textContent = subtitle();
@@ -451,7 +472,7 @@
       const react = document.createElement("button");
       react.type = "button"; react.title = "React"; react.textContent = "☺";
       react.addEventListener("click", () => togglePicker(row, current.personReactions.map((e) => [e, e]), (emoji) => {
-        fetch(BASE + "/api/reactions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ platform: current.id, person, messageId: line.id, emoji }) });
+        fetch(BASE + "/api/reactions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...where(), messageId: line.id, emoji }) });
       }));
       actions.appendChild(react);
     }
@@ -685,7 +706,7 @@
       else if (d.type === "status") { if (current.status) { showStatus(d.text); if (d.text) onSeen("status", d.at); } }
       else if (d.type === "typing") showTyping(d.on);
       else if (d.type === "trace") trace(d.event);
-      else if (d.type === "reset") setPlatform(current.id);
+      else if (d.type === "reset") setPlatform(PLAY ? current.channel : current.id);
     };
   }
 
@@ -704,7 +725,7 @@
   }
 
   async function send(text, extra = {}) {
-    const body = { platform: current.id, person, text, ...extra };
+    const body = { ...where(), text, ...extra };
     if (!body.replyTo && replyTo) body.replyTo = replyTo.id;
     setReply(null);
     await fetch(BASE + "/api/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -750,24 +771,53 @@
   $("text").addEventListener("input", updateCounter);
   $("cancelReply").addEventListener("click", () => setReply(null));
   $("reset").addEventListener("click", () => fetch(BASE + "/api/reset" + query(), { method: "POST" }));
+  $("clear").addEventListener("click", () => {
+    const who = people.find((p) => p.phone === person);
+    if (who && confirm(`Forget ${who.name}? Their history, schedules and everything the agent kept about them go, on every channel.`)) {
+      fetch(BASE + "/api/clear?" + new URLSearchParams({ person }).toString(), { method: "POST" });
+    }
+  });
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".picker") && !e.target.closest(".actions")) document.querySelectorAll(".picker").forEach((p) => p.remove());
   });
 
+  function tabFor(id, label, p) {
+    const b = document.createElement("button");
+    b.className = "tab";
+    b.type = "button";
+    b.dataset.id = id;
+    const img = document.createElement("img");
+    img.src = `https://cdn.simpleicons.org/${p.icon}`;
+    img.alt = "";
+    b.append(img, document.createTextNode(label));
+    if (!p.complete) { const s = document.createElement("small"); s.textContent = "partial"; b.appendChild(s); }
+    b.addEventListener("click", () => setPlatform(id));
+    $("tabs").appendChild(b);
+  }
+
+  // The playground with nothing to play: say what the agent's author has to declare.
+  function empty(html) {
+    document.querySelector("main").innerHTML = `<div class="empty">${html}</div>`;
+  }
+
   (async () => {
-    ({ platforms, cards } = await (await fetch(BASE + "/api/platforms")).json());
-    for (const p of platforms) {
-      const b = document.createElement("button");
-      b.className = "tab";
-      b.type = "button";
-      b.dataset.id = p.id;
-      const img = document.createElement("img");
-      img.src = `https://cdn.simpleicons.org/${p.icon}`;
-      img.alt = "";
-      b.append(img, document.createTextNode(p.name));
-      if (!p.complete) { const s = document.createElement("small"); s.textContent = "partial"; b.appendChild(s); }
-      b.addEventListener("click", () => setPlatform(p.id));
-      $("tabs").appendChild(b);
+    ({ platforms, cards, people = [], channels = [] } = await (await fetch(BASE + "/api/platforms")).json());
+    if (PLAY) {
+      if (!channels.length) return empty("This agent has no channels. Declare them in <code>createAgent({ channels: [...] })</code> (whatsapp(), sms(), customUI()) to test it here.");
+      if (!people.length) return empty("This agent has no test people. Declare who may be played here in <code>createAgent({ testPeople: [{ name, phone }] })</code>.");
+      if (!people.some((p) => p.phone === person)) person = people[0].phone;
+      remember("parley.person", person);
+      for (const p of people) {
+        const o = document.createElement("option");
+        o.value = p.phone;
+        o.textContent = `${p.name} · ${p.phone}`;
+        $("who").appendChild(o);
+      }
+      $("who").value = person;
+      $("who").addEventListener("change", () => { person = $("who").value; remember("parley.person", person); setPlatform(current.channel); });
+      for (const c of channels) tabFor(c.name, c.name, c.platform);
+    } else {
+      for (const p of platforms) tabFor(p.id, p.name, p);
     }
     let debug = params.get("debug") === "1";
     if (!params.has("debug")) { try { debug = localStorage.getItem("parley.debug") === "1"; } catch {} }
@@ -781,9 +831,8 @@
       setPlatform(replayData.channel || replayData.platform || "sms");
       return;
     }
-    let saved = params.get("platform");
-    if (!saved) { try { saved = localStorage.getItem("parley.platform"); } catch {} }
-    setPlatform(saved || "sms");
+    const saved = PLAY ? params.get("channel") || recall("parley.channel") : params.get("platform") || recall("parley.platform");
+    setPlatform(saved || (PLAY ? channels[0].name : "sms"));
     setInterval(refreshStatus, 1000);
     refreshStatus();
   })();

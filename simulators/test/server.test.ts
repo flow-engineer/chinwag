@@ -1,7 +1,12 @@
-// covers: simulators/src/server.ts simulators/src/platforms.ts
+// covers: simulators/src/server.ts simulators/src/platforms.ts src/agent.ts src/conversation.ts
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import type { ChannelInfo, ChannelSummary, Deliver } from "../../src/index.ts";
+import { sqlite, type ChannelInfo, type ChannelSummary, type Deliver } from "../../src/index.ts";
+import { WHATSAPP, call, multi, respond } from "../../test/helpers.ts";
 import { simulators, type AgentConnection, type Line } from "../src/index.ts";
 
 /** An agent that answers nothing by itself: the test delivers through the last `deliver` it got. */
@@ -27,9 +32,10 @@ function fakeAgent(channels?: ChannelSummary[]) {
   return { fake, connection };
 }
 
-async function start(helpReply?: string, channels?: ChannelSummary[], shareConversations = false) {
+/** The test cloud's simulators: any person, any platform. */
+async function start(helpReply?: string, channels?: ChannelSummary[]) {
   const { fake, connection } = fakeAgent(channels);
-  const server = await simulators({ sms: { helpReply }, shareConversations }).listen(connection, 0);
+  const server = await simulators({ sms: { helpReply }, testCloud: true }).listen(connection, 0);
   const post = (path: string, body: unknown) =>
     fetch(server.url + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const send = async (platform: string, text: string) => assert.equal((await post("/api/messages", { platform, person: "p", text })).status, 202);
@@ -97,22 +103,76 @@ test("the web simulator plays the agent's own custom UI, and shows the params it
   }
 });
 
-test("shared conversations: one person on the agent's SMS and app is one conversation, each reply on its own platform", async () => {
-  const channels: ChannelSummary[] = [
-    { name: "sms", kind: "sms", info: { reactions: false, status: false, formatting: "plain" } },
-    { name: "app", kind: "custom", info: { reactions: false, status: false, formatting: "markdown" } },
-  ];
-  const { fake, server, send, lines } = await start(undefined, channels, true);
+const MARIA = { name: "Maria", phone: "+15555550101" };
+
+/** Pip-like agent with one WhatsApp channel and Maria as its test person, on `database`. */
+function agentOn(database: ReturnType<typeof sqlite>, dir?: string) {
+  return multi({ channels: { whatsapp: { info: WHATSAPP, phone: true } }, testPeople: [MARIA], database, dir });
+}
+
+test("a deployed playground lets in only its token, then only the agent's test people", async () => {
+  const h = agentOn(sqlite());
+  const play = simulators();
+  assert.throws(() => play.handler(h.agent, { token: undefined as unknown as string }), /token/);
+  assert.throws(() => play.handler(h.agent, { token: "too-short" }), /32 characters/);
+  const token = "t".repeat(40);
+  const server = createServer(play.handler(h.agent, { token, base: "/play" }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/play`;
   try {
-    await send("sms", "hi");
-    const bySms = fake.deliver!;
-    await send("web", "show my progress");
-    assert.deepEqual(fake.conversationIds, ["person:p", "person:p"]);
-    await bySms({ type: "message", text: "Hi by text" });
-    await fake.deliver!({ type: "message", text: "Here in the app" });
-    assert.deepEqual((await lines("sms")).filter((l) => l.kind === "out").map((l) => l.kind === "out" && l.text), ["Hi by text"]);
-    assert.deepEqual((await lines("web")).filter((l) => l.kind === "out").map((l) => l.kind === "out" && l.text), ["Here in the app"]);
+    assert.equal((await fetch(`${url}/`)).status, 401);
+    assert.equal((await fetch(`${url}/api/platforms`, { headers: { authorization: "Bearer wrong" } })).status, 401);
+
+    const opened = await fetch(`${url}/?token=${token}&channel=whatsapp`, { redirect: "manual" });
+    assert.equal(opened.status, 303);
+    assert.equal(opened.headers.get("location"), "/play/?channel=whatsapp", "the token leaves the URL");
+    const cookie = opened.headers.get("set-cookie")!;
+    assert.match(cookie, /HttpOnly/);
+    assert.match(cookie, /SameSite=Strict/);
+    assert.doesNotMatch(cookie, new RegExp(token), "the cookie does not hold the token");
+    assert.equal((await fetch(`${url}/`, { headers: { cookie: cookie.split(";")[0] } })).status, 200);
+    assert.equal((await fetch(`${url}/api/platforms`, { headers: { authorization: `Bearer ${token}` } })).status, 200);
+
+    const stranger = await fetch(`${url}/api/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ channel: "whatsapp", person: "+15555550199", text: "hi" }),
+    });
+    assert.equal(stranger.status, 403);
+    assert.equal(h.calls.length, 0);
+
+    for (let i = 0; i < 9; i++) await fetch(`${url}/api/status`, { headers: { authorization: "Bearer wrong" } });
+    assert.equal((await fetch(`${url}/api/status`, { headers: { authorization: `Bearer ${token}` } })).status, 429, "too many wrong tokens: even the right one waits");
   } finally {
-    await server.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("the playground shows the person's conversation from the agent's store, also after a restart", async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "parley-play-")), "parley.db");
+  const first = agentOn(sqlite(path));
+  await first.agent.resume();
+  const play = simulators();
+  const server = await play.listen(first.agent, 0);
+  const send = await fetch(`${server.url}/api/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ channel: "whatsapp", person: MARIA.phone, text: "a latte please" }),
+  });
+  assert.equal(send.status, 202);
+  (await first.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Which size?", buttons: ["Small", "Large"] })));
+  const id = (await first.agent.testConversation(MARIA.phone))!;
+  await first.agent.conversation(id)!.whenIdle();
+  await server.close();
+
+  const again = agentOn(sqlite(path), first.dir);
+  await again.agent.resume();
+  const restarted = await simulators().listen(again.agent, 0);
+  try {
+    const { lines } = (await (await fetch(`${restarted.url}/api/transcript?channel=whatsapp&person=${encodeURIComponent(MARIA.phone)}`)).json()) as { lines: Line[] };
+    const said = lines.flatMap((l) => (l.kind === "in" || l.kind === "out" ? [[l.kind, l.text, l.kind === "out" ? l.buttons : undefined]] : []));
+    assert.deepEqual(said, [["in", "a latte please", undefined], ["out", "Which size?", ["Small", "Large"]]]);
+  } finally {
+    await restarted.close();
   }
 });

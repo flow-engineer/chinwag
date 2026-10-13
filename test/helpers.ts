@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, tool, type Database } from "../src/index.ts";
+import { createAgent, tool, type Database, type TestPerson } from "../src/index.ts";
 import type { ChannelInfo, ChatMessage, Model, ModelRequest, ModelResponse, Outbound, ParleyEvent, ToolCall } from "../src/index.ts";
 
 /**
@@ -103,6 +103,7 @@ export function multi(options: {
   now?: () => number;
   timeZone?: string;
   dir?: string;
+  testPeople?: TestPerson[];
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "parley-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
@@ -127,6 +128,7 @@ export function multi(options: {
     resolve: options.resolve,
     now: options.now,
     timeZone: options.timeZone,
+    testPeople: options.testPeople,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>

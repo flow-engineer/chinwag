@@ -56,7 +56,8 @@ export function buildAgent(options: { model?: Model; events?: EventSink[]; tools
 }
 ```
 
-Other `createAgent` options: `context(conversationId)` adds who the person is and the time to
+Other `createAgent` options: `files` replaces `dir` on hosts with no file system (the folder's
+text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `context(conversationId)` adds who the person is and the time to
 every turn (cheaper than a lookup tool); `intercept(conversationId, text)` answers a message
 without the model (return the reply, `""` for silence, or `null` to let the agent answer);
 `deadlineMs` (default 60,000) is the longest a reply waits for a tool before it moves to the
@@ -101,6 +102,11 @@ await agent.resume();                     // a durable database: always before t
 await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" });
 ```
 
+- Several processes or machines need Postgres, not a SQLite file: `database: postgres(pool)`
+  with the app's own node-postgres `Pool` (Parley adds no Postgres dependency). An agent that must
+  not hold database credentials gets `store` instead of `database`: any object with Store's
+  methods (`StoreApi`), such as a client that forwards each call to a service running `new
+  Store(postgres(pool), agentId)`.
 - The simulators and the test cloud play an agent's own channels with these definitions (the web
   simulator plays a customUI), so the model sees the production tools; they show params such as
   app_link under the message instead of calling your sendMessage.
@@ -116,7 +122,7 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 - After a restart, `resume()` carries on: cut-off turns run again, background tools that were
   running are reported as interrupted (never rerun).
 - `agent.receive(conversationId, message, deliver)` still works for one channel at a time (the
-  playground uses it).
+  test cloud uses it).
 
 Built in, so don't build them as tools: scheduled messages (`schedule_message`, `list_scheduled`,
 `cancel_scheduled`, in the person's local time), and what a person asked not to be messaged about
@@ -129,8 +135,19 @@ to send later. Outside WhatsApp's 24-hour window only templates go out (`outside
 
 ## The playground
 
-`src/main.ts` serves the agent in the local simulators (SMS, WhatsApp, iMessage, Telegram, web),
-each with that platform's real rules:
+Every agent ships a test playground: people test it as real users before its numbers are live.
+Declare who may be played in `createAgent({ testPeople: [{ name: "Maria", phone: "+15555550101" }] })`;
+no one else can be. A test person is a real person to the agent: the same identity, `resolve`,
+`intercept`, history and schedules as when that number writes through a provider (the playground
+is just another phone; they may be test members in your real backend). On phone channels their
+address is the number; on others `test:<number>`, joined to the same person. One person is one
+conversation across every channel: switch channels and the chat resumes. A listed number may also
+write from a real provider once a channel is live; replies, scheduled messages and nudges go back
+wherever that person last wrote from on that channel.
+
+`src/main.ts` serves it with the simulators (SMS, WhatsApp, and the web simulator for a custom UI),
+each with that platform's real rules, on the agent's own `channels` (declare them, with a provider
+that is not connected yet if the numbers are not ready: test people never reach it):
 
 ```ts
 import { simulators } from "@parley/simulators";
@@ -138,13 +155,20 @@ import { buildAgent } from "./agent.ts";
 
 const play = simulators({ title: "My agent" });
 const agent = buildAgent({ events: [play.events] });
-await play.listen(agent, 8788);
+await play.listen(agent, 8788);           // 127.0.0.1 only; no token needed there
 ```
 
-Open the printed link, pick a platform, and chat. The side panel shows how fast each message was
-acknowledged and a trace of every model call and tool.
+Open the printed link, pick a test person and a channel, and chat; `/person` shows every channel
+side by side. The page shows the person's conversation from the agent's store, so it survives
+restarts (with a durable `database`), and Clear history forgets the person entirely
+(`agent.forgetPerson(conversationId)`: history, schedules, everything). The side panel shows how
+fast each message was acknowledged and a trace of every model call and tool. `cards` says how a
+custom UI shows a link in its params: `{ match: "/video/", label: "Start video call", kind: "call" }`;
+any other link is "Open in app".
 
-For an agent with several channels, `simulators({ shareConversations: true, cards: [...] })` and
-`/person` show one person (a test number the browser remembers) on each of its channels side by
-side, as one conversation. `cards` says how a custom UI shows a link in its params:
-`{ match: "/video/", label: "Start video call", kind: "call" }`; any other link is "Open in app".
+On a deployed agent, mount it in your own server with a token of at least 32 characters, from a
+secret: `const playground = play.handler(agent, { token: process.env.PLAYGROUND_TOKEN!, base: "/playground" })`,
+and hand it the requests under `/playground` (`if (url.pathname.startsWith("/playground")) return playground(req, res)`).
+Open `/playground/?token=...` once (it becomes an HttpOnly cookie and leaves the URL) or call the API
+with `Authorization: Bearer <token>`. Wrong tokens are limited per address, and every simulated
+message is logged with the person, channel, time and address.

@@ -23,22 +23,35 @@ function frontmatter(text: string): { fields: Record<string, string>; body: stri
   return { fields, body: match[2] };
 }
 
-export function loadSkills(dir: string): Skill[] {
+/** An agent's folder as text: AGENTS.md and skills/<name>/SKILL.md, by their paths in it. */
+export type AgentFiles = Record<string, string>;
+
+export function readAgentFolder(dir: string): AgentFiles {
+  const files: AgentFiles = {};
+  const agents = join(dir, "AGENTS.md");
+  if (existsSync(agents)) files["AGENTS.md"] = readFileSync(agents, "utf8");
   const root = join(dir, "skills");
-  if (!existsSync(root)) return [];
-  const skills: Skill[] = [];
+  if (!existsSync(root)) return files;
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const file = join(root, entry.name, "SKILL.md");
-    if (!entry.isDirectory() || !existsSync(file)) continue;
-    const { fields, body } = frontmatter(readFileSync(file, "utf8"));
-    skills.push({ name: fields.name || entry.name, description: fields.description || "", body: body.trim() });
+    if (entry.isDirectory() && existsSync(file)) files[`skills/${entry.name}/SKILL.md`] = readFileSync(file, "utf8");
+  }
+  return files;
+}
+
+export function loadSkills(files: AgentFiles): Skill[] {
+  const skills: Skill[] = [];
+  for (const [path, text] of Object.entries(files)) {
+    const folder = /^skills\/([^/]+)\/SKILL\.md$/.exec(path)?.[1];
+    if (!folder) continue;
+    const { fields, body } = frontmatter(text);
+    skills.push({ name: fields.name || folder, description: fields.description || "", body: body.trim() });
   }
   return skills.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function loadInstructions(dir: string, skills: Skill[], inline = false): string {
-  const file = join(dir, "AGENTS.md");
-  const base = existsSync(file) ? readFileSync(file, "utf8").trim() : "";
+export function loadInstructions(files: AgentFiles, skills: Skill[], inline = false): string {
+  const base = (files["AGENTS.md"] ?? "").trim();
   if (!skills.length) return base;
   if (inline) return `${base}\n\n${skills.map((s) => `## Skill: ${s.name}\n${s.body}`).join("\n\n")}`;
   const list = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");

@@ -6,7 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { Store, ScheduleRow } from "./store.ts";
+import type { ScheduleRow, StoreApi } from "./store.ts";
 import { DAY_INDEX, clock, date, describe, endOfLocalDay, formatLocal, isBareUtc, localDate, localToUtc, nextRun, parts, validZone, type Rule } from "./time.ts";
 import { tool, type Tool } from "./tools.ts";
 
@@ -22,7 +22,7 @@ export const LIMITS = {
 
 /** What the schedule tools need from the conversation they run in. */
 export interface ScheduleScope {
-  store: Store;
+  store: StoreApi;
   conversationId: string;
   /** The channel of the person's latest message, where a schedule's messages will go. */
   channel(): string;
@@ -176,7 +176,7 @@ function ruleOf(input: z.infer<typeof scheduleInput>, zone: string, now: number)
 }
 
 /** A scheduled message from the business (a nudge with a time): fixed text, or an instruction. */
-export async function addBusinessSchedule(store: Store, conversationId: string, channel: string, at: number, zone: string, body: { text?: string; prompt?: string }): Promise<string> {
+export async function addBusinessSchedule(store: StoreApi, conversationId: string, channel: string, at: number, zone: string, body: { text?: string; prompt?: string }): Promise<string> {
   const id = `s_${randomUUID().slice(0, 8)}`;
   await store.addSchedule({
     id,
@@ -210,7 +210,7 @@ export interface DueRun {
  * now, so nothing floods after downtime), one `blocked` names a reason is skipped, the rest are
  * queued for their conversation. Returns the queued runs with their inbox ids.
  */
-export async function claimDue(store: Store, now: number, blocked: (s: ScheduleRow) => Promise<string | null>): Promise<Array<{ conversationId: string; inbox: number; run: DueRun }>> {
+export async function claimDue(store: StoreApi, now: number, blocked: (s: ScheduleRow) => Promise<string | null>): Promise<Array<{ conversationId: string; inbox: number; run: DueRun }>> {
   const queued: Array<{ conversationId: string; inbox: number; run: DueRun }> = [];
   for (const s of await store.dueSchedules(now)) {
     const due = s.nextRunAt!;

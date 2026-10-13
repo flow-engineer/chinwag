@@ -1,9 +1,12 @@
 // covers: src/conversation.ts src/events.ts
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
-import { tool } from "../src/index.ts";
-import { call, gate, harness, last, respond, say, users } from "./helpers.ts";
+import { createAgent, tool } from "../src/index.ts";
+import { call, gate, harness, last, respond, say, scriptedModel, users } from "./helpers.ts";
 
 test("a double text folds into the reply being written", async () => {
   const h = harness();
@@ -18,6 +21,24 @@ test("a double text folds into the reply being written", async () => {
   await h.agent.conversation("c7")!.whenIdle();
   assert.deepEqual(h.sent(), ["Hi! Sure, which day works?"]);
   assert.ok(h.events.some((e) => e.type === "model.restarted"));
+});
+
+test("a double text that comes before the first model call (the turn still loading) joins that call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "parley-"));
+  writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
+  const scripted = scriptedModel();
+  const loading = gate();
+  const loaded = gate<string>();
+  const agent = createAgent({ dir, model: scripted.model, debounceMs: 0, context: () => (loading.open(), loaded.promise) });
+  agent.receive("c9", "hi", () => undefined);
+  await loading.promise;
+  agent.receive("c9", "can I move Thursday?", () => undefined);
+  loaded.open("");
+
+  const first = await scripted.nextCall(0);
+  assert.deepEqual(users(first.request.messages), ["[m1] hi", "[m2] can I move Thursday?"]);
+  first.answer(respond(say("Hi! Sure, which day works?")));
+  await agent.conversation("c9")!.whenIdle();
 });
 
 test("a message sent while tools run is read at once: the tool moves to the background", async () => {
