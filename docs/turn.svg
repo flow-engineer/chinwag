@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-labelledby="title description">
+  <title id="title">One turn, from double text to one answer</title>
+  <desc id="description">At 0.0 seconds the person asks for a large latte. At 1.2 seconds they add oat milk; both messages fold into the same turn. Around 2 seconds the agent acknowledges and calls get_menu. The tool runs until around 3 seconds. Around 4 seconds the agent gives one answer. If the person writes again while a tool runs, the tool moves to the background, the agent answers the new message now, and the result comes back into the chat when ready.</desc>
+  <style>
+    text { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #182637; }
+    .muted { fill: #526173; }
+    .accent { fill: #2f6fed; }
+    .glyph { fill: none; stroke: #2f6fed; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <rect x="1" y="1" width="1198" height="698" rx="24" fill="#fbfcfe" stroke="#dce3eb" stroke-width="2"/>
+  <text x="40" y="54" font-size="28" font-weight="600" class="" text-anchor="start">One turn</text>
+  <path d="M96 104H1128m-7-5 7 5-7 5" fill="none" stroke="#526173" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="96" y="88" font-size="14" font-weight="600" class="" text-anchor="middle">0.0 s</text>
+  <path d="M96 99v10" stroke="#526173" stroke-width="2"/>
+  <text x="384" y="88" font-size="14" font-weight="600" class="" text-anchor="middle">1.2 s</text>
+  <path d="M384 99v10" stroke="#526173" stroke-width="2"/>
+  <text x="576" y="88" font-size="14" font-weight="600" class="" text-anchor="middle">~2 s</text>
+  <path d="M576 99v10" stroke="#526173" stroke-width="2"/>
+  <text x="816" y="88" font-size="14" font-weight="600" class="" text-anchor="middle">~3 s</text>
+  <path d="M816 99v10" stroke="#526173" stroke-width="2"/>
+  <text x="1056" y="88" font-size="14" font-weight="600" class="" text-anchor="middle">~4 s</text>
+  <path d="M1056 99v10" stroke="#526173" stroke-width="2"/>
+  <path d="M96 110v32M384 110v32M576 110v194M1056 110v32" stroke="#dce3eb" stroke-width="2" stroke-dasharray="4 6"/>
+  <rect x="40" y="142" width="280" height="100" rx="16" fill="#e8f4ec" stroke="#dce3eb" stroke-width="2"/>
+  <text x="58" y="168" font-size="13" font-weight="600" class="" text-anchor="start">Person</text>
+  <text x="58" y="196" font-size="16" font-weight="400" class="" text-anchor="start">“hi! can I get a large latte”</text>
+  <rect x="338" y="142" width="224" height="100" rx="16" fill="#e8f4ec" stroke="#dce3eb" stroke-width="2"/>
+  <text x="356" y="168" font-size="13" font-weight="600" class="" text-anchor="start">Person</text>
+  <text x="356" y="196" font-size="16" font-weight="400" class="" text-anchor="start">“oat milk please”</text>
+  <path d="M96 254v10h288v-10" fill="none" stroke="#a8c6b1" stroke-width="2" stroke-linecap="round"/>
+  <text x="240" y="287" font-size="13" font-weight="400" class="muted" text-anchor="middle">Double text · folded into the same turn</text>
+  <rect x="458" y="306" width="384" height="96" rx="16" fill="#edf3ff" stroke="#dce3eb" stroke-width="2"/>
+  <text x="476" y="331" font-size="13" font-weight="600" class="accent" text-anchor="start">Agent · acknowledgement + tool call</text>
+  <text x="476" y="358" font-size="17" font-weight="400" class="" text-anchor="start">“Large oat latte, coming up.</text>
+  <text x="476" y="381" font-size="17" font-weight="400" class="" text-anchor="start">Checking the price.”</text>
+  <rect x="882" y="142" width="278" height="120" rx="16" fill="#edf3ff" stroke="#dce3eb" stroke-width="2"/>
+  <text x="900" y="168" font-size="13" font-weight="600" class="accent" text-anchor="start">Agent · one answer</text>
+  <text x="900" y="196" font-size="17" font-weight="400" class="" text-anchor="start">“Large oat latte is $4.80.</text>
+  <text x="900" y="219" font-size="17" font-weight="400" class="" text-anchor="start">Shall I place it?”</text>
+  <rect x="576" y="422" width="240" height="16" rx="8" fill="#2f6fed"/>
+  <text x="696" y="464" font-size="14" font-weight="600" class="accent" text-anchor="middle">get_menu runs</text>
+  <path d="M40 498h1120" stroke="#dce3eb" stroke-width="2"/>
+  <text x="40" y="533" font-size="16" font-weight="600" class="" text-anchor="start">if they write again while a tool runs</text>
+  <path d="M72 571h1056m-7-5 7 5-7 5" fill="none" stroke="#9aa6b5" stroke-width="2" stroke-dasharray="5 6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="96" cy="571" r="5" fill="#fbfcfe" stroke="#2f6fed" stroke-width="2"/>
+  <circle cx="480" cy="571" r="5" fill="#fbfcfe" stroke="#2f6fed" stroke-width="2"/>
+  <circle cx="884" cy="571" r="5" fill="#fbfcfe" stroke="#2f6fed" stroke-width="2"/>
+  <text x="72" y="607" font-size="16" font-weight="400" class="" text-anchor="start">Tool moves to</text>
+  <text x="72" y="630" font-size="16" font-weight="400" class="" text-anchor="start">the background</text>
+  <text x="456" y="607" font-size="16" font-weight="400" class="" text-anchor="start">Agent answers the</text>
+  <text x="456" y="630" font-size="16" font-weight="400" class="" text-anchor="start">new message now</text>
+  <text x="860" y="607" font-size="16" font-weight="400" class="" text-anchor="start">Tool result comes back into</text>
+  <text x="860" y="630" font-size="16" font-weight="400" class="" text-anchor="start">the chat when it is ready</text>
+</svg>

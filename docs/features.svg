@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-labelledby="title description">
+  <title id="title">Chat agents that feel like a person texting back</title>
+  <desc id="description">Ten features: double texts fold into one reply; every message is heard in seconds; parallel tools keep moving; one conversation across channels; each platform’s rules; restarts with SQLite or your database; reminders in the person’s time zone; nudges respect no; skills on demand; a playground for every channel.</desc>
+  <style>
+    text { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #182637; }
+    .muted { fill: #526173; }
+    .accent { fill: #2f6fed; }
+    .glyph { fill: none; stroke: #2f6fed; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <rect x="1" y="1" width="1198" height="698" rx="24" fill="#fbfcfe" stroke="#dce3eb" stroke-width="2"/>
+  <text x="32" y="58" font-size="28" font-weight="600" class="" text-anchor="start">Chat agents that feel like a person texting back</text>
+  <rect x="32" y="104" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="50" y="124" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(58 132)"><path d="M5 6h26v18H15l-6 5v-5H5z"/><path d="M18 30h12l6 5v-5h5V12h-5"/></g>
+  <text x="50" y="220" font-size="18" font-weight="600" class="" text-anchor="start">Double texts,</text>
+  <text x="50" y="243" font-size="18" font-weight="600" class="" text-anchor="start">one reply</text>
+  <text x="50" y="282" font-size="13" font-weight="400" class="muted" text-anchor="start">Messages sent while it thinks</text>
+  <text x="50" y="302" font-size="13" font-weight="400" class="muted" text-anchor="start">fold into the same turn.</text>
+  <rect x="262" y="104" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="280" y="124" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(288 132)"><circle cx="23" cy="23" r="17"/><path d="M23 12v11l8 5"/><path d="m36 7 4 4"/></g>
+  <text x="280" y="220" font-size="18" font-weight="600" class="" text-anchor="start">Heard in seconds</text>
+  <text x="280" y="282" font-size="13" font-weight="400" class="muted" text-anchor="start">Every message gets an answer,</text>
+  <text x="280" y="302" font-size="13" font-weight="400" class="muted" text-anchor="start">a reaction or a short line first.</text>
+  <rect x="492" y="104" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="510" y="124" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(518 132)"><path d="M5 11h30m-6-6 6 6-6 6M5 33h30m-6-6 6 6-6 6"/><path d="M9 22h8m8 0h10"/></g>
+  <text x="510" y="220" font-size="18" font-weight="600" class="" text-anchor="start">Tools keep moving</text>
+  <text x="510" y="282" font-size="13" font-weight="400" class="muted" text-anchor="start">Tools run in parallel; slow work</text>
+  <text x="510" y="302" font-size="13" font-weight="400" class="muted" text-anchor="start">carries on when they write again.</text>
+  <rect x="722" y="104" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="740" y="124" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(748 132)"><rect x="3" y="3" width="12" height="18" rx="3"/><rect x="29" y="3" width="12" height="18" rx="3"/><path d="M9 25v5h26v-5M22 30v7"/><circle cx="22" cy="41" r="3"/></g>
+  <text x="740" y="220" font-size="18" font-weight="600" class="" text-anchor="start">One person,</text>
+  <text x="740" y="243" font-size="18" font-weight="600" class="" text-anchor="start">every channel</text>
+  <text x="740" y="282" font-size="13" font-weight="400" class="muted" text-anchor="start">SMS, WhatsApp and your app</text>
+  <text x="740" y="302" font-size="13" font-weight="400" class="muted" text-anchor="start">share one conversation.</text>
+  <rect x="952" y="104" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="970" y="124" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(978 132)"><rect x="4" y="4" width="36" height="36" rx="6"/><rect x="10" y="11" width="24" height="7" rx="3"/><path d="M11 25h3m5 0h14M11 32h3m5 0h14"/></g>
+  <text x="970" y="220" font-size="18" font-weight="600" class="" text-anchor="start">Each platform’s rules</text>
+  <text x="970" y="282" font-size="13" font-weight="400" class="muted" text-anchor="start">Buttons and lists on WhatsApp,</text>
+  <text x="970" y="302" font-size="13" font-weight="400" class="muted" text-anchor="start">plain text on SMS,</text>
+  <text x="970" y="322" font-size="13" font-weight="400" class="muted" text-anchor="start">links in your app.</text>
+  <rect x="32" y="386" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="50" y="406" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(58 414)"><ellipse cx="22" cy="9" rx="16" ry="6"/><path d="M6 9v22c0 8 32 8 32 0V9M6 20c0 8 32 8 32 0"/><path d="m28 40 5 4 7-8"/></g>
+  <text x="50" y="502" font-size="18" font-weight="600" class="" text-anchor="start">Survives restarts</text>
+  <text x="50" y="564" font-size="13" font-weight="400" class="muted" text-anchor="start">SQLite or your database; a restart</text>
+  <text x="50" y="584" font-size="13" font-weight="400" class="muted" text-anchor="start">carries on mid-conversation.</text>
+  <rect x="262" y="386" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="280" y="406" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(288 414)"><rect x="4" y="7" width="35" height="32" rx="5"/><path d="M12 3v8M31 3v8M4 17h35"/><circle cx="23" cy="28" r="7"/><path d="M23 24v5h4"/></g>
+  <text x="280" y="502" font-size="18" font-weight="600" class="" text-anchor="start">Their time zone</text>
+  <text x="280" y="564" font-size="13" font-weight="400" class="muted" text-anchor="start">“Remind me at 9 tomorrow”</text>
+  <text x="280" y="584" font-size="13" font-weight="400" class="muted" text-anchor="start">just works.</text>
+  <rect x="492" y="386" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="510" y="406" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(518 414)"><path d="M11 30V17a11 11 0 0 1 22 0v13l4 5H7zM18 40h8"/><path d="M5 5 39 39"/></g>
+  <text x="510" y="502" font-size="18" font-weight="600" class="" text-anchor="start">Nudges respect no</text>
+  <text x="510" y="564" font-size="13" font-weight="400" class="muted" text-anchor="start">Business messages skip what</text>
+  <text x="510" y="584" font-size="13" font-weight="400" class="muted" text-anchor="start">each person asked not to get.</text>
+  <rect x="722" y="386" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="740" y="406" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(748 414)"><rect x="7" y="7" width="30" height="30" rx="5"/><path d="M14 16h16M14 23h10M22 31v12m-5-5 5 5 5-5"/></g>
+  <text x="740" y="502" font-size="18" font-weight="600" class="" text-anchor="start">Skills on demand</text>
+  <text x="740" y="564" font-size="13" font-weight="400" class="muted" text-anchor="start">A small prompt; skills load</text>
+  <text x="740" y="584" font-size="13" font-weight="400" class="muted" text-anchor="start">only when needed.</text>
+  <rect x="952" y="386" width="216" height="266" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="970" y="406" width="60" height="60" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(978 414)"><rect x="3" y="5" width="38" height="32" rx="5"/><path d="M3 14h38M9 10h1m4 0h1m4 0h1m-8 11-5 5 5 5m18-10 5 5-5 5m-7-11-4 12"/></g>
+  <text x="970" y="502" font-size="18" font-weight="600" class="" text-anchor="start">Every channel’s</text>
+  <text x="970" y="525" font-size="18" font-weight="600" class="" text-anchor="start">playground</text>
+  <text x="970" y="564" font-size="13" font-weight="400" class="muted" text-anchor="start">Real platform rules and a</text>
+  <text x="970" y="584" font-size="13" font-weight="400" class="muted" text-anchor="start">debug trace in the browser.</text>
+</svg>

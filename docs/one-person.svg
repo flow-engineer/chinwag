@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-labelledby="title description">
+  <title id="title">One person, every channel</title>
+  <desc id="description">SMS +1 555 0100 and WhatsApp +1 555 0100 join one conversation using the same verified number. Your app’s signed-in session joins through your resolve() function. There is one history and one person. Each reply goes out on the channel the message came in on, in that channel’s format.</desc>
+  <style>
+    text { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; fill: #182637; }
+    .muted { fill: #526173; }
+    .accent { fill: #2f6fed; }
+    .glyph { fill: none; stroke: #2f6fed; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <rect x="1" y="1" width="1198" height="698" rx="24" fill="#fbfcfe" stroke="#dce3eb" stroke-width="2"/>
+  <text x="56" y="66" font-size="28" font-weight="600" class="" text-anchor="start">One person, every channel</text>
+  <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="m1 1 8 4-8 4" fill="none" stroke="#2f6fed" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+  <rect x="56" y="142" width="320" height="112" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="74" y="166" width="64" height="64" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(84 176)"><rect x="8" y="3" width="26" height="40" rx="5"/><path d="M17 9h8M19 37h4"/></g>
+  <text x="158" y="189" font-size="20" font-weight="600" class="" text-anchor="start">SMS</text>
+  <text x="158" y="218" font-size="17" font-weight="400" class="muted" text-anchor="start">+1 555 0100</text>
+  <rect x="56" y="288" width="320" height="112" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="74" y="312" width="64" height="64" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(84 322)"><path d="M5 7h34v27H18l-9 7v-7H5z"/><path d="M13 17h18m-18 7h12"/></g>
+  <text x="158" y="335" font-size="20" font-weight="600" class="" text-anchor="start">WhatsApp</text>
+  <text x="158" y="364" font-size="17" font-weight="400" class="muted" text-anchor="start">+1 555 0100</text>
+  <rect x="56" y="434" width="320" height="112" rx="16" fill="#ffffff" stroke="#dce3eb" stroke-width="2"/>
+  <rect x="74" y="458" width="64" height="64" rx="16" fill="#edf3ff"/>
+  <g class="glyph" transform="translate(84 468)"><rect x="3" y="5" width="38" height="32" rx="5"/><path d="M3 14h38M9 10h1m4 0h1m4 0h1"/><circle cx="22" cy="23" r="4"/><path d="M14 33c1-7 15-7 16 0"/></g>
+  <text x="158" y="481" font-size="20" font-weight="600" class="" text-anchor="start">Your app</text>
+  <text x="158" y="510" font-size="17" font-weight="400" class="muted" text-anchor="start">Signed-in session</text>
+  <g fill="none" stroke="#2f6fed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)">
+    <path d="M376 198H714Q738 198 738 222V250Q738 274 762 274H818"/>
+    <path d="M376 344H818"/>
+    <path d="M376 490H714Q738 490 738 466V438Q738 414 762 414H818"/>
+  </g>
+  <text x="414" y="181" font-size="16" font-weight="500" class="accent" text-anchor="start">same verified number</text>
+  <text x="414" y="327" font-size="16" font-weight="500" class="accent" text-anchor="start">same verified number</text>
+  <text x="414" y="473" font-size="16" font-weight="500" class="accent" text-anchor="start">your resolve() function</text>
+  <rect x="820" y="226" width="324" height="236" rx="16" fill="#edf3ff" stroke="#dce3eb" stroke-width="2"/>
+  <g class="glyph" transform="translate(960 250)"><path d="M3 5h38v28H19l-10 8v-8H3z"/><path d="M12 15h20m-20 9h14"/></g>
+  <text x="982" y="339" font-size="25" font-weight="600" class="" text-anchor="middle">One conversation</text>
+  <text x="982" y="379" font-size="18" font-weight="400" class="muted" text-anchor="middle">one history, one person</text>
+  <text x="804" y="532" font-size="17" font-weight="400" class="muted" text-anchor="start">Each reply goes out on the channel</text>
+  <text x="804" y="557" font-size="17" font-weight="400" class="muted" text-anchor="start">the message came in on,</text>
+  <text x="804" y="582" font-size="17" font-weight="400" class="muted" text-anchor="start">in that channel’s format.</text>
+</svg>
