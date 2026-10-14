@@ -1,17 +1,17 @@
 ---
-name: parley-tools
-description: Write or change a Parley agent's tools and their test files (tests/tools/*.yaml). Load when adding a tool to a Parley agent, changing what a tool returns, or describing how a tool behaves in tests.
+name: chinwag-tools
+description: Write or change a Chinwag agent's tools and their test files (tests/tools/*.yaml). Load when adding a tool to a Chinwag agent, changing what a tool returns, or describing how a tool behaves in tests.
 ---
 
-# Writing tools for a Parley agent
+# Writing tools for a Chinwag agent
 
-Read `skill.md` in this folder first if you haven't. Tests that use these tool files are in
-`test-skill.md`.
+Read the `chinwag` skill (`skill.md`) first if you haven't. Tests that use these tool files are
+in the `chinwag-tests` skill (`test-skill.md`).
 
 ## The tool
 
 ```ts
-import { tool, z } from "parley";
+import { tool, z } from "chinwag";
 
 export const findSlots = tool({
   name: "find_session_slots",
@@ -26,12 +26,12 @@ export const findSlots = tool({
 
 - The name and description are what the model reads to choose the tool: say what it does and
   what it returns, in one line.
-- `input` is a zod schema; Parley checks the model's input against it before `run` is called and
+- `input` is a zod schema; Chinwag checks the model's input against it before `run` is called and
   sends the model the error if it doesn't fit.
 - `run` returns any JSON-able value; throw to report a failure (the agent sees `Failed: <message>`).
 - Don't make tools for talking to the person (send_<channel>, react, share_updates), for reminders
-  or scheduled messages, or for opting out of messages: Parley has them.
-- Key a person's data by `context.person` (who Parley verified they are) or `context.conversationId`,
+  or scheduled messages, or for opting out of messages: Chinwag has them.
+- Key a person's data by `context.person` (who Chinwag verified they are) or `context.conversationId`,
   never by an id the model passed.
 - Don't decide what runs in the background. The reply waits for every call; one moves to the
   background only if the person writes again meanwhile or it passes its limit (the agent's

@@ -50,14 +50,16 @@ export const PLATFORMS: Platform[] = [
     replies: true,
     buttons: { max: 3, labelMax: 20 },
     lists: { maxRows: 10, titleMax: 24, buttonMax: 20 },
+    linkButton: { labelMax: 20 },
+    images: { captionMax: 1024 },
     readReceipts: true,
     personReactions: ["👍", "❤️", "😂", "😮", "😢", "🙏"],
     complete: true,
     icon: "whatsapp",
   },
-  { id: "imessage", name: "iMessage", reactions: true, status: false, typing: true, formatting: "plain", complete: false, icon: "imessage" },
-  { id: "telegram", name: "Telegram", reactions: true, status: false, typing: true, formatting: "markdown", complete: false, icon: "telegram" },
-  { id: "web", name: "Web", reactions: true, status: true, typing: true, formatting: "markdown", complete: false, icon: "googlechrome" },
+  { id: "imessage", name: "iMessage", reactions: true, status: false, typing: true, formatting: "plain", images: { captionMax: 4000 }, complete: false, icon: "imessage" },
+  { id: "telegram", name: "Telegram", reactions: true, status: false, typing: true, formatting: "markdown", images: { captionMax: 1024 }, complete: false, icon: "telegram" },
+  { id: "web", name: "Web", reactions: true, status: true, typing: true, formatting: "markdown", linkButton: { labelMax: 20 }, images: { captionMax: 4000 }, complete: false, icon: "googlechrome" },
 ];
 
 export function platform(id: string | null): Platform {
@@ -74,6 +76,8 @@ export function channelOf(p: Platform): ChannelInfo {
     replies: p.replies,
     buttons: p.buttons,
     lists: p.lists,
+    linkButton: p.linkButton,
+    images: p.images,
     readReceipts: p.readReceipts,
   };
 }

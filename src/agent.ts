@@ -14,7 +14,7 @@
 // every send to it (replies, scheduled messages, nudges) goes back the same way.
 
 import { randomUUID } from "node:crypto";
-import { summarize, type Channel, type ChannelSummary } from "./channels.ts";
+import { declaredTemplate, fillTemplate, summarize, type Channel, type ChannelSummary } from "./channels.ts";
 import { Conversation, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type TranscriptEntry } from "./conversation.ts";
 import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
@@ -22,7 +22,8 @@ import { addBusinessSchedule, claimDue } from "./schedules.ts";
 import { loadInstructions, loadSkills, readAgentFolder, skillTool, type AgentFiles } from "./skills.ts";
 import { Store, type ConversationRow, type IdentityRow, type StoreApi, type Via } from "./store.ts";
 import { toSpec, type Tool } from "./tools.ts";
-import type { ChannelInfo, Deliver, Incoming, Model, Outbound } from "./types.ts";
+import { traces, tracesFromEnv, type Traces, type TracesOptions } from "./traces.ts";
+import type { ChannelInfo, Deliver, Incoming, Model, Outbound, Template, TemplateDefinition, Transcribe } from "./types.ts";
 
 export interface AgentOptions {
   /** Folder holding AGENTS.md and skills/<name>/SKILL.md. Give this or `files`. */
@@ -30,6 +31,11 @@ export interface AgentOptions {
   /** That folder's files as text, by path ("AGENTS.md", "skills/<name>/SKILL.md"), for hosts with no file system. */
   files?: AgentFiles;
   model: Model;
+  /**
+   * Speech to text for voice notes, with the provider you choose: the agent reads the transcript,
+   * marked as a voice note. Without it, it is told a voice note came that it can't listen to.
+   */
+  transcribe?: Transcribe;
   tools?: Tool[];
   /** Added to the system prompt at the start of every turn: who this person is, the time. */
   context?: (conversationId: string) => Promise<string> | string;
@@ -45,7 +51,7 @@ export interface AgentOptions {
   inlineSkills?: boolean;
   /**
    * Live status lines (share_updates) on channels that can show them, web and app UIs. Default on;
-   * pass a string to replace Parley's guidance on when and what to share.
+   * pass a string to replace Chinwag's guidance on when and what to share.
    */
   shareUpdates?: boolean | string;
   /**
@@ -62,7 +68,7 @@ export interface AgentOptions {
   events?: EventSink[];
   /** This agent's id in the database (several agents can share one). Default "default". */
   id?: string;
-  /** Where Parley keeps its state. Default: SQLite in memory (gone on restart). */
+  /** Where Chinwag keeps its state. Default: SQLite in memory (gone on restart). */
   database?: Database;
   /**
    * Instead of `database`: a store that keeps the state elsewhere, such as a client of a store
@@ -89,6 +95,18 @@ export interface AgentOptions {
    * the playground or, once a channel is live, from the provider.
    */
   testPeople?: TestPerson[];
+  /**
+   * The WhatsApp templates the owner set up with Meta. A nudge with one of them is checked against
+   * it before it goes (values that don't fit throw), the agent is told what it said, and the
+   * playground shows it as WhatsApp would. A template not declared here is sent as it is.
+   */
+  templates?: TemplateDefinition[];
+  /**
+   * Send every turn to a traces endpoint as a trace. Default: from the environment, on when
+   * CHINWAG_TRACES_KEY is set (with CHINWAG_TRACES_URL, and CHINWAG_TRACES_CONTENT=1 for content),
+   * never under `node --test`.
+   */
+  traces?: TracesOptions;
 }
 
 export interface TestPerson {
@@ -111,7 +129,7 @@ export interface AgentStatus {
 export interface ReceiveOptions {
   /** What the channel can show. Default: plain text only (no reactions, no status). */
   channel?: ChannelInfo;
-  /** The channel's own id for the message; Parley makes one (m1, m2, ...) otherwise. */
+  /** The channel's own id for the message; Chinwag makes one (m1, m2, ...) otherwise. */
   messageId?: string;
   /** The channel's name. Default "chat". */
   channelName?: string;
@@ -125,7 +143,7 @@ export interface NudgeInput {
   /** The agent gets a turn with this note and writes the message itself, or sends nothing. */
   prompt?: string;
   /** A template the owner already set up with the channel, sent as is (also outside WhatsApp's window). */
-  template?: { name: string; language?: string; variables?: Record<string, string> };
+  template?: Template;
   /** Send it later, at this time (ms since the epoch), as a scheduled message. */
   at?: number;
   /** The same key twice sends once; the second call gets the first's result. */
@@ -157,22 +175,26 @@ export class Agent {
   /** Where each identity (channel, address) last wrote from; sends go back the same way. */
   private readonly via = new Map<string, Via>();
   private playgroundSink: PlaygroundSink | null = null;
+  private readonly traces: Traces | null;
 
   constructor(options: AgentOptions) {
     this.options = options;
     this.channelsByName = new Map((options.channels ?? []).map((c) => [c.name, c]));
-    if (this.channelsByName.size !== (options.channels ?? []).length) throw new Error("parley: two channels have the same name");
+    if (this.channelsByName.size !== (options.channels ?? []).length) throw new Error("chinwag: two channels have the same name");
     this.now = options.now ?? Date.now;
-    const emit = emitter(options.events ?? []);
-    if ((options.dir === undefined) === (options.files === undefined)) throw new Error("parley: give an agent exactly one of dir or files");
+    const tracing = options.traces ?? tracesFromEnv();
+    this.traces = tracing ? traces(tracing, { service: options.id ?? "chinwag", kindOf: (name) => this.channelsByName.get(name)?.kind }) : null;
+    const emit = emitter([...(options.events ?? []), ...(this.traces ? [this.traces.sink] : [])]);
+    if ((options.dir === undefined) === (options.files === undefined)) throw new Error("chinwag: give an agent exactly one of dir or files");
     const files = options.files ?? readAgentFolder(options.dir!);
     const skills = loadSkills(files);
     const tools = [...(options.tools ?? [])];
     if (skills.length && !options.inlineSkills) tools.push(skillTool(skills, (id, name) => emit(id, "skill.loaded", { skill: name })));
-    if (options.store && (options.database || options.id)) throw new Error("parley: give an agent a store or a database (and id), not both");
+    if (options.store && (options.database || options.id)) throw new Error("chinwag: give an agent a store or a database (and id), not both");
     this.store = options.store ?? new Store(options.database ?? sqlite(), options.id ?? "default");
     this.settings = {
       model: options.model,
+      transcribe: options.transcribe,
       tools: new Map(tools.map((t) => [t.name, t])),
       specs: tools.map(toSpec),
       instructions: loadInstructions(files, skills, options.inlineSkills),
@@ -191,12 +213,13 @@ export class Agent {
       ready: this.store.migrate(),
       now: this.now,
       timeZone: options.timeZone,
+      templates: options.templates ?? [],
       tagChannels: (options.channels ?? []).length > 1,
       links: (id) => this.links(id),
       settle: (target, status, reason) => this.settle(target, status, reason),
     };
     const every = options.scheduleCheckMs ?? 5_000;
-    if (every > 0) setInterval(() => void this.runDue().catch((error) => console.warn("parley: scheduled messages:", error)), every).unref();
+    if (every > 0) setInterval(() => void this.runDue().catch((error) => console.warn("chinwag: scheduled messages:", error)), every).unref();
   }
 
   /**
@@ -226,9 +249,19 @@ export class Agent {
    */
   async simulate(input: { person: string; channel: string; message: string | Incoming; messageId?: string }): Promise<{ conversationId: string; messageId: string } | null> {
     const person = this.testPerson(input.person);
-    if (!person) throw new Error("parley: only the agent's testPeople can be simulated");
+    if (!person) throw new Error("chinwag: only the agent's testPeople can be simulated");
     const adapter = this.channelOf(input.channel);
     return this.take(adapter, { channel: input.channel, from: this.testAddress(adapter, person), message: input.message, messageId: input.messageId, via: "playground", person });
+  }
+
+  /** Sends the traces of finished turns still waiting for the traces endpoint; call it before the process exits. */
+  flushTraces(): Promise<void> {
+    return this.traces?.flush() ?? Promise.resolve();
+  }
+
+  /** The templates declared in `templates`. */
+  templates(): TemplateDefinition[] {
+    return [...(this.options.templates ?? [])];
   }
 
   /** The people declared in `testPeople`. */
@@ -281,7 +314,7 @@ export class Agent {
 
   private channelOf(name: string): Channel {
     const adapter = this.channelsByName.get(name);
-    if (!adapter) throw new Error(`parley: no channel named ${name}`);
+    if (!adapter) throw new Error(`chinwag: no channel named ${name}`);
     this.mustBeResumed();
     return adapter;
   }
@@ -417,7 +450,10 @@ export class Agent {
   async nudge(input: NudgeInput): Promise<NudgeResult> {
     await this.settings.ready;
     const kinds = [input.text, input.prompt, input.template].filter((v) => v !== undefined).length;
-    if (kinds !== 1) throw new Error("parley: a nudge has exactly one of text, prompt or template");
+    if (kinds !== 1) throw new Error("chinwag: a nudge has exactly one of text, prompt or template");
+    // A declared template whose values don't fit it never goes: Meta would refuse it, the playground would show nonsense.
+    const declared = input.template && declaredTemplate(this.options.templates, input.template);
+    if (declared) fillTemplate(declared, input.template!);
     if (input.idempotencyKey) {
       const earlier = await this.store.nudgeByKey(input.idempotencyKey);
       if (earlier) return this.result(earlier.id, earlier.status, earlier.reason);
@@ -428,7 +464,7 @@ export class Agent {
     const conversationId = identity.conversationId;
     const record = { id, conversationId, channel: input.to.channel, idempotencyKey: input.idempotencyKey ?? null, reason: null };
     if (input.at !== undefined) {
-      if (input.template) throw new Error("parley: a template nudge cannot be scheduled yet");
+      if (input.template) throw new Error("chinwag: a template nudge cannot be scheduled yet");
       const zone = (await this.store.conversation(conversationId))?.timeZone ?? this.options.timeZone ?? "UTC";
       await addBusinessSchedule(this.store, conversationId, input.to.channel, input.at, zone, { text: input.text, prompt: input.prompt });
       await this.store.addNudge({ ...record, body: { text: input.text, prompt: input.prompt, at: input.at }, status: "scheduled" });
@@ -534,7 +570,7 @@ export class Agent {
   }
 
   private mustBeResumed(): void {
-    if (this.store.durable && !this.resumed) throw new Error("parley: call await agent.resume() before the first message when the database is durable");
+    if (this.store.durable && !this.resumed) throw new Error("chinwag: call await agent.resume() before the first message when the database is durable");
   }
 }
 

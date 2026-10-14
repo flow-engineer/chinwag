@@ -1,4 +1,4 @@
-// The shapes every part of Parley shares: chat history, the model contract, what a channel is sent.
+// The shapes every part of Chinwag shares: chat history, the model contract, what a channel is sent.
 
 export interface ToolCall {
   id: string;
@@ -8,9 +8,20 @@ export interface ToolCall {
 }
 
 export type ChatMessage =
-  | { role: "user"; content: string }
+  | { role: "user"; content: string; media?: Media[] }
   | { role: "assistant"; content: string | null; toolCalls?: ToolCall[] }
   | { role: "tool"; toolCallId: string; content: string };
+
+/**
+ * A photo or PDF in the person's messages, for the model to read. `data` (base64) is held in memory
+ * only while the model is shown it, never stored; without it, the model is told it is no longer shown.
+ */
+export interface Media {
+  kind: "image" | "document";
+  mime: string;
+  name?: string;
+  data?: string;
+}
 
 export interface ToolSpec {
   name: string;
@@ -37,9 +48,11 @@ export interface ModelResponse {
   model?: string;
 }
 
-/** Any model behind Parley. `complete` must reject promptly when `signal` aborts. */
+/** Any model behind Chinwag. `complete` must reject promptly when `signal` aborts. */
 export interface Model {
   complete(request: ModelRequest): Promise<ModelResponse>;
+  /** What it reads besides text, as `media` on the person's messages. Without it: text only, and a note for each photo or PDF. */
+  reads?: { images?: boolean; pdfs?: boolean };
 }
 
 export interface ListRow {
@@ -59,18 +72,57 @@ export type Outbound =
       buttons?: string[];
       /** A list the person picks one row from. */
       list?: { button: string; rows: ListRow[] };
+      /** A button that opens this https page; only on channels with linkButton (elsewhere Chinwag puts the URL in the text). */
+      link?: { label: string; url: string };
+      /** A photo by https URL, the text its caption; only on channels with images (elsewhere the text goes alone). */
+      image?: { url: string };
       /** The channel's own params (see Channel.params), as the agent filled them in. */
       fields?: Record<string, unknown>;
     }
   /** The agent has picked these messages up (WhatsApp's blue ticks). */
   | { type: "read"; messageIds: string[] }
-  /** A reaction on one of the person's messages, by the id Parley gave it. */
+  /** A reaction on one of the person's messages, by the id Chinwag gave it. */
   | { type: "reaction"; emoji: string; messageId: string }
   /** A template the owner set up with the channel (WhatsApp), sent as is, even outside its window. */
-  | { type: "template"; name: string; language?: string; variables?: Record<string, string> }
+  | ({ type: "template" } & Template)
   /** A short line of what the agent is doing, shown in the loading indicator; null clears it. */
   | { type: "status"; text: string | null }
   | { type: "typing"; on: boolean };
+
+/** A WhatsApp template as it is sent: its name and the values for its placeholders (Meta's template parameters). */
+export interface Template {
+  /** Its name as approved (or the provider's own id for it). */
+  name: string;
+  language?: string;
+  /** The header's value: the text for its {{1}}, or its photo, video or document by https URL or the provider's file id. */
+  header?: { kind: "text"; text: string } | { kind: "image" | "video" | "document"; url?: string; fileId?: string };
+  /** Values for the body's {{1}}, {{2}}, ... in order. */
+  body?: string[];
+  /** Values for the buttons that take one, by the button's position from 0: a URL button's suffix, a quick reply's payload. */
+  buttons?: Array<{ index: number; value: string }>;
+  /** The body's values by number ({ "1": "Maria" }), the older form of `body`: give one or the other. */
+  variables?: Record<string, string>;
+}
+
+/**
+ * A WhatsApp template as the owner set it up with Meta, declared in `createAgent({ templates })`:
+ * Chinwag checks every send of it against this, and the playground shows it as WhatsApp would.
+ */
+export interface TemplateDefinition {
+  name: string;
+  /** Meta's language code: en, en_US, hi. */
+  language: string;
+  category: "utility" | "marketing" | "authentication";
+  /** Text (which may hold one {{1}}), or a photo, video or document sent with each message. */
+  header?: { kind: "text"; text: string } | { kind: "image" | "video" | "document" };
+  /** The message, with {{1}}, {{2}}, ... where its values go. */
+  body: string;
+  footer?: string;
+  /** Quick replies come back as the person's tap; a URL may end in {{1}}, its value given at each send. */
+  buttons?: TemplateButton[];
+}
+
+export type TemplateButton = { type: "quick_reply"; text: string } | { type: "url"; text: string; url: string } | { type: "phone"; text: string; phone: string };
 
 /** Sends one outbound; a rejection means it did not reach the person. */
 export type Deliver = (outbound: Outbound) => Promise<void> | void;
@@ -91,6 +143,10 @@ export interface ChannelInfo {
   buttons?: { max: number; labelMax: number };
   /** A list the person picks one row from. */
   lists?: { maxRows: number; titleMax: number; buttonMax: number };
+  /** One button under a message that opens a web page (WhatsApp's call-to-action URL button). */
+  linkButton?: { labelMax: number };
+  /** Photos sent by URL, with the message's text as their caption. */
+  images?: { captionMax: number };
   /** The channel shows the person when their message has been read. */
   readReceipts?: boolean;
   /**
@@ -107,4 +163,19 @@ export interface Incoming {
   replyTo?: { text: string; fromAgent: boolean };
   /** They tapped a button or picked a list row rather than typing. */
   choice?: { id?: string; title: string };
+  /** Photos, voice notes and documents sent with it; `text` is then their caption, or "". */
+  attachments?: Attachment[];
 }
+
+/** A file the person sent. Its bytes are fetched only when the agent can use them. */
+export interface Attachment {
+  kind: "image" | "audio" | "document";
+  mime: string;
+  /** The file name, when the channel gives one (documents). */
+  name?: string;
+  /** The bytes. A provider fetches its media here with its own credentials: no URL reaches the model. */
+  data(): Promise<Uint8Array>;
+}
+
+/** Turns a voice note into text, with whatever speech-to-text the agent's author chose. */
+export type Transcribe = (audio: { mime: string; data: Uint8Array }) => Promise<string>;

@@ -1,5 +1,5 @@
 // covers: src/postgres.ts
-// The adapter over a recording stand-in for node-postgres's Pool: no Postgres here. Parley's
+// The adapter over a recording stand-in for node-postgres's Pool: no Postgres here. Chinwag's
 // queries are checked against a real Postgres outside this suite.
 import assert from "node:assert/strict";
 import { test } from "node:test";

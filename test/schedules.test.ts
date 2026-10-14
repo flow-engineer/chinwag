@@ -48,7 +48,7 @@ test("a schedule that comes due becomes a turn, and its message goes out", async
 });
 
 test("two runners claim a due run only once", async () => {
-  const path = join(mkdtempSync(join(tmpdir(), "parley-db-")), "parley.db");
+  const path = join(mkdtempSync(join(tmpdir(), "chinwag-db-")), "chinwag.db");
   const h = await withSam(sqlite(path));
   await h.store.addSchedule({ id: "s1", conversationId: h.conversationId, channel: "sms", instruction: "check in", fixedText: false, mode: "message", rule: { repeat: "daily", time: "11:00" }, timeZone: "America/New_York", nextRunAt: NOON_NY - 60_000, maxRuns: null, endsOn: null, origin: "person" });
   const other = multi({ channels: CHANNELS, database: sqlite(path), now: () => h.clock.now, dir: h.dir });

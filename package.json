@@ -1,22 +1,55 @@
 {
-  "name": "parley",
-  "version": "0.1.0",
-  "private": true,
+  "name": "chinwag",
+  "version": "0.1.2",
   "description": "An open-source runtime for chat agents that feel like a person texting back.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flow-engineer/chinwag.git"
+  },
+  "homepage": "https://github.com/flow-engineer/chinwag",
   "type": "module",
   "engines": {
     "node": ">=22.18"
   },
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./simulators": {
+      "types": "./dist/simulators/src/index.d.ts",
+      "default": "./dist/simulators/src/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/src/index.d.ts",
+      "default": "./dist/testing/src/index.js"
+    },
+    "./package.json": "./package.json"
   },
+  "bin": {
+    "chinwag": "dist/testing/src/cli.js"
+  },
+  "files": [
+    "dist",
+    "examples/cafe/agent",
+    "examples/cafe/src",
+    "examples/cafe/tests",
+    "coding-agents",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
+    "build": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node -e \"for (const f of ['page.html', 'person.html']) fs.copyFileSync('simulators/src/' + f, 'dist/simulators/src/' + f)\"",
+    "prepack": "npm run build",
     "test": "node --test \"test/**/*.test.ts\"",
     "test:changed": "node scripts/test-changed.ts",
+    "new": "node scripts/new-agent.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "openai": "^7.32.0",
+    "yaml": "^2.9.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {

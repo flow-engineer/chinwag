@@ -8,7 +8,7 @@ import { createAgent, customUI, sms, whatsapp, z, type Channel, type Outbound, t
 import { call, last, respond, scriptedModel } from "./helpers.ts";
 
 function agentWith(channels: Channel[]) {
-  const dir = mkdtempSync(join(tmpdir(), "parley-"));
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
   const scripted = scriptedModel();
   const agent = createAgent({ dir, model: scripted.model, debounceMs: 0, channels, scheduleCheckMs: 0 });
@@ -17,7 +17,7 @@ function agentWith(channels: Channel[]) {
 
 const props = (tool: { parameters: unknown }) => Object.keys((tool.parameters as { properties: object }).properties);
 
-/** A WhatsApp provider that records what Parley asked it to do. */
+/** A WhatsApp provider that records what Chinwag asked it to do. */
 function recorder(extra: Partial<WhatsAppProvider> = {}) {
   const calls: unknown[][] = [];
   const provider: WhatsAppProvider = {
@@ -27,18 +27,22 @@ function recorder(extra: Partial<WhatsAppProvider> = {}) {
   return { provider, calls };
 }
 
-test("WhatsApp offers the agent only what its provider can do", async () => {
-  const bare = agentWith([whatsapp(recorder({ features: { buttons: false } }).provider)]);
-  await bare.agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" });
+test("WhatsApp offers the agent only what its provider can do; a link it cannot send goes as its URL in the text", async () => {
+  const r = recorder({ features: { buttons: false, links: false } });
+  const bare = agentWith([whatsapp(r.provider)]);
+  const a = await bare.agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" });
   const first = await bare.nextCall(0);
-  assert.deepEqual(props(first.request.tools.find((t) => t.name === "send_whatsapp")!), ["text", "reply_to", "list"]);
+  assert.deepEqual(props(first.request.tools.find((t) => t.name === "send_whatsapp")!), ["text", "reply_to", "list", "link", "image"]);
   assert.ok(!first.request.tools.some((t) => t.name === "react"), "no react method, no react tool");
+  first.answer(respond(call("send_whatsapp", { text: "Here it is", link: { label: "Open in app", url: "https://example.com/l/7" } })));
+  await bare.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.deepEqual(r.calls, [["sendMessage", "+15550100100", { text: "Here it is\nhttps://example.com/l/7" }]]);
 
   const full = recorder({ react: async () => {} });
-  const switchedOff = agentWith([whatsapp(full.provider, { disable: ["reactions", "lists"] })]);
+  const switchedOff = agentWith([whatsapp(full.provider, { disable: ["reactions", "lists", "images"] })]);
   await switchedOff.agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" });
   const second = await switchedOff.nextCall(0);
-  assert.deepEqual(props(second.request.tools.find((t) => t.name === "send_whatsapp")!), ["text", "reply_to", "buttons"]);
+  assert.deepEqual(props(second.request.tools.find((t) => t.name === "send_whatsapp")!), ["text", "reply_to", "buttons", "link"]);
   assert.ok(!second.request.tools.some((t) => t.name === "react"), "switched off though the provider has it");
 });
 
@@ -51,12 +55,20 @@ test("one send call reaches the provider's sendMessage with everything; reaction
   });
   const h = agentWith([whatsapp(r.provider)]);
   const a = await h.agent.message({ channel: "whatsapp", from: "+15550100100", message: "which day works?" });
-  (await h.nextCall(0)).answer(respond(call("react", { message_id: "m1", emoji: "👍" }), call("send_whatsapp", { text: "Pick one", buttons: ["Mon", "Tue"], reply_to: "m1" })));
+  const photo = { url: "https://example.com/flat.jpg" };
+  (await h.nextCall(0)).answer(
+    respond(
+      call("react", { message_id: "m1", emoji: "👍" }),
+      call("send_whatsapp", { text: "Pick one", buttons: ["Mon", "Tue"], reply_to: "m1", image: photo }),
+      call("send_whatsapp", { text: "2 BHK, Indiranagar", image: photo, link: { label: "Open in app", url: "https://example.com/l/7" } }),
+    ),
+  );
   await h.agent.conversation(a!.conversationId)!.whenIdle();
   assert.deepEqual(r.calls, [
     ["markRead", "+15550100100", ["m1"]],
     ["react", "+15550100100", "m1", "👍"],
-    ["sendMessage", "+15550100100", { text: "Pick one", replyTo: "m1", buttons: ["Mon", "Tue"] }],
+    ["sendMessage", "+15550100100", { text: "Pick one", replyTo: "m1", buttons: ["Mon", "Tue"], image: photo }],
+    ["sendMessage", "+15550100100", { text: "2 BHK, Indiranagar", link: { label: "Open in app", url: "https://example.com/l/7" }, image: photo }],
   ]);
   assert.deepEqual(typing, [true, false]);
 });

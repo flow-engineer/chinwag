@@ -93,8 +93,8 @@ test("a background result the agent answers in plain text is sent back once, wit
   done.open("booked Friday 2pm");
   (await h.nextCall(2)).answer({ text: "Done: Friday at 2pm.", toolCalls: [] });
   const reminder = await h.nextCall(3);
-  assert.match(last(reminder.request.messages).content, /^\[Parley\] INTERNAL MESSAGE, not from them: they have not heard from you since the result above.*without mentioning this note/);
-  assert.match(reminder.request.system, /Lines starting \[Parley\] are INTERNAL MESSAGES/);
+  assert.match(last(reminder.request.messages).content, /^\[Chinwag\] INTERNAL MESSAGE, not from them: they have not heard from you since the result above.*without mentioning this note/);
+  assert.match(reminder.request.system, /Lines starting \[Chinwag\] are INTERNAL MESSAGES/);
   reminder.answer(respond(say("Done: Friday at 2pm.")));
   await h.agent.conversation("c7")!.whenIdle();
   assert.deepEqual(h.sent(), ["Booking Friday.", "Done: Friday at 2pm."]);
@@ -108,7 +108,7 @@ test("a tool result the agent answers in plain text, after acknowledging, is sen
   (await h.nextCall(0)).answer(respond(say("Logging that now."), call("log_run")));
   (await h.nextCall(1)).answer({ text: "Logged your 5 km run; your coach will see it today.", toolCalls: [] });
   const reminder = await h.nextCall(2);
-  assert.match(last(reminder.request.messages).content, /^\[Parley\] INTERNAL MESSAGE, not from them: they have not heard from you since the result above/);
+  assert.match(last(reminder.request.messages).content, /^\[Chinwag\] INTERNAL MESSAGE, not from them: they have not heard from you since the result above/);
   reminder.answer(respond(say("Logged your 5 km run; your coach will see it today.")));
   await h.agent.conversation("c2")!.whenIdle();
   assert.deepEqual(h.sent(), ["Logging that now.", "Logged your 5 km run; your coach will see it today."]);

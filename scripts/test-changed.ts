@@ -1,7 +1,7 @@
-// Runs only the tests affected by what changed in parley/ (staged, unstaged and untracked, against HEAD).
+// Runs only the tests affected by what changed in this repository (staged, unstaged and untracked, against HEAD).
 // A changed test file runs itself; a changed src file runs every test whose `// covers:` line lists it;
 // a change to a file everything depends on runs all tests. The simulators package (simulators/) is
-// included: its tests' `covers:` paths are relative to parley/ too. `npm test` in each package still
+// included: its tests' `covers:` paths are relative to the repository root too. `npm test` in each package still
 // runs its whole suite.
 import { execFileSync, spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
