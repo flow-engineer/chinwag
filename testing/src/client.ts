@@ -3,6 +3,8 @@
 // cloud's platform simulators, and the person's messages arrive over one stream.
 
 import { readFile } from "node:fs/promises";
+import { request as httpRequest, type IncomingMessage } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { basename, relative, resolve } from "node:path";
 import { toSpec, type Agent, type Incoming, type EventSink, type Outbound, type ChinwagEvent, type Tool } from "../../src/index.ts";
 import type { Command, Opened, WireIncoming, OpenSession, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
@@ -146,11 +148,10 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     if (!response.ok) throw new Error(((await response.json().catch(() => ({}))) as { error?: string }).error ?? `refused (${response.status})`);
   };
 
-  const response = await fetch(`${session}/stream`, { headers: auth });
-  if (!response.ok || !response.body) throw new Error(`could not open the stream (${response.status})`);
+  const stream = await openStream(`${session}/stream`, auth);
   let buffer = "";
   const decoder = new TextDecoder();
-  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const chunk of stream) {
     buffer += decoder.decode(chunk, { stream: true });
     let end: number;
     while ((end = buffer.indexOf("\n\n")) >= 0) {
@@ -176,6 +177,22 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     }
   }
   throw new Error("the cloud closed the stream before the session finished");
+}
+
+/** The stream on a connection of its own. fetch shares one HTTP/2 connection per origin, and over
+ * HTTPS a POST behind an open stream on it was held until the stream closed: the cloud heard no
+ * reply and ended every run agent_quiet. */
+function openStream(url: string, headers: Record<string, string>): Promise<IncomingMessage> {
+  const request = url.startsWith("https:") ? httpsRequest : httpRequest;
+  return new Promise((resolve, reject) => {
+    request(url, { headers, agent: false }, (response) => {
+      if (response.statusCode === 200) return resolve(response);
+      response.resume();
+      reject(new Error(`could not open the stream (${response.statusCode})`));
+    })
+      .on("error", reject)
+      .end();
+  });
 }
 
 async function post<T = unknown>(url: string, body: unknown, headers: Record<string, string> = {}): Promise<T> {

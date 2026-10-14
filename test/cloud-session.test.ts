@@ -1,13 +1,17 @@
 // covers: testing/src/client.ts
 // The CLI against a hosted cloud: the open carries the CI key and the synthetic attestation, and the
-// session is played at the tunnel the open answers, which never sees the key.
+// session is played at the tunnel the open answers, which never sees the key; the agent's posts reach
+// the cloud while the stream is open, also over HTTPS with HTTP/2 as a hosted cloud speaks it.
 import assert from "node:assert/strict";
+import { generateKeyPairSync, sign, X509Certificate } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { createSecureServer, type Http2ServerResponse, type Http2Session } from "node:http2";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { getCACertificates, setDefaultCACertificates } from "node:tls";
 import { cloudHeaders, runInCloud, tunnelBase } from "../testing/src/client.ts";
 import type { Agent, Incoming } from "../src/index.ts";
 
@@ -110,3 +114,65 @@ test("a file a scenario attaches is read from the tests folder on this machine, 
   assert.deepEqual(await photo.data(), new Uint8Array([1, 2, 3]));
   await assert.rejects(outside.data(), /not a file in the tests folder/);
 });
+
+test("the agent's posts reach the cloud while the stream is open, over HTTPS with HTTP/2", { timeout: 10_000 }, async (t) => {
+  // A hosted cloud speaks HTTP/2, and fetch multiplexes onto one connection per origin: a POST
+  // behind the open stream was held until the stream closed, so the cloud heard nothing (agent_quiet).
+  const { key, cert } = selfSignedCert();
+  setDefaultCACertificates([...getCACertificates("default"), cert]); // this test file's process only
+  const outbound: unknown[] = [];
+  let stream: Http2ServerResponse | undefined;
+  const server = createSecureServer({ key, cert, allowHTTP1: true }, (req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      if (req.url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+      if (req.url === "/api/sessions/s/outbound") {
+        outbound.push(JSON.parse(body));
+        res.writeHead(200, { "content-type": "application/json" }).end("{}");
+        return void stream!.end(`data: ${JSON.stringify({ type: "finished", summary: { runs: [] } })}\n\n`);
+      }
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ type: "message", conversationId: "c", messageId: "m1", channel: { reactions: false, status: false }, incoming: { text: "hi" } })}\n\n`);
+    });
+  });
+  const sessions = new Set<Http2Session>();
+  server.on("session", (session) => sessions.add(session));
+  const close = () => (sessions.forEach((s) => s.destroy()), server.close());
+  t.signal.addEventListener("abort", close);
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  try {
+    const summary = await runInCloud({
+      cloud: `https://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      name: "cafe",
+      tools: [],
+      build: () => ({ channels: () => [], receive: (_id: string, _message: Incoming, deliver: (o: unknown) => Promise<void>) => (void deliver({ type: "message", text: "hello" }), "m1") }) as unknown as Agent,
+      files: [],
+      log: () => {},
+    });
+    assert.deepEqual(summary, { runs: [] });
+  } finally {
+    close();
+  }
+  assert.deepEqual(outbound, [{ conversationId: "c", outbound: { type: "message", text: "hello" } }]);
+});
+
+/** A throwaway self-signed certificate for 127.0.0.1, made here so no key is ever checked in. */
+function selfSignedCert(): { key: string; cert: string } {
+  const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const tlv = (tag: number, ...parts: Buffer[]) => {
+    const body = Buffer.concat(parts);
+    const n = body.length;
+    return Buffer.concat([Buffer.from([tag, ...(n < 128 ? [n] : n < 256 ? [0x81, n] : [0x82, n >> 8, n & 255])]), body]);
+  };
+  const hex = (h: string) => Buffer.from(h, "hex");
+  const ecdsaSha256 = tlv(0x30, hex("06082a8648ce3d040302"));
+  const name = tlv(0x30, tlv(0x31, tlv(0x30, hex("0603550403"), tlv(0x0c, Buffer.from("localhost")))));
+  const validity = tlv(0x30, tlv(0x17, Buffer.from("250101000000Z")), tlv(0x17, Buffer.from("491231235959Z")));
+  const ipSan = tlv(0x30, hex("0603551d11"), tlv(0x04, tlv(0x30, tlv(0x87, Buffer.from([127, 0, 0, 1])))));
+  const spki = publicKey.export({ type: "spki", format: "der" });
+  const tbs = tlv(0x30, tlv(0xa0, hex("020102")), hex("020101"), ecdsaSha256, name, validity, name, spki, tlv(0xa3, tlv(0x30, ipSan)));
+  const der = tlv(0x30, tbs, ecdsaSha256, tlv(0x03, Buffer.from([0]), sign("sha256", tbs, privateKey)));
+  return { key: privateKey.export({ type: "pkcs8", format: "pem" }) as string, cert: new X509Certificate(der).toString() };
+}
