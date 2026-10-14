@@ -19,7 +19,9 @@
 //                                           `seq` its events continue from
 //   POST /api/clear       ?person           forget the person: history, schedules, everything
 //   GET  /api/status                         busy / idle, background tasks
-//   GET  /api/platforms                      each platform's rules, the agent's channels and test people, link cards
+//   GET  /api/platforms                      each platform's rules, the agent's channels and test people, link cards,
+//                                            the Backend panel's action labels
+//   POST /api/actions     {index}            runs one of `actions`; its result goes to every open page's trace
 //
 // The test cloud (`testCloud: true`, for Chinwag's test cloud only): generated people per run, any
 // person id, through AgentConnection.receive; the same API with `platform` for `channel`, `person`
@@ -32,7 +34,26 @@ import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { fitMessage, type Attachment, type ChannelInfo, type ChannelSummary, type Deliver, type EventSink, type Incoming, type ListRow, type Outbound, type ChinwagEvent, type PlaygroundSink, type TestPerson, type TranscriptEntry } from "../../src/index.ts";
+import {
+  declaredTemplate,
+  fillTemplate,
+  fitMessage,
+  type Attachment,
+  type ChannelInfo,
+  type ChannelSummary,
+  type Deliver,
+  type EventSink,
+  type FilledTemplate,
+  type Incoming,
+  type ListRow,
+  type Outbound,
+  type ChinwagEvent,
+  type PlaygroundSink,
+  type Template,
+  type TemplateDefinition,
+  type TestPerson,
+  type TranscriptEntry,
+} from "../../src/index.ts";
 import { PLATFORMS, channelOf, platform as platformOf, smsSegments, type Platform } from "./platforms.ts";
 
 /** What the test cloud's simulators need from an agent. */
@@ -60,6 +81,8 @@ export interface PlaygroundAgent {
   forgetPerson(conversationId: string): Promise<void>;
   attachPlayground(sink: PlaygroundSink | null): void;
   status(): { busy: boolean; idleForMs: number; backgroundTasks: number; conversations: number };
+  /** The WhatsApp templates the agent declared, shown as WhatsApp would show them. */
+  templates?(): TemplateDefinition[];
 }
 
 export interface SimulatorsOptions {
@@ -71,6 +94,18 @@ export interface SimulatorsOptions {
   cards?: LinkCard[];
   /** The pages' HTML, for a host with no file system (Cloudflare); else read from this folder. */
   pages?: { page: string; person: string };
+}
+
+/**
+ * A button in the playground's Backend panel that makes your backend do something (an order ships,
+ * a price drops), so a demo shows the agent reacting. Playground only: it runs on this server,
+ * behind the playground's token, and never exists on the agent's channels.
+ */
+export interface PlaygroundAction {
+  /** The button's label, such as "Order 1042 ships". */
+  label: string;
+  /** Runs when the button is pressed. A string it returns ("sent", "skipped: quiet hours") shows in the trace; a throw shows as a failure. */
+  run: () => Promise<string | void> | string | void;
 }
 
 export interface LinkCard {
@@ -116,6 +151,11 @@ export type Line =
       image?: { url: string };
       /** The channel's own params the agent filled in (an app_link): shown under the message. */
       fields?: Record<string, unknown>;
+      /**
+       * A WhatsApp template, by name; declared, with its header, footer and buttons, the text its
+       * filled body. Not declared, the text lists the values it was sent with.
+       */
+      template?: { name: string; header?: FilledTemplate["header"]; footer?: string; buttons?: FilledTemplate["buttons"] };
       sms?: { segments: number; encoding: string };
       /** Sent by the SMS carrier itself (STOP, START, HELP replies), not the agent. */
       carrier?: boolean;
@@ -180,8 +220,8 @@ interface Thread {
 }
 
 export function simulators(options: SimulatorsOptions & { testCloud: true }): TestCloudSimulators;
-export function simulators(options?: SimulatorsOptions & { testCloud?: false }): Playground;
-export function simulators(options: SimulatorsOptions & { testCloud?: boolean } = {}): Playground | TestCloudSimulators {
+export function simulators(options?: SimulatorsOptions & { testCloud?: false; /** The playground's Backend panel: one button per action. */ actions?: PlaygroundAction[] }): Playground;
+export function simulators(options: SimulatorsOptions & { testCloud?: boolean; actions?: PlaygroundAction[] } = {}): Playground | TestCloudSimulators {
   const cloud = options.testCloud === true;
   const playPage = options.pages?.page ?? readFileSync(new URL("./page.html", import.meta.url), "utf8");
   const personPage = options.pages?.person ?? readFileSync(new URL("./person.html", import.meta.url), "utf8");
@@ -272,9 +312,24 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
   }
 
   /** What the platform does with one thing the agent sends. Throws when it would not arrive. */
-  function deliverer(p: Platform, k: string) {
+  function deliverer(p: Platform, k: string, templates: TemplateDefinition[] = []) {
     return (outbound: Outbound) => {
       const t = thread(k);
+      if (outbound.type === "template") {
+        const { type: _type, ...sent } = outbound;
+        const declared = declaredTemplate(templates, sent);
+        let filled: FilledTemplate | null = null;
+        try {
+          if (p.id !== "whatsapp") throw new Error(`${p.name} has no templates`);
+          if (declared) filled = fillTemplate(declared, sent);
+        } catch (error) {
+          emitLine(k, { kind: "undelivered", text: `template ${sent.name}`, reason: error instanceof Error ? error.message : String(error), at: Date.now() });
+          throw error;
+        }
+        const { body, ...shown } = filled ?? { body: valuesOf(sent) };
+        emitLine(k, { kind: "out", id: `a${++t.agentCount}`, text: body, at: Date.now(), template: { name: sent.name, ...shown } });
+        return;
+      }
       if (outbound.type === "message") {
         if (t.optedOut) throw new Error("the person texted STOP, so the carrier blocks messages to them");
         const sms = p.segments ? smsSegments(outbound.text) : undefined;
@@ -508,7 +563,7 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
     agent.attachPlayground(({ conversationId, person, channel, outbound }) => {
       people.set(conversationId, person);
       const own = agent.channels().find((c) => c.name === channel);
-      if (own) return deliverer(platformFor(own), threadKey(channel, person))(outbound);
+      if (own) return deliverer(platformFor(own), threadKey(channel, person), agent.templates?.())(outbound);
     });
   }
 
@@ -528,10 +583,14 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
       }
       if (e.channel !== channel.name) continue;
       if (e.kind === "in") lines.push({ kind: "in", id: e.id, text: e.text, at: e.at, ...(e.choice ? { choice: true } : {}) });
-      else if (e.kind === "reaction") lines.push({ kind: "reaction", messageId: e.messageId, emoji: e.emoji, at: e.at, by: "agent" });
+      else if (e.kind === "out" && e.template) {
+        // The store keeps a template's name and body text, not its other values: those show as declared.
+        const declared = agent.templates?.().find((d) => d.name === e.template);
+        lines.push({ kind: "out", id: `a${++count}`, text: e.text, at: e.at, template: { name: e.template, ...(declared ? asDeclared(declared) : {}) } });
+      } else if (e.kind === "reaction") lines.push({ kind: "reaction", messageId: e.messageId, emoji: e.emoji, at: e.at, by: "agent" });
       else {
         // The agent's message as this platform showed it (a link's URL in the text where it has no link button).
-        const { kind: _kind, channel: _channel, ...rest } = fitMessage(channel.info, e);
+        const { kind: _kind, channel: _channel, template: _template, ...rest } = fitMessage(channel.info, e);
         const sms = p.segments ? smsSegments(rest.text) : undefined;
         lines.push({ kind: "out", id: `a${++count}`, ...rest, ...(sms ? { sms: { segments: sms.segments, encoding: sms.encoding } } : {}) });
       }
@@ -553,10 +612,27 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
     if (req.method === "GET" && path === "/api/status") return json(res, 200, agent.status());
     if (req.method === "GET" && path === "/api/platforms") {
       const channels = agent.channels().map((c) => ({ name: c.name, kind: c.kind, platform: platformFor(c) }));
-      return json(res, 200, { platforms: PLATFORMS, channels, people: agent.testPeople(), cards: options.cards ?? [] });
+      return json(res, 200, { platforms: PLATFORMS, channels, people: agent.testPeople(), cards: options.cards ?? [], actions: (options.actions ?? []).map((a) => a.label) });
     }
 
     const body = req.method === "POST" ? await readBody(req, path === "/api/messages" ? MAX_MESSAGE_BODY : MAX_BODY) : null;
+
+    if (req.method === "POST" && path === "/api/actions") {
+      const action = typeof body?.index === "number" ? options.actions?.[body.index] : undefined;
+      if (!action) return json(res, 400, { error: "index must be one of the playground's actions" });
+      console.info(JSON.stringify({ chinwag: "playground.action", label: action.label, at: new Date().toISOString(), ip: req.socket.remoteAddress ?? null }));
+      let outcome: { ok: true; result?: string } | { ok: false; error: string };
+      try {
+        const result = await action.run();
+        outcome = { ok: true, ...(typeof result === "string" ? { result } : {}) };
+      } catch (error) {
+        outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      // A backend event belongs to no one conversation: every open page shows it, streamed or polled.
+      const event = { type: "action", label: action.label, at: Date.now(), ...outcome };
+      for (const k of new Set([...clients.keys(), ...recent.keys()])) push(k, event);
+      return json(res, 200, outcome);
+    }
     const asked = (name: string) => (typeof body?.[name] === "string" ? (body[name] as string) : (url.searchParams.get(name) ?? ""));
     const person = agent.testPeople().find((p) => digits(p.phone) === digits(asked("person")) && digits(p.phone) !== "");
     if (!person) return json(res, 403, { error: "only this agent's test people can be played: declare them in createAgent({ testPeople })" });
@@ -713,6 +789,20 @@ const digits = (phone: string) => phone.replace(/[^\d]/g, "");
 function ownChannel(agent: AgentConnection, p: Platform, conversationId: string): ChannelSummary | undefined {
   const kind = p.id === "web" ? "custom" : p.id;
   return agent.channels?.(conversationId).find((c) => c.kind === kind);
+}
+
+/** A template the agent did not declare: the values it was sent with, one per line. */
+function valuesOf(sent: Template): string {
+  const header = sent.header && (sent.header.kind === "text" ? sent.header.text : `${sent.header.kind}: ${sent.header.url ?? sent.header.fileId}`);
+  const body = sent.body ?? Object.values(sent.variables ?? {});
+  return [...(header ? [header] : []), ...body, ...(sent.buttons ?? []).map((b) => `button ${b.index}: ${b.value}`)].join("\n");
+}
+
+/** A declared template's header, footer and buttons without one send's values (a header's {{1}} as …). */
+function asDeclared(d: TemplateDefinition): Omit<FilledTemplate, "body"> {
+  const header = d.header?.kind === "text" ? { kind: "text" as const, text: d.header.text.replace("{{1}}", "…") } : d.header;
+  const buttons = (d.buttons ?? []).map((b) => (b.type === "quick_reply" ? { ...b, payload: b.text } : b.type === "url" ? { ...b, url: b.url.replace(/\{\{1\}\}$/, "") } : b));
+  return { ...(header ? { header } : {}), ...(d.footer ? { footer: d.footer } : {}), buttons };
 }
 
 /** The files of a message, from the page: { kind, mime, name?, data (base64) }. */

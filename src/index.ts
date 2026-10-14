@@ -1,6 +1,8 @@
 export { Agent, createAgent, type AgentOptions, type AgentStatus, type NudgeInput, type NudgeResult, type PlaygroundSink, type ReceiveOptions, type TestPerson } from "./agent.ts";
 export {
   customUI,
+  declaredTemplate,
+  fillTemplate,
   fitMessage,
   sms,
   whatsapp,
@@ -10,9 +12,9 @@ export {
   type ChannelKind,
   type ChannelSummary,
   type CustomUIProvider,
+  type FilledTemplate,
   type Message,
   type SmsProvider,
-  type Template,
   type WhatsAppFeature,
   type WhatsAppProvider,
 } from "./channels.ts";
@@ -25,5 +27,5 @@ export { Store, type StoreApi } from "./store.ts";
 export type { AgentFiles } from "./skills.ts";
 export type { TracesOptions } from "./traces.ts";
 export { tool, toSpec, type Tool, type ToolContext } from "./tools.ts";
-export type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, ListRow, Media, Model, ModelRequest, ModelResponse, Outbound, ToolCall, ToolSpec, Transcribe } from "./types.ts";
+export type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, ListRow, Media, Model, ModelRequest, ModelResponse, Outbound, Template, TemplateButton, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 export { z } from "zod";

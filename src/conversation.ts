@@ -35,14 +35,14 @@
 
 import { Buffer } from "node:buffer";
 import type { z } from "zod";
-import { fitMessage } from "./channels.ts";
+import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { Emit } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
 import type { ConversationRow, InboxRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
 import { render, toSpec, type Tool } from "./tools.ts";
-import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, ToolCall, ToolSpec, Transcribe } from "./types.ts";
+import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
   model: Model;
@@ -69,6 +69,8 @@ export interface ConversationSettings {
   now: () => number;
   /** The agent's own time zone (the business's), for schedules when the person's is not known. */
   timeZone?: string;
+  /** The WhatsApp templates the owner declared: a sent one's text goes in the history. */
+  templates: TemplateDefinition[];
   /** Tag every message with its channel (the agent has several), even for a person on one so far. */
   tagChannels: boolean;
   /** How the channels of a conversation loaded from the store are reached again. */
@@ -161,7 +163,7 @@ interface Direct {
   inbox?: number;
   channel: string;
   text?: string;
-  template?: { name: string; language?: string; variables?: Record<string, string> };
+  template?: Template;
   run?: string;
   nudge?: string;
 }
@@ -902,7 +904,13 @@ export class Conversation {
     const failure = await this.send(d.channel, outbound);
     if (failure) return settle("failed", failure);
     if (d.template) {
-      this.history.push({ role: "user", content: `[Chinwag] The business sent them its template "${d.template.name}" on ${d.channel}.` });
+      // A declared template's text, so the agent knows what the person read (and tapped a reply to).
+      const declared = declaredTemplate(this.settings.templates, d.template);
+      let reads = "";
+      try {
+        if (declared) reads = ` It reads:\n${fillTemplate(declared, d.template).body}`;
+      } catch {}
+      this.history.push({ role: "user", content: `[Chinwag] The business sent them its template "${d.template.name}" on ${d.channel}.${reads}` });
     } else {
       const callId = `direct_${d.inbox ?? Date.now()}`;
       this.history.push({ role: "user", content: `[Chinwag] The business sent them this message through you on ${d.channel}, as written:` });
@@ -1055,6 +1063,8 @@ export type TranscriptEntry =
       image?: { url: string };
       /** The channel's own params the agent filled in. */
       fields?: Record<string, unknown>;
+      /** A WhatsApp template the business sent, by name; the text is its body when it was declared. */
+      template?: string;
     }
   | { kind: "reaction"; channel: string; messageId: string; emoji: string; at: number }
   | { kind: "tool"; callId: string; tool: string; input: unknown; output: string; ok: boolean; at: number };
@@ -1074,6 +1084,11 @@ export function transcriptOf(history: Array<{ entry: ChatMessage; at: number }>,
   const channelOf = new Map<string, string>();
   for (const { entry, at } of history) {
     if (entry.role === "user") {
+      const template = /^\[Chinwag\] The business sent them its template "(.*)" on ([\w-]+)\.(?: It reads:\n([\s\S]*))?$/.exec(entry.content);
+      if (template) {
+        lines.push({ kind: "out", channel: template[2], text: template[3] ?? "", at, template: template[1] });
+        continue;
+      }
       const starts = [...entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)(?=[,\]])/gm)];
       starts.forEach((m, i) => {
         const channel = m[1] ?? only;

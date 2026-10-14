@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { sqlite, type ChannelInfo, type ChannelSummary, type Deliver, type Incoming } from "../../src/index.ts";
+import { sqlite, type ChannelInfo, type ChannelSummary, type Deliver, type Incoming, type TemplateDefinition } from "../../src/index.ts";
 import { WHATSAPP, call, multi, respond } from "../../test/helpers.ts";
 import { simulators, type AgentConnection, type Line } from "../src/index.ts";
 
@@ -251,6 +251,85 @@ test("a page the live stream can't reach gets the same events by polling, each o
 
     (await h.nextCall(1)).answer(respond(call("send_whatsapp", { text: "Coming up" })));
     await idle();
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("WhatsApp shows a declared template as WhatsApp would, and one not declared by its name and values, also after a reload", async () => {
+  const ready: TemplateDefinition = {
+    name: "order_ready",
+    language: "en",
+    category: "utility",
+    header: { kind: "text", text: "Order {{1}}" },
+    body: "Hi {{1}}, your {{2}} is ready.",
+    footer: "Reply STOP to opt out",
+    buttons: [{ type: "quick_reply", text: "On my way" }, { type: "url", text: "Track", url: "https://example.com/o/{{1}}" }, { type: "phone", text: "Call us", phone: "+15555550100" }],
+  };
+  const h = multi({ channels: { whatsapp: { info: WHATSAPP, phone: true, kind: "whatsapp" } }, testPeople: [MARIA], database: sqlite(), templates: [ready] });
+  await h.agent.resume();
+  const server = await simulators().listen(h.agent, 0);
+  const where = `channel=whatsapp&person=${encodeURIComponent(MARIA.phone)}`;
+  const transcript = async () => (await (await fetch(`${server.url}/api/transcript?${where}`)).json()) as { seq: number; lines: Line[] };
+  try {
+    await fetch(`${server.url}/api/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "whatsapp", person: MARIA.phone, text: "hi" }) });
+    (await h.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Hi Maria!" })));
+    await h.agent.conversation((await h.agent.testConversation(MARIA.phone))!)!.whenIdle();
+    const { seq } = await transcript();
+
+    const to = { channel: "whatsapp", address: MARIA.phone };
+    await h.agent.nudge({ to, template: { name: "order_ready", header: { kind: "text", text: "1042" }, body: ["Maria", "latte"], buttons: [{ index: 0, value: "omw_1042" }, { index: 1, value: "1042" }] } });
+    await h.agent.nudge({ to, template: { name: "loyalty", body: ["Maria", "120"] } });
+    const polled = (await (await fetch(`${server.url}/api/poll?${where}&after=${seq}`)).json()) as { events: Array<{ line?: Line }> };
+    const [declared, other] = polled.events.flatMap((e) => (e.line?.kind === "out" ? [e.line] : []));
+    assert.deepEqual([declared.text, declared.template], [
+      "Hi Maria, your latte is ready.",
+      {
+        name: "order_ready",
+        header: { kind: "text", text: "Order 1042" },
+        footer: "Reply STOP to opt out",
+        buttons: [{ type: "quick_reply", text: "On my way", payload: "omw_1042" }, { type: "url", text: "Track", url: "https://example.com/o/1042" }, { type: "phone", text: "Call us", phone: "+15555550100" }],
+      },
+    ]);
+    assert.deepEqual([other.text, other.template], ["Maria\n120", { name: "loyalty" }]);
+
+    // From the store, after a reload: the body as it read, the rest as declared.
+    const reloaded = (await transcript()).lines.flatMap((l) => (l.kind === "out" && l.template ? [[l.text, l.template.name, l.template.footer]] : []));
+    assert.deepEqual(reloaded, [["Hi Maria, your latte is ready.", "order_ready", "Reply STOP to opt out"], ["", "loyalty", undefined]]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the playground's Backend buttons run on the server behind its token, and their results reach the trace, polled too", async () => {
+  const h = agentOn(sqlite());
+  await h.agent.resume();
+  const token = "t".repeat(40);
+  const ran: string[] = [];
+  const actions = [
+    { label: "Order 1042 ships", run: async () => (ran.push("ships"), "sent") },
+    { label: "Price drops", run: () => { throw new Error("skipped: quiet hours"); } },
+  ];
+  const server = createServer(simulators({ actions }).handler(h.agent, { token, base: "/play" }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/play`;
+  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  const where = `channel=whatsapp&person=${encodeURIComponent(MARIA.phone)}`;
+  const press = (index: number, auth = headers) => fetch(`${url}/api/actions`, { method: "POST", headers: auth, body: JSON.stringify({ index }) });
+  try {
+    assert.deepEqual((await (await fetch(`${url}/api/platforms`, { headers })).json()).actions, ["Order 1042 ships", "Price drops"]);
+    assert.equal((await press(0, { authorization: "Bearer wrong", "content-type": "application/json" })).status, 401);
+    assert.deepEqual(ran, [], "nothing runs without the token");
+
+    const { seq } = await (await fetch(`${url}/api/transcript?${where}`, { headers })).json();
+    assert.deepEqual(await (await press(0)).json(), { ok: true, result: "sent" });
+    assert.deepEqual(await (await press(1)).json(), { ok: false, error: "skipped: quiet hours" });
+    assert.equal((await press(2)).status, 400);
+    const polled = (await (await fetch(`${url}/api/poll?${where}&after=${seq}`, { headers })).json()) as { events: Array<Record<string, unknown>> };
+    assert.deepEqual(polled.events.map(({ type, label, ok, result, error }) => ({ type, label, ok, result, error })), [
+      { type: "action", label: "Order 1042 ships", ok: true, result: "sent", error: undefined },
+      { type: "action", label: "Price drops", ok: false, result: undefined, error: "skipped: quiet hours" },
+    ]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

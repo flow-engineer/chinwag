@@ -1,8 +1,8 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, tool, type Database, type TestPerson } from "../src/index.ts";
-import type { ChannelInfo, ChatMessage, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
+import { createAgent, tool, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
+import type { ChannelInfo, ChannelKind, ChatMessage, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
 
 /**
  * A model the test drives: each call waits for the test to answer it. The step Chinwag adds after a
@@ -96,7 +96,8 @@ export const WEB_APP: ChannelInfo = { reactions: true, status: true, formatting:
 
 /** An agent with real channels (by name), for one person across several of them. */
 export function multi(options: {
-  channels: Record<string, { info: ChannelInfo; phone?: boolean }>;
+  /** Each channel is custom unless it names its kind. */
+  channels: Record<string, { info: ChannelInfo; phone?: boolean; kind?: ChannelKind }>;
   tools?: ReturnType<typeof tool>[];
   database?: Database;
   resolve?: (identity: { channel: string; address: string }) => string | null;
@@ -104,6 +105,7 @@ export function multi(options: {
   timeZone?: string;
   dir?: string;
   testPeople?: TestPerson[];
+  templates?: TemplateDefinition[];
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
@@ -129,6 +131,7 @@ export function multi(options: {
     now: options.now,
     timeZone: options.timeZone,
     testPeople: options.testPeople,
+    templates: options.templates,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>

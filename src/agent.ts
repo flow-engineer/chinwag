@@ -14,7 +14,7 @@
 // every send to it (replies, scheduled messages, nudges) goes back the same way.
 
 import { randomUUID } from "node:crypto";
-import { summarize, type Channel, type ChannelSummary } from "./channels.ts";
+import { declaredTemplate, fillTemplate, summarize, type Channel, type ChannelSummary } from "./channels.ts";
 import { Conversation, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type TranscriptEntry } from "./conversation.ts";
 import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
@@ -23,7 +23,7 @@ import { loadInstructions, loadSkills, readAgentFolder, skillTool, type AgentFil
 import { Store, type ConversationRow, type IdentityRow, type StoreApi, type Via } from "./store.ts";
 import { toSpec, type Tool } from "./tools.ts";
 import { traces, tracesFromEnv, type Traces, type TracesOptions } from "./traces.ts";
-import type { ChannelInfo, Deliver, Incoming, Model, Outbound, Transcribe } from "./types.ts";
+import type { ChannelInfo, Deliver, Incoming, Model, Outbound, Template, TemplateDefinition, Transcribe } from "./types.ts";
 
 export interface AgentOptions {
   /** Folder holding AGENTS.md and skills/<name>/SKILL.md. Give this or `files`. */
@@ -96,6 +96,12 @@ export interface AgentOptions {
    */
   testPeople?: TestPerson[];
   /**
+   * The WhatsApp templates the owner set up with Meta. A nudge with one of them is checked against
+   * it before it goes (values that don't fit throw), the agent is told what it said, and the
+   * playground shows it as WhatsApp would. A template not declared here is sent as it is.
+   */
+  templates?: TemplateDefinition[];
+  /**
    * Send every turn to a traces endpoint as a trace. Default: from the environment, on when
    * CHINWAG_TRACES_KEY is set (with CHINWAG_TRACES_URL, and CHINWAG_TRACES_CONTENT=1 for content),
    * never under `node --test`.
@@ -137,7 +143,7 @@ export interface NudgeInput {
   /** The agent gets a turn with this note and writes the message itself, or sends nothing. */
   prompt?: string;
   /** A template the owner already set up with the channel, sent as is (also outside WhatsApp's window). */
-  template?: { name: string; language?: string; variables?: Record<string, string> };
+  template?: Template;
   /** Send it later, at this time (ms since the epoch), as a scheduled message. */
   at?: number;
   /** The same key twice sends once; the second call gets the first's result. */
@@ -207,6 +213,7 @@ export class Agent {
       ready: this.store.migrate(),
       now: this.now,
       timeZone: options.timeZone,
+      templates: options.templates ?? [],
       tagChannels: (options.channels ?? []).length > 1,
       links: (id) => this.links(id),
       settle: (target, status, reason) => this.settle(target, status, reason),
@@ -250,6 +257,11 @@ export class Agent {
   /** Sends the traces of finished turns still waiting for the traces endpoint; call it before the process exits. */
   flushTraces(): Promise<void> {
     return this.traces?.flush() ?? Promise.resolve();
+  }
+
+  /** The templates declared in `templates`. */
+  templates(): TemplateDefinition[] {
+    return [...(this.options.templates ?? [])];
   }
 
   /** The people declared in `testPeople`. */
@@ -439,6 +451,9 @@ export class Agent {
     await this.settings.ready;
     const kinds = [input.text, input.prompt, input.template].filter((v) => v !== undefined).length;
     if (kinds !== 1) throw new Error("chinwag: a nudge has exactly one of text, prompt or template");
+    // A declared template whose values don't fit it never goes: Meta would refuse it, the playground would show nonsense.
+    const declared = input.template && declaredTemplate(this.options.templates, input.template);
+    if (declared) fillTemplate(declared, input.template!);
     if (input.idempotencyKey) {
       const earlier = await this.store.nudgeByKey(input.idempotencyKey);
       if (earlier) return this.result(earlier.id, earlier.status, earlier.reason);

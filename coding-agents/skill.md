@@ -162,6 +162,41 @@ as written; `prompt` instead lets the agent write it (or decide not to); `templa
 WhatsApp template you already set up. Pass `idempotencyKey` when your system may retry, and `at`
 to send later. Outside WhatsApp's 24-hour window only templates go out (`outside_window`).
 
+Templates are WhatsApp only. Declare the ones the owner set up with Meta beside `testPeople`, so
+Chinwag checks each send against them and the playground shows them as WhatsApp does:
+
+```ts
+createAgent({
+  ...,
+  templates: [{
+    name: "order_ready", language: "en", category: "utility",   // or marketing, authentication
+    header: { kind: "text", text: "Order {{1}}" },              // or { kind: "image" | "video" | "document" }
+    body: "Hi {{1}}, your {{2}} is ready.",
+    footer: "Reply STOP to opt out",
+    buttons: [
+      { type: "quick_reply", text: "On my way" },
+      { type: "url", text: "Track", url: "https://example.com/o/{{1}}" },
+      { type: "phone", text: "Call us", phone: "+15555550100" },
+    ],
+  }],
+});
+
+await agent.nudge({ to, template: {
+  name: "order_ready",
+  header: { kind: "text", text: "1042" },                     // media: { kind: "image", url } or { kind, fileId }
+  body: ["Maria", "latte"],                                   // {{1}}, {{2}}, ... in order
+  buttons: [{ index: 0, value: "omw_1042" }, { index: 1, value: "1042" }],   // a quick reply's payload, a URL's end
+} });
+```
+
+A declared template sent with the wrong values (a body value too few or many, a missing header or
+URL value) throws from `nudge` before anything is sent, in the playground and live alike. One not
+declared goes as it is (the provider checks it) and the playground shows its name and values. A
+quick-reply tap comes back as the person's message with `choice: { id: payload, title }`, like a
+reply button, and the agent is told what the template said. An ordinary message has one kind of
+button: up to 3 reply buttons OR one link button, never both. A template may mix quick replies and
+URL buttons.
+
 ## The playground
 
 Every agent ships a test playground: people test it as real users before its numbers are live.
@@ -194,6 +229,19 @@ restarts (with a durable `database`), and Clear history forgets the person entir
 fast each message was acknowledged and a trace of every model call and tool. `cards` says how a
 custom UI shows a link in its params: `{ match: "/video/", label: "Start video call", kind: "call" }`;
 any other link is "Open in app".
+
+To demo what your backend does (an order ships, a price drops) without a page of your own, give the
+playground `actions`: each is a button in its Backend panel that runs your function on the server,
+usually one that calls your backend or `agent.nudge`. What it returns ("sent", "skipped: quiet
+hours") shows in the trace with its label; a throw shows as a failure. Actions exist only in the
+playground, behind its token, never on the agent's channels:
+
+```ts
+const play = simulators({
+  title: "My agent",
+  actions: [{ label: "Order 1042 is ready", run: async () => (await notifyOrderReady("1042")).status }],
+});
+```
 
 On a deployed agent, mount it in your own server with a token of at least 32 characters, from a
 secret: `const playground = play.handler(agent, { token: process.env.PLAYGROUND_TOKEN!, base: "/playground" })`,

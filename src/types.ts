@@ -84,10 +84,45 @@ export type Outbound =
   /** A reaction on one of the person's messages, by the id Chinwag gave it. */
   | { type: "reaction"; emoji: string; messageId: string }
   /** A template the owner set up with the channel (WhatsApp), sent as is, even outside its window. */
-  | { type: "template"; name: string; language?: string; variables?: Record<string, string> }
+  | ({ type: "template" } & Template)
   /** A short line of what the agent is doing, shown in the loading indicator; null clears it. */
   | { type: "status"; text: string | null }
   | { type: "typing"; on: boolean };
+
+/** A WhatsApp template as it is sent: its name and the values for its placeholders (Meta's template parameters). */
+export interface Template {
+  /** Its name as approved (or the provider's own id for it). */
+  name: string;
+  language?: string;
+  /** The header's value: the text for its {{1}}, or its photo, video or document by https URL or the provider's file id. */
+  header?: { kind: "text"; text: string } | { kind: "image" | "video" | "document"; url?: string; fileId?: string };
+  /** Values for the body's {{1}}, {{2}}, ... in order. */
+  body?: string[];
+  /** Values for the buttons that take one, by the button's position from 0: a URL button's suffix, a quick reply's payload. */
+  buttons?: Array<{ index: number; value: string }>;
+  /** The body's values by number ({ "1": "Maria" }), the older form of `body`: give one or the other. */
+  variables?: Record<string, string>;
+}
+
+/**
+ * A WhatsApp template as the owner set it up with Meta, declared in `createAgent({ templates })`:
+ * Chinwag checks every send of it against this, and the playground shows it as WhatsApp would.
+ */
+export interface TemplateDefinition {
+  name: string;
+  /** Meta's language code: en, en_US, hi. */
+  language: string;
+  category: "utility" | "marketing" | "authentication";
+  /** Text (which may hold one {{1}}), or a photo, video or document sent with each message. */
+  header?: { kind: "text"; text: string } | { kind: "image" | "video" | "document" };
+  /** The message, with {{1}}, {{2}}, ... where its values go. */
+  body: string;
+  footer?: string;
+  /** Quick replies come back as the person's tap; a URL may end in {{1}}, its value given at each send. */
+  buttons?: TemplateButton[];
+}
+
+export type TemplateButton = { type: "quick_reply"; text: string } | { type: "url"; text: string; url: string } | { type: "phone"; text: string; phone: string };
 
 /** Sends one outbound; a rejection means it did not reach the person. */
 export type Deliver = (outbound: Outbound) => Promise<void> | void;

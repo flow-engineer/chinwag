@@ -1,13 +1,14 @@
-// covers: src/nudges.ts src/schedules.ts src/store.ts src/conversation.ts src/agent.ts
+// covers: src/nudges.ts src/schedules.ts src/store.ts src/conversation.ts src/agent.ts src/channels.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { TemplateDefinition } from "../src/index.ts";
 import { SMS, WHATSAPP, call, last, multi, respond } from "./helpers.ts";
 
 const SAM = { channel: "sms", address: "+15550100100" };
 
 /** Sam has written once and been answered. */
-async function withSam(channels: Record<string, { info: typeof SMS; phone?: boolean }> = { sms: { info: SMS, phone: true } }, clock = { now: Date.UTC(2026, 9, 12, 16) }) {
-  const h = multi({ channels, now: () => clock.now });
+async function withSam(channels: Record<string, { info: typeof SMS; phone?: boolean }> = { sms: { info: SMS, phone: true } }, clock = { now: Date.UTC(2026, 9, 12, 16) }, templates?: TemplateDefinition[]) {
+  const h = multi({ channels, now: () => clock.now, templates });
   const channel = Object.keys(channels)[0];
   const a = await h.message(channel, SAM.address, "hi");
   (await h.nextCall(0)).answer(respond(call(`send_${channel}`, { text: "Hi!" })));
@@ -98,6 +99,31 @@ test("outside WhatsApp's window, text and prompt nudges are refused before any m
   const template = await h.agent.nudge({ to: h.to, template: { name: "order_ready", variables: { name: "Sam" } } });
   assert.equal(template.status, "sent");
   assert.deepEqual(h.out.at(-1)!.outbound, { type: "template", name: "order_ready", variables: { name: "Sam" } });
+});
+
+test("a declared template is checked before it goes, and the agent is told what it read", async () => {
+  const ready: TemplateDefinition = {
+    name: "order_ready",
+    language: "en",
+    category: "utility",
+    header: { kind: "image" },
+    body: "Hi {{1}}, your {{2}} order is ready.",
+    buttons: [{ type: "quick_reply", text: "On my way" }, { type: "url", text: "Track it", url: "https://example.com/o/{{1}}" }],
+  };
+  const h = await withSam({ whatsapp: { info: WHATSAPP, phone: true } }, undefined, [ready]);
+  const header = { kind: "image" as const, url: "https://example.com/order.png" };
+  await assert.rejects(h.agent.nudge({ to: h.to, template: { name: "order_ready", header, body: ["Sam"], buttons: [{ index: 1, value: "o42" }] } }), /template "order_ready" \(en\) takes 2 body values, got 1/);
+  await assert.rejects(h.agent.nudge({ to: h.to, template: { name: "order_ready", header, body: ["Sam", "coffee"] } }), /takes the end of button 1's URL/);
+  assert.equal(h.out.filter((o) => o.outbound.type === "template").length, 0, "nothing was sent");
+
+  const template = { name: "order_ready", header, body: ["Sam", "coffee"], buttons: [{ index: 0, value: "on_my_way" }, { index: 1, value: "o42" }] };
+  assert.equal((await h.agent.nudge({ to: h.to, template })).status, "sent");
+  assert.deepEqual(h.out.at(-1)!.outbound, { type: "template", ...template });
+  await h.message("whatsapp", SAM.address, "ok");
+  const next = await h.nextCall(1);
+  assert.ok(next.request.messages.some((m) => m.role === "user" && m.content === '[Chinwag] The business sent them its template "order_ready" on whatsapp. It reads:\nHi Sam, your coffee order is ready.'));
+  next.answer(respond(call("send_whatsapp", { text: "See you soon." })));
+  await h.conversation.whenIdle();
 });
 
 test("a nudge for someone who never wrote is refused", async () => {

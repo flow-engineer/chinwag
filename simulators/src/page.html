@@ -65,6 +65,10 @@
   .fields { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
   .fields span { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px dashed currentColor; opacity: .75; }
   .btns button { border: 0; padding: 8px; cursor: pointer; text-align: center; }
+  .tpl-name { font-size: 11.5px; opacity: .7; margin-bottom: 2px; }
+  .tpl-head { font-weight: 600; margin-bottom: 2px; }
+  .tpl-media { display: flex; align-items: center; justify-content: center; width: 260px; max-width: 100%; height: 140px; border-radius: 6px; margin: 0 0 4px; background: rgba(0,0,0,.06); font-size: 13px; opacity: .8; }
+  .tpl-foot { display: block; font-size: 12.5px; opacity: .6; margin-top: 2px; }
   .photo { display: block; width: 260px; max-width: 100%; min-height: 140px; max-height: 320px; object-fit: cover; border-radius: 12px; margin: 0 0 4px; background: rgba(0,0,0,.06); }
   /* A link in a custom UI's params, as that UI would show it (the agent's card rules). */
   .linkcard { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; min-width: 220px; max-width: 280px; padding: 10px 12px; border-radius: 14px; border: 1px solid rgba(0,0,0,.1); background: #fff; color: #111; text-align: left; cursor: pointer; }
@@ -172,7 +176,9 @@
   .p-web .compose button { background: #2f6fed; }
 
   /* Side panel */
-  .side { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 16px; min-height: 0; }
+  .side { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+  .side > .card:last-child { flex: 1; }
+  .backend { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
   .card h2 { font-size: 13px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
   .card h2 span { font-weight: 400; color: var(--quiet); }
@@ -215,6 +221,10 @@
     <div class="screen" id="screen" role="dialog" aria-label="Opened link"></div>
   </section>
   <div class="side">
+    <section class="card" id="backend" style="display: none">
+      <h2>Backend <span>what your server does; results show in the trace</span></h2>
+      <div class="backend" id="actions"></div>
+    </section>
     <section class="card">
       <h2>Per turn <span id="status"></span></h2>
       <div class="metrics">
@@ -353,10 +363,32 @@
       img.title = line.image.url;
       b.appendChild(img);
     }
+    // A WhatsApp template. Declared (it has its buttons, even none): header, filled body, footer,
+    // buttons, as WhatsApp shows it. Not declared: its name over the values it was sent with.
+    const tpl = line.template;
+    const declared = tpl && Array.isArray(tpl.buttons);
+    if (tpl) {
+      b.title = `Template ${tpl.name}`;
+      if (!declared) { const n = document.createElement("div"); n.className = "tpl-name"; n.textContent = `Template “${tpl.name}”`; b.appendChild(n); }
+      const h = tpl.header;
+      if (h && h.kind === "text") { const el = document.createElement("div"); el.className = "tpl-head"; el.textContent = h.text; b.appendChild(el); }
+      else if (h && h.kind === "image" && h.url && h.url.startsWith("https://")) {
+        const img = document.createElement("img");
+        img.className = "photo"; img.src = h.url; img.alt = "Photo"; img.loading = "lazy"; img.referrerPolicy = "no-referrer"; img.title = h.url;
+        b.appendChild(img);
+      } else if (h) {
+        const el = document.createElement("div");
+        el.className = "tpl-media";
+        el.textContent = { image: "🖼 Photo", video: "▶ Video", document: "📄 Document" }[h.kind] || h.kind;
+        if (h.url || h.fileId) el.title = h.url || h.fileId;
+        b.appendChild(el);
+      }
+    }
     const body = document.createElement("span");
     if (current.formatting === "whatsapp") body.innerHTML = whatsappHtml(line.text);
     else body.textContent = line.text;
     b.appendChild(body);
+    if (tpl && tpl.footer) { const f = document.createElement("span"); f.className = "tpl-foot"; f.textContent = tpl.footer; b.appendChild(f); }
     if (current.id === "whatsapp") {
       const stamp = document.createElement("span");
       stamp.className = "stamp";
@@ -365,6 +397,26 @@
       b.appendChild(stamp);
     }
     row.appendChild(b);
+    if (declared && tpl.buttons.length) {
+      // A quick reply comes back as their tap, with its payload; a URL or phone button opens, as a link button does.
+      const btns = document.createElement("div");
+      btns.className = "btns";
+      for (const t of tpl.buttons) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        if (t.type === "quick_reply") {
+          btn.textContent = "↩ " + t.text;
+          btn.addEventListener("click", () => send(t.text, { choice: { id: t.payload, title: t.text }, replyTo: line.id }));
+        } else {
+          const url = t.type === "url" ? t.url : "tel:" + t.phone;
+          btn.textContent = (t.type === "url" ? "↗ " : "📞 ") + t.text;
+          btn.title = url;
+          btn.addEventListener("click", () => openScreen(cards.find((c) => url.includes(c.match)) || { label: t.text, kind: "page" }, url));
+        }
+        btns.appendChild(btn);
+      }
+      row.appendChild(btns);
+    }
     if (line.buttons) {
       const btns = document.createElement("div");
       btns.className = "btns";
@@ -709,10 +761,20 @@
     else if (e.type === "turn.end") { text = `turn done in ${e.ms} ms`; }
     else if (e.type === "tool.start") { text = `${e.tool} started`; }
     else if (e.type === "message.undelivered") { tag = "not delivered"; cls = "bad"; text = e.reason; }
+    logRow(e.at, tag, cls, text);
+  }
+
+  // A Backend button's run, on every open page: what it returned, or why it failed.
+  function actionDone(d) {
+    if (d.ok) logRow(d.at, "backend", "inline", d.label + (d.result ? ` → ${d.result}` : ""));
+    else logRow(d.at, "backend failed", "bad", `${d.label}: ${d.error}`);
+  }
+
+  function logRow(at, tag, cls, text) {
     const row = document.createElement("div");
     const ts = document.createElement("span");
     ts.className = "t";
-    ts.textContent = new Date(e.at).toLocaleTimeString([], { hour12: false });
+    ts.textContent = new Date(at).toLocaleTimeString([], { hour12: false });
     const what = document.createElement("span");
     if (tag) { const b = document.createElement("span"); b.className = "tag " + cls; b.textContent = tag + " "; what.appendChild(b); }
     what.appendChild(document.createTextNode(text));
@@ -783,6 +845,7 @@
     else if (d.type === "status") { if (current.status) { showStatus(d.text); if (d.text) onSeen("status", d.at); } }
     else if (d.type === "typing") showTyping(d.on);
     else if (d.type === "trace") trace(d.event);
+    else if (d.type === "action") actionDone(d);
     else if (d.type === "reset") setPlatform(PLAY ? current.channel : current.id);
   }
 
@@ -893,7 +956,24 @@
   }
 
   (async () => {
-    ({ platforms, cards, people = [], channels = [] } = await (await fetch(BASE + "/api/platforms")).json());
+    let actions = [];
+    ({ platforms, cards, people = [], channels = [], actions = [] } = await (await fetch(BASE + "/api/platforms")).json());
+    if (PLAY && actions.length && !REPLAY) {
+      // The Backend panel: each button runs one of the playground's actions on the server.
+      $("backend").style.display = "";
+      actions.forEach((label, index) => {
+        const btn = document.createElement("button");
+        btn.type = "button"; btn.className = "ghost"; btn.textContent = label;
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          try {
+            const res = await fetch(BASE + "/api/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ index }) });
+            if (!res.ok) logRow(Date.now(), "backend failed", "bad", `${label}: ${res.status}`);
+          } finally { btn.disabled = false; }
+        });
+        $("actions").appendChild(btn);
+      });
+    }
     if (PLAY) {
       if (!channels.length) return empty("This agent has no channels. Declare them in <code>createAgent({ channels: [...] })</code> (whatsapp(), sms(), customUI()) to test it here.");
       if (!people.length) return empty("This agent has no test people. Declare who may be played here in <code>createAgent({ testPeople: [{ name, phone }] })</code>.");
