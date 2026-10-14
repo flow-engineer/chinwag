@@ -8,7 +8,7 @@ import { createAgent } from "../src/index.ts";
 import { WEB, call, last, respond, say, scriptedModel } from "./helpers.ts";
 
 test("skills are listed, and load only when the agent asks", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "parley-"));
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "Base.");
   mkdirSync(join(dir, "skills", "booking"), { recursive: true });
   writeFileSync(join(dir, "skills", "booking", "SKILL.md"), "---\nname: booking\ndescription: moving sessions\n---\nOffer three slots.");

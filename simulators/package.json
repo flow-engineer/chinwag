@@ -1,15 +1,8 @@
 {
-  "name": "@parley/simulators",
-  "version": "0.1.0",
+  "name": "chinwag-simulators",
   "private": true,
-  "description": "Chat platform simulators (SMS, WhatsApp, iMessage, Telegram, web) for Parley agents.",
+  "description": "Holds the simulators' tests and typecheck; they ship in the chinwag package as chinwag/simulators.",
   "type": "module",
-  "engines": {
-    "node": ">=22.18"
-  },
-  "exports": {
-    ".": "./src/index.ts"
-  },
   "scripts": {
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "../node_modules/.bin/tsc --noEmit -p ."

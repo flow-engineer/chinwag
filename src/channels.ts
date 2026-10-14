@@ -1,4 +1,4 @@
-// Channels: where people reach an agent. Parley knows each platform (what WhatsApp can show, its
+// Channels: where people reach an agent. Chinwag knows each platform (what WhatsApp can show, its
 // limits, its 24-hour window); a provider only says how to send through its own API. A provider
 // implements one sendMessage, which gets everything the agent's send tool carries, plus the
 // optional actions that are not messages (react, typing, markRead, sendTemplate). A feature the
@@ -43,6 +43,10 @@ export interface Message {
   replyTo?: string;
   buttons?: string[];
   list?: { button: string; rows: ListRow[] };
+  /** A button that opens this page. Never with buttons or a list. */
+  link?: { label: string; url: string };
+  /** A photo, the text its caption. Never with a list. */
+  image?: { url: string };
 }
 
 export interface Template {
@@ -54,7 +58,7 @@ export interface Template {
 export interface WhatsAppProvider {
   sendMessage(to: string, message: Message): Promise<void>;
   /** Which parts of a message this provider can send. Default: all. */
-  features?: { buttons?: boolean; lists?: boolean; replies?: boolean };
+  features?: { buttons?: boolean; lists?: boolean; replies?: boolean; links?: boolean; images?: boolean };
   react?(to: string, messageId: string, emoji: string): Promise<void>;
   typing?(to: string, on: boolean): Promise<void>;
   markRead?(to: string, messageIds: string[]): Promise<void>;
@@ -89,6 +93,10 @@ export const WHATSAPP: ChannelInfo = {
   replies: true,
   buttons: { max: 3, labelMax: 20 },
   lists: { maxRows: 10, titleMax: 24, buttonMax: 20 },
+  // An interactive cta_url message: one URL button, its label up to 20 characters.
+  linkButton: { labelMax: 20 },
+  // An image's caption is at most 1,024 characters (as is an interactive message's body).
+  images: { captionMax: 1024 },
   readReceipts: true,
   replyWindowHours: 24,
 };
@@ -96,7 +104,7 @@ export const WHATSAPP: ChannelInfo = {
 /** SMS: plain text; providers join up to 10 segments into one text (1,530 GSM-7 characters). */
 export const SMS: ChannelInfo = { reactions: false, status: false, formatting: "plain", maxLength: 1530 };
 
-export type WhatsAppFeature = "buttons" | "lists" | "replies" | "reactions" | "typing" | "readReceipts" | "templates";
+export type WhatsAppFeature = "buttons" | "lists" | "links" | "images" | "replies" | "reactions" | "typing" | "readReceipts" | "templates";
 
 export function whatsapp(provider: WhatsAppProvider, options: { name?: string; disable?: WhatsAppFeature[]; instructions?: string } = {}): Channel {
   const off = new Set(options.disable ?? []);
@@ -109,6 +117,8 @@ export function whatsapp(provider: WhatsAppProvider, options: { name?: string; d
     replies: has("replies", f.replies !== false),
     buttons: has("buttons", f.buttons !== false) ? WHATSAPP.buttons : undefined,
     lists: has("lists", f.lists !== false) ? WHATSAPP.lists : undefined,
+    linkButton: has("links", f.links !== false) ? WHATSAPP.linkButton : undefined,
+    images: has("images", f.images !== false) ? WHATSAPP.images : undefined,
   };
   return {
     name: options.name ?? "whatsapp",
@@ -190,7 +200,23 @@ function message(outbound: Extract<Outbound, { type: "message" }>): Message {
     ...(outbound.replyTo ? { replyTo: outbound.replyTo } : {}),
     ...(outbound.buttons ? { buttons: outbound.buttons } : {}),
     ...(outbound.list ? { list: outbound.list } : {}),
+    ...(outbound.link ? { link: outbound.link } : {}),
+    ...(outbound.image ? { image: outbound.image } : {}),
   };
+}
+
+/**
+ * A message as this channel can show it: without a link button the link's URL goes on a line after
+ * the text, and without images the text goes alone. So a provider only gets what it declared.
+ */
+export function fitMessage<M extends { text: string; link?: { label: string; url: string }; image?: { url: string } }>(info: ChannelInfo, message: M): M {
+  const { link, image, ...rest } = message;
+  return {
+    ...rest,
+    ...(link && !info.linkButton ? { text: `${message.text}\n${link.url}` } : {}),
+    ...(link && info.linkButton ? { link } : {}),
+    ...(image && info.images ? { image } : {}),
+  } as M;
 }
 
 export function summarize(channel: Channel): ChannelSummary {

@@ -11,13 +11,17 @@
 //   GET  /?person=<phone>&channel=<name>      the playground; /person shows every channel side by side
 //   POST /api/messages    {channel, person, text, replyTo?, choice?}  → {messageId, at}
 //   POST /api/reactions   {channel, person, messageId, emoji}          the person reacts to an agent message
-//   GET  /api/events      ?channel&person   server-sent events: what the person sees, plus the trace
-//   GET  /api/transcript  ?channel&person   the conversation on that channel, from the store
+//   GET  /api/events      ?channel&person&after?   server-sent events: what the person sees, plus the trace
+//   GET  /api/poll        ?channel&person&after    the same events for a page the stream can't reach (a
+//                                                  tunnel that holds it back): those after `after` at once,
+//                                                  else the next within 20 s → {boot, seq, events}
+//   GET  /api/transcript  ?channel&person   the conversation on that channel, from the store, and the
+//                                           `seq` its events continue from
 //   POST /api/clear       ?person           forget the person: history, schedules, everything
 //   GET  /api/status                         busy / idle, background tasks
 //   GET  /api/platforms                      each platform's rules, the agent's channels and test people, link cards
 //
-// The test cloud (`testCloud: true`, for Parley's test cloud only): generated people per run, any
+// The test cloud (`testCloud: true`, for Chinwag's test cloud only): generated people per run, any
 // person id, through AgentConnection.receive; the same API with `platform` for `channel`, `person`
 // free, and POST /api/reset to start a conversation over. Its transcript is kept in memory.
 //
@@ -28,7 +32,7 @@ import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { TLSSocket } from "node:tls";
-import type { ChannelInfo, ChannelSummary, Deliver, EventSink, Incoming, ListRow, Outbound, ParleyEvent, PlaygroundSink, TestPerson, TranscriptEntry } from "../../src/index.ts";
+import { fitMessage, type Attachment, type ChannelInfo, type ChannelSummary, type Deliver, type EventSink, type Incoming, type ListRow, type Outbound, type ChinwagEvent, type PlaygroundSink, type TestPerson, type TranscriptEntry } from "../../src/index.ts";
 import { PLATFORMS, channelOf, platform as platformOf, smsSegments, type Platform } from "./platforms.ts";
 
 /** What the test cloud's simulators need from an agent. */
@@ -45,7 +49,7 @@ export interface AgentConnection {
   status(): { busy: boolean; idleForMs: number; backgroundTasks: number; conversations: number };
 }
 
-/** What the playground needs from an agent. Parley's Agent is one as it is. */
+/** What the playground needs from an agent. Chinwag's Agent is one as it is. */
 export interface PlaygroundAgent {
   testPeople(): TestPerson[];
   channels(): ChannelSummary[];
@@ -97,7 +101,7 @@ export interface TestCloudSimulators {
 }
 
 export type Line =
-  | { kind: "in"; id: string | null; text: string; at: number; replyTo?: string; choice?: boolean }
+  | { kind: "in"; id: string | null; text: string; at: number; replyTo?: string; choice?: boolean; attachments?: Array<{ kind: Attachment["kind"]; name?: string }> }
   | {
       kind: "out";
       id: string;
@@ -106,6 +110,10 @@ export type Line =
       replyTo?: string;
       buttons?: string[];
       list?: { button: string; rows: ListRow[] };
+      /** A button under the message that opens this page. */
+      link?: { label: string; url: string };
+      /** A photo above the text, which is its caption. */
+      image?: { url: string };
       /** The channel's own params the agent filled in (an app_link): shown under the message. */
       fields?: Record<string, unknown>;
       sms?: { segments: number; encoding: string };
@@ -141,10 +149,28 @@ const CARRIER = {
 };
 
 const MAX_BODY = 16_384;
+/** A message may carry files (base64): up to 4, about 11 MB in all, above the largest the agent reads (10 MB). */
+const MAX_MESSAGE_BODY = 15_000_000;
+const MAX_FILES = 4;
 /** Wrong tokens one address may try in a window before it is refused for the rest of it. */
 const MAX_FAILURES = 10;
 const FAILURE_WINDOW_MS = 15 * 60_000;
-const COOKIE = "parley_playground";
+const COOKIE = "chinwag_playground";
+/** The events kept per conversation for pollers, and how long one stays kept after nobody asked for it. */
+const RECENT_EVENTS = 500;
+const RECENT_IDLE_MS = 5 * 60_000;
+/** How long a poll waits for the next event before it answers with none. */
+const POLL_WAIT_MS = 20_000;
+
+/** An event as the page gets it: numbered, so a page knows what it has seen. */
+type Numbered = Record<string, unknown> & { seq: number };
+interface Recent {
+  events: Numbered[];
+  /** Events up to this number are not kept: a page that saw only those has missed some. */
+  floor: number;
+  waiters: Set<() => void>;
+  touched: number;
+}
 
 interface Thread {
   lines: Line[];
@@ -175,9 +201,35 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
     return t;
   };
 
-  function push(k: string, payload: unknown): void {
-    const data = `data: ${JSON.stringify(payload)}\n\n`;
+  /** The number of the last event pushed, on any conversation. */
+  let seq = 0;
+  /** The last events of each conversation a page opened, for pages that poll. */
+  const recent = new Map<string, Recent>();
+
+  /** The kept events of one conversation, kept from now on if they were not; drops ones nobody asked for lately. */
+  function recentOf(k: string): Recent {
+    const now = Date.now();
+    for (const [key, r] of recent) if (!r.waiters.size && !clients.get(key)?.size && now - r.touched > RECENT_IDLE_MS) recent.delete(key);
+    let r = recent.get(k);
+    if (!r) recent.set(k, (r = { events: [], floor: seq, waiters: new Set(), touched: now }));
+    r.touched = now;
+    return r;
+  }
+
+  /** The events after `after`, or a reset when some of them are no longer kept (the page loads the transcript again). */
+  function since(r: Recent, after: number): Array<Record<string, unknown>> {
+    return Number.isInteger(after) && after >= r.floor ? r.events.filter((e) => e.seq > after) : [{ type: "reset" }];
+  }
+
+  function push(k: string, payload: object): void {
+    const event: Numbered = { ...payload, seq: ++seq };
+    const data = `data: ${JSON.stringify(event)}\n\n`;
     for (const client of clients.get(k) ?? []) client.write(data);
+    const r = recent.get(k);
+    if (!r) return;
+    r.events.push(event);
+    if (r.events.length > RECENT_EVENTS) r.floor = r.events.splice(0, r.events.length - RECENT_EVENTS).at(-1)!.seq;
+    for (const wake of [...r.waiters]) wake();
   }
 
   /** Record a line and show it to the open simulators. */
@@ -195,7 +247,7 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
   /** Tool calls in progress, by call id, so later events update the same line. */
   const toolLines = new Map<string, Extract<Line, { kind: "tool" }>>();
 
-  function show(k: string, event: ParleyEvent): void {
+  function show(k: string, event: ChinwagEvent): void {
     if (event.type === "tool.start" && typeof event.callId === "string") {
       const line: Extract<Line, { kind: "tool" }> = { kind: "tool", callId: event.callId, tool: String(event.tool), input: event.input, at: event.at, status: "running" };
       toolLines.set(`${k}:${event.callId}`, line);
@@ -234,6 +286,8 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
           ...(outbound.replyTo ? { replyTo: outbound.replyTo } : {}),
           ...(outbound.buttons ? { buttons: outbound.buttons } : {}),
           ...(outbound.list ? { list: outbound.list } : {}),
+          ...(outbound.link ? { link: outbound.link } : {}),
+          ...(outbound.image ? { image: outbound.image } : {}),
           ...(outbound.fields ? { fields: outbound.fields } : {}),
           ...(sms ? { sms: { segments: sms.segments, encoding: sms.encoding } } : {}),
         });
@@ -293,13 +347,16 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
 
   const guarded = (work: (req: IncomingMessage, res: ServerResponse) => Promise<void>): Handler => (req, res) =>
     work(req, res).catch((error) => {
-      console.warn("parley simulators:", error);
+      console.warn("chinwag simulators:", error);
       if (!res.headersSent) res.writeHead(500).end();
     });
 
-  function events(req: IncomingMessage, res: ServerResponse, k: string): void {
+  function events(req: IncomingMessage, res: ServerResponse, k: string, url: URL): void {
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
     res.write(`data: ${JSON.stringify({ type: "hello", boot: boot() })}\n\n`);
+    // What happened since the page read the transcript, so nothing between the two is lost.
+    const after = url.searchParams.get("after");
+    if (after !== null) for (const e of since(recentOf(k), Number(after))) res.write(`data: ${JSON.stringify(e)}\n\n`);
     const set = clients.get(k) ?? new Set();
     set.add(res);
     clients.set(k, set);
@@ -307,20 +364,48 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
     req.on("close", () => {
       clearInterval(keepAlive);
       set.delete(res);
+      // Kept a while longer, so a stream that reconnects goes on from where it was.
+      const r = recent.get(k);
+      if (r) r.touched = Date.now();
     });
   }
 
-  /** The person's message as the agent gets it: the text, a quoted message, a tapped button. */
+  /** The same events for a page the stream does not reach: at once if there are any after `after`, else the next. */
+  async function poll(res: ServerResponse, k: string, url: URL): Promise<void> {
+    const r = recentOf(k);
+    const after = Number(url.searchParams.get("after"));
+    if (!since(r, after).length) {
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          r.waiters.delete(done);
+          res.off("close", done);
+          resolve();
+        };
+        const timer = setTimeout(done, POLL_WAIT_MS);
+        r.waiters.add(done);
+        res.on("close", done);
+      });
+      if (res.destroyed) return;
+    }
+    r.touched = Date.now();
+    json(res, 200, { boot: boot(), seq, events: since(r, after) });
+  }
+
+  /** The person's message as the agent gets it: the text, a quoted message, a tapped button, files. */
   function incomingOf(k: string, body: Record<string, unknown> | null, text: string, replies: boolean): { incoming: Incoming; line: Extract<Line, { kind: "in" }> } {
     const replyId = replies && typeof body?.replyTo === "string" ? body.replyTo : undefined;
     const quoted = replyId ? findLine(k, replyId) : undefined;
     const choice = body?.choice && typeof body.choice === "object" ? (body.choice as { id?: string; title?: string }) : undefined;
+    const attachments = attachmentsOf(body);
     const incoming: Incoming = {
       text,
       ...(quoted && (quoted.kind === "in" || quoted.kind === "out") ? { replyTo: { text: quoted.text, fromAgent: quoted.kind === "out" } } : {}),
       ...(choice?.title ? { choice: { id: choice.id, title: String(choice.title) } } : {}),
+      ...(attachments.length ? { attachments } : {}),
     };
-    const line: Extract<Line, { kind: "in" }> = { kind: "in", id: null, text, at: Date.now(), ...(quoted ? { replyTo: replyId } : {}), ...(choice?.title ? { choice: true } : {}) };
+    const files = attachments.map((a) => ({ kind: a.kind, ...(a.name ? { name: a.name } : {}) }));
+    const line: Extract<Line, { kind: "in" }> = { kind: "in", id: null, text, at: Date.now(), ...(quoted ? { replyTo: replyId } : {}), ...(choice?.title ? { choice: true } : {}), ...(files.length ? { attachments: files } : {}) };
     return { incoming, line };
   }
 
@@ -351,7 +436,8 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
       if (req.method === "GET" && path === "/api/status") return json(res, 200, agent.status());
       if (req.method === "GET" && path === "/api/transcript") {
         const t = thread(qk);
-        return json(res, 200, { platform: qp.id, person: qperson, optedOut: t.optedOut, lines: t.lines });
+        recentOf(qk);
+        return json(res, 200, { platform: qp.id, person: qperson, optedOut: t.optedOut, lines: t.lines, seq });
       }
       if (req.method === "POST" && path === "/api/reset") {
         generations.set(qk, (generations.get(qk) ?? 0) + 1);
@@ -359,9 +445,10 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
         push(qk, { type: "reset" });
         return json(res, 200, { ok: true });
       }
-      if (req.method === "GET" && path === "/api/events") return events(req, res, qk);
+      if (req.method === "GET" && path === "/api/events") return events(req, res, qk, url);
+      if (req.method === "GET" && path === "/api/poll") return poll(res, qk, url);
 
-      const body = req.method === "POST" ? await readBody(req) : null;
+      const body = req.method === "POST" ? await readBody(req, path === "/api/messages" ? MAX_MESSAGE_BODY : MAX_BODY) : null;
       const p = typeof body?.platform === "string" ? platformOf(body.platform) : qp;
       const person = typeof body?.person === "string" && body.person ? body.person.slice(0, 128) : qperson;
       const k = key(p.id, person);
@@ -380,7 +467,7 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
 
       if (req.method === "POST" && path === "/api/messages") {
         const text = typeof body?.text === "string" ? body.text.trim().slice(0, 4_000) : "";
-        if (!text) return json(res, 400, { error: "text is required" });
+        if (!text && !attachmentsOf(body).length) return json(res, 400, { error: "text or a file is required" });
         const { incoming, line } = incomingOf(k, body, text, Boolean(p.replies));
         emitLine(k, line);
         carrier(p, k, text);
@@ -443,8 +530,9 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
       if (e.kind === "in") lines.push({ kind: "in", id: e.id, text: e.text, at: e.at, ...(e.choice ? { choice: true } : {}) });
       else if (e.kind === "reaction") lines.push({ kind: "reaction", messageId: e.messageId, emoji: e.emoji, at: e.at, by: "agent" });
       else {
-        const sms = p.segments ? smsSegments(e.text) : undefined;
-        const { kind: _kind, channel: _channel, ...rest } = e;
+        // The agent's message as this platform showed it (a link's URL in the text where it has no link button).
+        const { kind: _kind, channel: _channel, ...rest } = fitMessage(channel.info, e);
+        const sms = p.segments ? smsSegments(rest.text) : undefined;
         lines.push({ kind: "out", id: `a${++count}`, ...rest, ...(sms ? { sms: { segments: sms.segments, encoding: sms.encoding } } : {}) });
       }
     }
@@ -468,7 +556,7 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
       return json(res, 200, { platforms: PLATFORMS, channels, people: agent.testPeople(), cards: options.cards ?? [] });
     }
 
-    const body = req.method === "POST" ? await readBody(req) : null;
+    const body = req.method === "POST" ? await readBody(req, path === "/api/messages" ? MAX_MESSAGE_BODY : MAX_BODY) : null;
     const asked = (name: string) => (typeof body?.[name] === "string" ? (body[name] as string) : (url.searchParams.get(name) ?? ""));
     const person = agent.testPeople().find((p) => digits(p.phone) === digits(asked("person")) && digits(p.phone) !== "");
     if (!person) return json(res, 403, { error: "only this agent's test people can be played: declare them in createAgent({ testPeople })" });
@@ -494,9 +582,12 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
 
     if (req.method === "GET" && path === "/api/transcript") {
       const t = await load(agent, person, channel);
-      return json(res, 200, { channel: channel.name, person, optedOut: t.optedOut, lines: t.lines });
+      // Taken with the lines, in the same step: every event after this number came after these lines.
+      recentOf(k);
+      return json(res, 200, { channel: channel.name, person, optedOut: t.optedOut, lines: t.lines, seq });
     }
-    if (req.method === "GET" && path === "/api/events") return events(req, res, k);
+    if (req.method === "GET" && path === "/api/events") return events(req, res, k, url);
+    if (req.method === "GET" && path === "/api/poll") return poll(res, k, url);
 
     if (req.method === "POST" && path === "/api/reactions") {
       const messageId = typeof body?.messageId === "string" ? body.messageId : "";
@@ -513,9 +604,9 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean } 
 
     if (req.method === "POST" && path === "/api/messages") {
       const text = typeof body?.text === "string" ? body.text.trim().slice(0, 4_000) : "";
-      if (!text) return json(res, 400, { error: "text is required" });
+      if (!text && !attachmentsOf(body).length) return json(res, 400, { error: "text or a file is required" });
       const { incoming, line } = incomingOf(k, body, text, Boolean(p.replies));
-      console.info(JSON.stringify({ parley: "playground.message", person: person.name, phone: person.phone, channel: channel.name, at: new Date(line.at).toISOString(), ip: req.socket.remoteAddress ?? null }));
+      console.info(JSON.stringify({ chinwag: "playground.message", person: person.name, phone: person.phone, channel: channel.name, at: new Date(line.at).toISOString(), ip: req.socket.remoteAddress ?? null }));
       emitLine(k, line);
       carrier(p, k, text);
       const taken = await agent.simulate({ person: person.phone, channel: channel.name, message: incoming });
@@ -555,11 +646,11 @@ interface Gate {
  * `Authorization: Bearer`. Compared in constant time; wrong tokens are limited per address.
  */
 function tokenGate(token: string | undefined): Gate {
-  if (typeof token !== "string" || token.length < 32) throw new Error("parley simulators: a deployed playground needs a token of at least 32 characters");
+  if (typeof token !== "string" || token.length < 32) throw new Error("chinwag simulators: a deployed playground needs a token of at least 32 characters");
   const hash = (text: string) => createHash("sha256").update(text).digest();
   const same = (given: string, wanted: string) => timingSafeEqual(hash(given), hash(wanted));
   // The cookie holds a value made from the token, not the token itself.
-  const session = hash(`parley-playground:${token}`).toString("hex");
+  const session = hash(`chinwag-playground:${token}`).toString("hex");
   const failures = new Map<string, { count: number; until: number }>();
 
   return {
@@ -624,12 +715,22 @@ function ownChannel(agent: AgentConnection, p: Platform, conversationId: string)
   return agent.channels?.(conversationId).find((c) => c.kind === kind);
 }
 
-async function readBody(req: IncomingMessage): Promise<Record<string, unknown> | null> {
+/** The files of a message, from the page: { kind, mime, name?, data (base64) }. */
+function attachmentsOf(body: Record<string, unknown> | null): Attachment[] {
+  if (!Array.isArray(body?.attachments)) return [];
+  return body.attachments.slice(0, MAX_FILES).flatMap((a): Attachment[] => {
+    if (!a || typeof a !== "object" || typeof a.mime !== "string" || typeof a.data !== "string" || !["image", "audio", "document"].includes(a.kind)) return [];
+    const bytes = new Uint8Array(Buffer.from(a.data, "base64"));
+    return [{ kind: a.kind, mime: a.mime.slice(0, 100), ...(typeof a.name === "string" && a.name ? { name: a.name.slice(0, 200) } : {}), data: async () => bytes }];
+  });
+}
+
+async function readBody(req: IncomingMessage, limit = MAX_BODY): Promise<Record<string, unknown> | null> {
   let size = 0;
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > MAX_BODY) return null;
+    if (size > limit) return null;
     chunks.push(chunk as Buffer);
   }
   try {

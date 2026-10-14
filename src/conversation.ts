@@ -29,18 +29,25 @@
 // - Everything is kept in the store as it happens: the history, the inbox of events not yet
 //   handled, background tools in flight. After a restart the conversation carries on.
 // - Scheduled messages and nudges arrive through the inbox and wait for the turn in progress.
+// - Files the person sends: photos and PDFs go to the model when it reads them, a voice note as its
+//   transcript; anything it cannot read is named with why, so it can ask for text. Only the latest
+//   few are shown, and their bytes are never stored: after a restart they are named, not shown.
 
+import { Buffer } from "node:buffer";
 import type { z } from "zod";
+import { fitMessage } from "./channels.ts";
 import type { Emit } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
 import type { ConversationRow, InboxRow, StoreApi } from "./store.ts";
-import { REACT, UPDATE, reactInput, sendInput, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
+import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
 import { render, toSpec, type Tool } from "./tools.ts";
-import type { ChannelInfo, ChatMessage, Deliver, Incoming, Model, Outbound, ToolCall, ToolSpec } from "./types.ts";
+import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
   model: Model;
+  /** Speech to text for voice notes; without it the agent is told it can't listen to them. */
+  transcribe?: Transcribe;
   tools: Map<string, Tool>;
   specs: ToolSpec[];
   instructions: string;
@@ -84,9 +91,25 @@ export interface ChannelLink {
 }
 
 const ACKNOWLEDGE_FIRST =
-  "[Parley] They have not heard from you yet. In one response, acknowledge them " +
+  "[Chinwag] They have not heard from you yet. In one response, acknowledge them " +
   "(react to their message or send a short line) and make your tool calls again.";
-const INTERRUPTED = "[Parley] Cut off by a restart: this may or may not have happened. Check before you rely on it.";
+const INTERRUPTED = "[Chinwag] Cut off by a restart: this may or may not have happened. Check before you rely on it.";
+const NOT_SHOWN = "[Chinwag] You are no longer shown the photos or documents in these messages; ask them to send one again if you need it.";
+
+/** Photos and PDFs the model is shown at once, the latest; each is resent on every model call. */
+const MEDIA_SHOWN = 3;
+/** The largest photo, and the largest PDF or voice note, the agent reads (most models take 5 MB images). */
+const IMAGE_MAX_MB = 5;
+const FILE_MAX_MB = 10;
+/** The image types the main model APIs take. */
+const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
+/** What a message's files became: marks after its id, the media the model is shown, a voice note's text. */
+interface Files {
+  marks: string[];
+  media: Media[];
+  transcript?: string;
+}
 
 /** A tool call the reply is waiting on. */
 interface Running {
@@ -121,6 +144,7 @@ interface Pending {
   id: string;
   text: string;
   channel: string;
+  media?: Media[];
   inbox?: number;
 }
 
@@ -163,6 +187,8 @@ export class Conversation {
   private recentChannels: string[] = [];
   private timeZone: string | null = null;
   private running = false;
+  /** Messages whose files are still being read (downloaded, transcribed); later ones wait behind them. */
+  private preparing: Promise<void> | null = null;
   private stepAbort: AbortController | null = null;
   /** Ends the reply's wait for its tools now (the person wrote). */
   private wakeTools: (() => void) | null = null;
@@ -216,7 +242,7 @@ export class Conversation {
     this.builtins = new Map(builtins.map((t) => [t.name, t]));
     this.builtinSpecs = builtins.map(toSpec);
     this.loaded = settings.ready.then(() => (existing ? this.load() : settings.store.createConversation(id, personKey)));
-    this.writes = this.loaded.catch((error) => console.warn(`parley: conversation ${id} did not load:`, error));
+    this.writes = this.loaded.catch((error) => console.warn(`chinwag: conversation ${id} did not load:`, error));
   }
 
   /** What a channel of this conversation can show, if the person has written on it. */
@@ -241,21 +267,45 @@ export class Conversation {
     const incoming: Incoming = typeof input === "string" ? { text: input } : input;
     const channel = options.channel;
     const id = options.messageId ?? `m${++this.messageCount}`;
-    const at = this.settings.now();
     this.messageIds.set(id, channel);
-    const item: Pending = { id, text: describe(incoming), channel };
+    void this.typing(true, channel);
+    if (!incoming.attachments?.length && !this.preparing) {
+      this.arrive(incoming, id, channel, options.messageId !== undefined, { marks: [], media: [] });
+      return id;
+    }
+    // Its files are read first (a voice note transcribed), and messages after it wait their turn.
+    const ready = (this.preparing ?? Promise.resolve())
+      .then(async () => {
+        const files = await this.readFiles(incoming.attachments ?? []);
+        if (!this.closed) this.arrive(incoming, id, channel, options.messageId !== undefined, files);
+      })
+      .catch((error) => console.warn(`chinwag: a message in conversation ${this.id} could not be read:`, error));
+    this.preparing = ready;
+    void ready.finally(() => {
+      if (this.preparing !== ready) return;
+      this.preparing = null;
+      this.checkIdle();
+    });
+    return id;
+  }
+
+  /** The message is ready for the agent: it joins the reply in progress, or starts one. */
+  private arrive(incoming: Incoming, id: string, channel: string, ownId: boolean, files: Files): void {
+    const at = this.settings.now();
+    const item: Pending = { id, text: describe(incoming, files), channel, ...(files.media.length ? { media: files.media } : {}) };
     this.pending.push(item);
     this.recentChannels = [...this.recentChannels, channel].slice(-5);
     const link = this.channels.get(channel);
     if (link) link.lastMessageAt = at;
     const fields = { messageCount: this.messageCount, recentChannels: this.recentChannels };
     this.persist(async () => {
-      item.inbox = await this.settings.store.addInbox(this.id, "message", { id, text: item.text, channel });
+      item.inbox = await this.settings.store.addInbox(this.id, "message", { id, text: item.text, channel, ...(item.media ? { media: item.media.map(stored) } : {}) });
       this.knownInbox.add(item.inbox);
       await this.settings.store.updateConversation(this.id, fields);
       if (link) await this.settings.store.touchIdentity(channel, link.address, at);
     });
-    this.settings.emit(this.id, "message.in", { text: incoming.text, messageId: id, channel, replyTo: incoming.replyTo, choice: incoming.choice });
+    const attachments = incoming.attachments?.map((a) => ({ kind: a.kind, mime: a.mime, ...(a.name ? { name: a.name } : {}) }));
+    this.settings.emit(this.id, "message.in", { text: incoming.text, messageId: id, ownId, channel, replyTo: incoming.replyTo, choice: incoming.choice, ...(attachments ? { attachments } : {}), ...(files.transcript !== undefined ? { transcript: files.transcript } : {}) });
     this.unanswered.add(channel);
     this.firstResponse = true;
     void this.typing(true, channel);
@@ -264,10 +314,57 @@ export class Conversation {
       // tools being waited on move to the background so the agent reads it now.
       this.stepAbort?.abort();
       this.wakeTools?.();
-      return id;
+      return;
     }
     this.schedule(this.settings.debounceMs);
-    return id;
+  }
+
+  /**
+   * What the agent gets of the person's files: photos and PDFs the model reads, a voice note as its
+   * transcript, and for anything else a mark saying why it cannot be read, so it can ask for text.
+   */
+  private async readFiles(attachments: Attachment[]): Promise<Files> {
+    const files: Files = { marks: [], media: [] };
+    const reads = this.settings.model.reads ?? {};
+    for (const a of attachments) {
+      const name = a.name ? ` "${a.name.replace(/["\n]/g, "")}"` : "";
+      const what = a.kind === "image" ? "photo" : a.kind === "audio" ? "voice note" : `document${name}`;
+      const cannot =
+        a.kind === "image" ? (!reads.images ? "you can't see photos" : !IMAGE_TYPES.has(a.mime) ? "you can't see this type of image" : null)
+        : a.kind === "document" ? (a.mime !== "application/pdf" ? "you can only open PDFs" : !reads.pdfs ? "you can't open documents" : null)
+        : !this.settings.transcribe ? "you can't listen to voice notes" : null;
+      if (cannot) {
+        files.marks.push(`[${what}: ${cannot}]`);
+        continue;
+      }
+      const max = a.kind === "image" ? IMAGE_MAX_MB : FILE_MAX_MB;
+      let bytes: Uint8Array;
+      try {
+        bytes = await a.data();
+      } catch (error) {
+        this.settings.emit(this.id, "attachment.failed", { kind: a.kind, error: String(error) });
+        files.marks.push(`[${what}: it could not be downloaded]`);
+        continue;
+      }
+      if (bytes.length > max * 1_048_576) {
+        files.marks.push(`[${what}: too large for you to read, over ${max} MB]`);
+        continue;
+      }
+      if (a.kind !== "audio") {
+        files.media.push({ kind: a.kind, mime: a.mime, ...(a.name ? { name: a.name } : {}), data: Buffer.from(bytes).toString("base64") });
+        files.marks.push(`[${what}]`);
+        continue;
+      }
+      try {
+        const text = (await this.settings.transcribe!({ mime: a.mime, data: bytes })).trim();
+        files.transcript = [files.transcript, text].filter(Boolean).join("\n");
+        files.marks.push("[voice note, transcribed]");
+      } catch (error) {
+        this.settings.emit(this.id, "attachment.failed", { kind: a.kind, error: String(error) });
+        files.marks.push(`[${what}: it could not be transcribed]`);
+      }
+    }
+    return files;
   }
 
   /** An event from the inbox (a scheduled run, a nudge) for this conversation. */
@@ -276,7 +373,8 @@ export class Conversation {
     this.knownInbox.add(row.id);
     const p = row.payload as Record<string, any>;
     if (row.kind === "message") {
-      this.pending.push({ id: p.id, text: p.text, channel: p.channel, inbox: row.id });
+      // Its photos and PDFs are named, not shown: their bytes were never stored.
+      this.pending.push({ id: p.id, text: p.text, channel: p.channel, inbox: row.id, ...(Array.isArray(p.media) ? { media: p.media } : {}) });
       this.messageIds.set(p.id, p.channel);
       this.unanswered.add(p.channel);
       this.firstResponse = true;
@@ -311,7 +409,7 @@ export class Conversation {
   }
 
   get busy(): boolean {
-    return this.running || this.timer !== null || this.tasks.size > 0;
+    return this.running || this.timer !== null || this.tasks.size > 0 || this.preparing !== null;
   }
 
   get idleForMs(): number {
@@ -353,7 +451,7 @@ export class Conversation {
     if (this.closed) return this.writes;
     const next = this.writes.then(work).then(
       () => undefined,
-      (error) => console.warn(`parley: could not save conversation ${this.id}:`, error),
+      (error) => console.warn(`chinwag: could not save conversation ${this.id}:`, error),
     );
     this.writes = next;
     return next;
@@ -378,7 +476,7 @@ export class Conversation {
       for (const c of lastCalls.toolCalls ?? []) if (!answered.has(c.id)) this.history.push({ role: "tool", toolCallId: c.id, content: INTERRUPTED });
     }
     for (const task of await store.tasks(this.id)) {
-      this.note(`[Parley] ${task.tool} (${task.taskId}) was still running in the background when the agent restarted. It may or may not have finished; check before telling them it is done.`);
+      this.note(`[Chinwag] ${task.tool} (${task.taskId}) was still running in the background when the agent restarted. It may or may not have finished; check before telling them it is done.`);
       this.persist(() => store.removeTask(this.id, task.taskId));
     }
     for (const row of await store.openInbox(this.id)) this.enqueue(row);
@@ -467,7 +565,9 @@ export class Conversation {
     const messages = this.pending.splice(0);
     if (messages.length) {
       const tag = this.settings.tagChannels || this.channels.size > 1;
-      this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n") });
+      const media = messages.flatMap((m) => m.media ?? []);
+      this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n"), ...(media.length ? { media } : {}) });
+      if (media.length) this.showLatestMedia();
       items.push(...messages);
       for (const channel of new Set(messages.map((m) => m.channel))) {
         if (this.channels.get(channel)?.info.readReceipts) void this.send(channel, { type: "read", messageIds: messages.filter((m) => m.channel === channel).map((m) => m.id) });
@@ -480,10 +580,23 @@ export class Conversation {
   /** Stores history entries not yet stored, and marks the inbox rows they came from handled. */
   private flush(items: Array<{ inbox?: number }> = []): void {
     const seq = this.saved;
-    const entries = this.history.slice(seq);
+    const entries = this.history.slice(seq).map((e) => (e.role === "user" && e.media ? { ...e, media: e.media.map(stored) } : e));
     this.saved = this.history.length;
     if (!entries.length && !items.length) return;
     this.persist(() => this.settings.store.appendHistory(this.id, seq, entries, items.flatMap((i) => (i.inbox === undefined ? [] : [i.inbox]))));
+  }
+
+  /** Only the latest MEDIA_SHOWN photos and PDFs keep their bytes; older ones are named, not shown. */
+  private showLatestMedia(): void {
+    let shown = 0;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const entry = this.history[i];
+      if (entry.role !== "user" || !entry.media) continue;
+      for (let k = entry.media.length - 1; k >= 0; k--) {
+        if (!entry.media[k].data) continue;
+        if (++shown > MEDIA_SHOWN) entry.media[k] = stored(entry.media[k]);
+      }
+    }
   }
 
   private async turn(): Promise<void> {
@@ -523,7 +636,7 @@ export class Conversation {
       const callStarted = Date.now();
       let response;
       try {
-        response = await this.settings.model.complete({ system, messages: [...this.history], tools: specs, signal: abort.signal });
+        response = await this.settings.model.complete({ system, messages: this.history.map(forModel), tools: specs, signal: abort.signal });
       } catch (error) {
         if (!abort.signal.aborted) throw error;
       } finally {
@@ -557,7 +670,7 @@ export class Conversation {
         this.history.push({
           role: "user",
           content: several
-            ? `[Parley] They have not heard from you on ${waiting.join(" or ")} yet. In one response, acknowledge them there (react to their message or send a short line) and make your tool calls again.`
+            ? `[Chinwag] They have not heard from you on ${waiting.join(" or ")} yet. In one response, acknowledge them there (react to their message or send a short line) and make your tool calls again.`
             : ACKNOWLEDGE_FIRST,
         });
         this.flush();
@@ -572,8 +685,8 @@ export class Conversation {
           this.history.push({
             role: "user",
             content: several
-              ? `[Parley] INTERNAL MESSAGE, not from them: ${response.text ? "your text above never reached them" : "they have not heard from you"} on ${owes.join(" or ")}. Reply with ${owes.map((c) => sendToolName(c)).join(" or ")}, without mentioning this note${response.text ? ", that text" : ""} or any delay.`
-              : `[Parley] INTERNAL MESSAGE, not from them: ${response.text ? "your text above never reached them" : "they have not heard from you"}. Reply with ${sendToolName(owes[0])}, without mentioning this note${response.text ? ", that text" : ""} or any delay.`,
+              ? `[Chinwag] INTERNAL MESSAGE, not from them: ${response.text ? "your text above never reached them" : "they have not heard from you"} on ${owes.join(" or ")}. Reply with ${owes.map((c) => sendToolName(c)).join(" or ")}, without mentioning this note${response.text ? ", that text" : ""} or any delay.`
+              : `[Chinwag] INTERNAL MESSAGE, not from them: ${response.text ? "your text above never reached them" : "they have not heard from you"}. Reply with ${sendToolName(owes[0])}, without mentioning this note${response.text ? ", that text" : ""} or any delay.`,
           });
           this.flush();
           continue;
@@ -585,7 +698,7 @@ export class Conversation {
         if ((this.resultUnsent === "background" || owedResult) && !this.tasks.size && !reminded) {
           // A result came back and the agent said nothing to them: it may have written the answer as plain text.
           reminded = true;
-          this.history.push({ role: "user", content: `[Parley] INTERNAL MESSAGE, not from them: they have not heard from you since the result above, and text outside ${this.sendToolsNow()} never reaches them. If the result is for them, tell them with ${this.sendToolsNow()}, without mentioning this note, any earlier text or any delay.` });
+          this.history.push({ role: "user", content: `[Chinwag] INTERNAL MESSAGE, not from them: they have not heard from you since the result above, and text outside ${this.sendToolsNow()} never reaches them. If the result is for them, tell them with ${this.sendToolsNow()}, without mentioning this note, any earlier text or any delay.` });
           this.flush();
           continue;
         }
@@ -613,7 +726,7 @@ export class Conversation {
       this.flush();
       // Only messages: the turn is over unless one was refused or something new came in meanwhile, or
       // this replies to their message without having used any tool: it gets one more step, in case it
-      // meant to act next (it said "getting your order status" and has not asked for it yet). A tool
+      // meant to act next (it said "getting your order" and has not asked for it yet). A tool
       // used, or still running in the background, means it already acted.
       if (!work.length && !problems && !this.absorb()) {
         if (!theirs || followedUp || acted || this.tasks.size) break;
@@ -677,20 +790,33 @@ export class Conversation {
         return refused(`Not sent: they have not written on ${channel} in their last 5 messages${last}. If you are sure, call ${call.name} again with confirm: true.`);
       }
       if (input.reply_to && this.messageIds.get(input.reply_to) !== channel) return refused(`Not sent: there is no message ${input.reply_to} on ${channel} to reply to.`);
-      const outbound: Outbound = {
-        type: "message",
+      const refusal = sendRefusal(link.info, input);
+      if (refusal) return refused(refusal);
+      const outbound = fitMessage(link.info, {
+        type: "message" as const,
         text: input.text,
         ...(input.reply_to ? { replyTo: input.reply_to } : {}),
         ...(input.buttons?.length ? { buttons: input.buttons } : {}),
         ...(input.list ? { list: input.list } : {}),
+        ...(input.link ? { link: input.link } : {}),
+        ...(input.image ? { image: input.image } : {}),
         ...(hasFields ? { fields } : {}),
-      };
+      });
       const failure = await this.send(channel, outbound);
       if (failure) {
         this.undelivered(input.text, failure);
         return done();
       }
-      this.settings.emit(this.id, "message.out", { text: input.text, channel, buttons: input.buttons, list: input.list, replyTo: input.reply_to, ...(hasFields ? { fields } : {}) });
+      this.settings.emit(this.id, "message.out", {
+        text: outbound.text,
+        channel,
+        buttons: input.buttons,
+        list: input.list,
+        link: outbound.link,
+        image: outbound.image,
+        replyTo: input.reply_to,
+        ...(hasFields ? { fields } : {}),
+      });
       this.sent();
       this.sentThisTurn.add(input.text.trim());
       await this.acknowledged(channel);
@@ -776,10 +902,10 @@ export class Conversation {
     const failure = await this.send(d.channel, outbound);
     if (failure) return settle("failed", failure);
     if (d.template) {
-      this.history.push({ role: "user", content: `[Parley] The business sent them its template "${d.template.name}" on ${d.channel}.` });
+      this.history.push({ role: "user", content: `[Chinwag] The business sent them its template "${d.template.name}" on ${d.channel}.` });
     } else {
       const callId = `direct_${d.inbox ?? Date.now()}`;
-      this.history.push({ role: "user", content: `[Parley] The business sent them this message through you on ${d.channel}, as written:` });
+      this.history.push({ role: "user", content: `[Chinwag] The business sent them this message through you on ${d.channel}, as written:` });
       this.history.push({ role: "assistant", content: null, toolCalls: [{ id: callId, name: sendToolName(d.channel), arguments: JSON.stringify({ text: d.text }) }] });
       this.history.push({ role: "tool", toolCallId: callId, content: JSON.stringify({ delivered: true, channel: d.channel }) });
     }
@@ -787,7 +913,7 @@ export class Conversation {
     settle("sent");
   }
 
-  /** The send tools the agent has right now, for Parley's notes: "send_sms", or "send_sms or send_app". */
+  /** The send tools the agent has right now, for Chinwag's notes: "send_sms", or "send_sms or send_app". */
   private sendToolsNow(): string {
     return [...this.channels.keys()].map((c) => sendToolName(c)).join(" or ");
   }
@@ -863,7 +989,7 @@ export class Conversation {
     const running = [...this.tasks.values()].find((t) => t.tool === call.name && t.input === input);
     if (running) {
       this.settings.emit(this.id, "tool.repeated", { callId: call.id, tool: call.name, task: running.id });
-      return `[Parley] Not run: ${call.name} with this input is already running in the background (${running.id}). Its result will come to you here; don't call it again.`;
+      return `[Chinwag] Not run: ${call.name} with this input is already running in the background (${running.id}). Its result will come to you here; don't call it again.`;
     }
 
     this.settings.emit(this.id, "tool.start", { callId: call.id, tool: call.name, input: parsed.data });
@@ -895,11 +1021,11 @@ export class Conversation {
       this.tasks.delete(task.id);
       this.persist(() => this.settings.store.removeTask(this.id, task.id));
       this.settings.emit(this.id, "task.done", { callId: call.id, tool: call.name, task: task.id, ms: Date.now() - startedAt, ok: result.ok, output: clipOutput(result.text) });
-      this.note(`[Background result: ${call.name} (${task.id})] ${result.text}\n[Parley] They have not seen this result: tell them with ${this.sendToolsNow()}.`);
+      this.note(`[Background result: ${call.name} (${task.id})] ${result.text}\n[Chinwag] They have not seen this result: tell them with ${this.sendToolsNow()}.`);
       this.checkIdle();
     });
     return (
-      `[Parley] ${call.name} started and is still running in the background (${task.id}). Do not call ${call.name} again: ` +
+      `[Chinwag] ${call.name} started and is still running in the background (${task.id}). Do not call ${call.name} again: ` +
       `its result will come to you here when it finishes. Until then don't tell them it is done; when it arrives, tell them with ${this.sendToolsNow()}.` +
       (why === "partial" ? " The other results are in: tell them this now only if it answers what they asked; the rest is coming." : "")
     );
@@ -924,18 +1050,21 @@ export type TranscriptEntry =
       replyTo?: string;
       buttons?: string[];
       list?: { button: string; rows: Array<{ id: string; title: string; description?: string }> };
+      /** As the agent sent them: fitMessage shows them as a channel can. */
+      link?: { label: string; url: string };
+      image?: { url: string };
       /** The channel's own params the agent filled in. */
       fields?: Record<string, unknown>;
     }
   | { kind: "reaction"; channel: string; messageId: string; emoji: string; at: number }
   | { kind: "tool"; callId: string; tool: string; input: unknown; output: string; ok: boolean; at: number };
 
-const SEND_KEYS = new Set(["text", "reply_to", "buttons", "list", "confirm"]);
+const SEND_KEYS = new Set(["text", "reply_to", "buttons", "list", "link", "image", "confirm"]);
 
 /**
  * The history as the person saw it: their messages (with the ids describe() wrote), what the agent
  * delivered with its send tools and reactions, and its other tool calls with their results.
- * Parley's notes and the agent's plain text never reached the person and are left out. `only` is
+ * Chinwag's notes and the agent's plain text never reached the person and are left out. `only` is
  * the channel of untagged messages (an agent with one channel does not tag them).
  */
 export function transcriptOf(history: Array<{ entry: ChatMessage; at: number }>, only: string): TranscriptEntry[] {
@@ -978,6 +1107,8 @@ export function transcriptOf(history: Array<{ entry: ChatMessage; at: number }>,
           ...(typeof args.reply_to === "string" ? { replyTo: args.reply_to } : {}),
           ...(Array.isArray(args.buttons) && args.buttons.length ? { buttons: args.buttons as string[] } : {}),
           ...(args.list ? { list: args.list as never } : {}),
+          ...(args.link ? { link: args.link as never } : {}),
+          ...(args.image ? { image: args.image as never } : {}),
           ...(Object.keys(fields).length ? { fields } : {}),
         });
       } else if (call.name === REACT) {
@@ -991,12 +1122,30 @@ export function transcriptOf(history: Array<{ entry: ChatMessage; at: number }>,
   return lines;
 }
 
-/** How a message from the person reads to the agent, after its id: "[m5] text", with any quote or tap. */
-function describe(incoming: Incoming): string {
+/**
+ * How a message from the person reads to the agent, after its id: "[m5] text", with any quote or
+ * tap, and its files marked before the text: "[m5] [photo] is this ripe?".
+ */
+function describe(incoming: Incoming, files?: Files): string {
   const parts: string[] = [];
   if (incoming.replyTo) parts.push(`, replying to ${incoming.replyTo.fromAgent ? "your" : "their own"} message "${clip(incoming.replyTo.text)}"`);
   if (incoming.choice) return `${parts.join("")}, tapped] ${incoming.choice.title}`;
-  return `${parts.join("")}] ${incoming.text}`;
+  const body = [files?.marks.join(" "), files?.transcript, incoming.text].filter(Boolean).join(" ");
+  return `${parts.join("")}] ${body}`;
+}
+
+/** A photo or PDF as it is stored: named, without its bytes. */
+function stored(media: Media): Media {
+  const { data: _bytes, ...rest } = media;
+  return rest;
+}
+
+/** A history entry as the model is sent it: media no longer shown are taken off, and it is told. */
+function forModel(entry: ChatMessage): ChatMessage {
+  if (entry.role !== "user" || !entry.media) return entry;
+  const shown = entry.media.filter((m) => m.data);
+  if (shown.length === entry.media.length) return entry;
+  return { role: "user", content: `${entry.content}\n${NOT_SHOWN}`, ...(shown.length ? { media: shown } : {}) };
 }
 
 /** A tool's output as events carry it: whole up to 4,000 characters (for debugging and observability). */

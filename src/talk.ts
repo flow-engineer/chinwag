@@ -36,13 +36,15 @@ export function sendToolName(channel: string): string {
   return `send_${channel.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
 }
 
+const https = z.url({ protocol: /^https$/ });
+
 /** A send tool's input on this channel: only the features it has, with its limits, and its own params. */
 export function sendInput(channel: ChannelInfo, several = false, params: Record<string, z.ZodType> = {}) {
   const shape: Record<string, z.ZodType> = {
     text: z.string().min(1).max(channel.maxLength ?? 4_000),
   };
   if (several) {
-    shape.confirm = z.boolean().optional().describe("Only when Parley asks: you are sure about this channel though they have not written on it lately");
+    shape.confirm = z.boolean().optional().describe("Only when Chinwag asks: you are sure about this channel though they have not written on it lately");
   }
   if (channel.replies) {
     shape.reply_to = z.string().optional().describe("Quote one of the person's messages, by id (such as m3)");
@@ -72,11 +74,44 @@ export function sendInput(channel: ChannelInfo, several = false, params: Record<
       .optional()
       .describe(`A list of up to ${channel.lists.maxRows} options the person picks one of; their pick comes back as their message`);
   }
+  // Every channel takes a link: where there is no link button, Chinwag puts its URL after the text.
+  shape.link = z
+    .object({ label: z.string().min(1).max(channel.linkButton?.labelMax ?? 20), url: https })
+    .optional()
+    .describe(channel.linkButton ? "A button that opens a page, by a URL you were given; not with buttons or a list" : "A page, by a URL you were given: it goes on a line after your text; not with buttons or a list");
+  if (channel.images) {
+    shape.image = z
+      .object({ url: https })
+      .optional()
+      .describe(`A photo, by a URL you were given; your text is its caption, up to ${channel.images.captionMax} characters${channel.lists ? "; not with a list" : ""}`);
+  }
   for (const [name, schema] of Object.entries(params)) shape[name] = schema.optional();
   return z.object(shape);
 }
 
-export type SendInput = { text: string; reply_to?: string; buttons?: string[]; list?: { button: string; rows: Array<{ id: string; title: string; description?: string }> }; confirm?: boolean };
+export type SendInput = {
+  text: string;
+  reply_to?: string;
+  buttons?: string[];
+  list?: { button: string; rows: Array<{ id: string; title: string; description?: string }> };
+  link?: { label: string; url: string };
+  image?: { url: string };
+  confirm?: boolean;
+};
+
+/** Why a send that fits its schema still cannot go out as written (WhatsApp's rules), or null. */
+export function sendRefusal(channel: ChannelInfo, input: SendInput): string | null {
+  if (input.link && (input.buttons?.length || input.list)) return "Not sent: a message with a link cannot also have buttons or a list. Send them in separate messages.";
+  if (input.image && input.list) return "Not sent: a message with an image cannot also have a list. Send them in separate messages.";
+  if (input.image && channel.images && input.text.length > channel.images.captionMax) {
+    return `Not sent: with an image, your text is its caption, at most ${channel.images.captionMax} characters. Shorten it, or send the rest in another message.`;
+  }
+  const max = channel.maxLength ?? 4_000;
+  if (input.link && !channel.linkButton && input.text.length + 1 + input.link.url.length > max) {
+    return `Not sent: the link's URL goes after your text here, and together they are over ${max} characters. Shorten the text.`;
+  }
+  return null;
+}
 
 const reactTool = tool({
   name: REACT,
@@ -94,7 +129,7 @@ const updateTool = tool({
 export interface TalkSettings {
   /** Live status on channels that can show it (web and app UIs). Default on. */
   shareUpdates: boolean;
-  /** The owner's own guidance for when and what to share; replaces Parley's default line. */
+  /** The owner's own guidance for when and what to share; replaces Chinwag's default line. */
   shareUpdatesInstructions?: string;
 }
 
@@ -130,7 +165,7 @@ export function talkInstructions(channels: ChannelView[], settings: TalkSettings
       (channel.reactions ? ", react" : "") +
       (channel.status && settings.shareUpdates ? " or share_updates" : "") +
       `. Anything else you write (your own text, a tool's result) never reaches them: to tell them anything, call ${sendToolName(channels[0].name)}.`,
-    "- Lines starting [Parley] are INTERNAL MESSAGES from the system running you, not from them: they never see them. Never mention them to the person, nor any text of yours that did not reach them.",
+    "- Lines starting [Chinwag] are INTERNAL MESSAGES from the system running you, not from them: they never see them. Never mention them to the person, nor any text of yours that did not reach them.",
     "- After they write, the first thing you do must reach them: your answer, or, if you need tools first, an acknowledgement in the same response as those tool calls" +
       (channel.reactions ? " (react to their message, or a short line)." : ": a short line."),
     "- Call every tool you can in one response; wait for a result only when another call needs it.",
@@ -158,7 +193,7 @@ function severalChannels(channels: ChannelView[], settings: TalkSettings): strin
     "## Talking to the person",
     `- They write to you on more than one channel: ${names.join(", ")}. One conversation covers all of them. Their messages start with the channel and an id, like [${names[0]} · m3].`,
     `- IMPORTANT: They see only what you send with ${tools.join(", ")}${reactions ? ", react" : ""}. Anything else you write (your own text, a tool's result) never reaches them: to tell them anything, call a send tool.`,
-    "- Lines starting [Parley] are INTERNAL MESSAGES from the system running you, not from them: they never see them. Never mention them to the person, nor any text of yours that did not reach them.",
+    "- Lines starting [Chinwag] are INTERNAL MESSAGES from the system running you, not from them: they never see them. Never mention them to the person, nor any text of yours that did not reach them.",
     "- Answer each message on the channel it came on, with that channel's send tool. Messages on different channels can be about different things: answer each one.",
     "- After they write, the first thing you do must reach them on every channel they are waiting on: your answer, or, if you need tools first, an acknowledgement there in the same response as those tool calls.",
     "- Call every tool you can in one response; wait for a result only when another call needs it.",

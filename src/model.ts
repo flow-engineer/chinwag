@@ -9,15 +9,21 @@ export interface OpenAICompatibleOptions {
   apiKey?: string;
   baseURL?: string;
   temperature?: number;
+  /** The model sees photos (OpenAI-style image_url parts). Default true; false for a text-only model. */
+  images?: boolean;
+  /** The model reads PDFs (file parts). Default true on OpenRouter, which reads them for any model; false elsewhere. */
+  pdfs?: boolean;
 }
 
 export function openAICompatible(options: OpenAICompatibleOptions): Model {
+  const baseURL = options.baseURL ?? "https://openrouter.ai/api/v1";
   const client = new OpenAI({
     apiKey: options.apiKey ?? process.env.OPENROUTER_API_KEY,
-    baseURL: options.baseURL ?? "https://openrouter.ai/api/v1",
+    baseURL,
     maxRetries: 1,
   });
   return {
+    reads: { images: options.images ?? true, pdfs: options.pdfs ?? baseURL.startsWith("https://openrouter.ai/") },
     async complete(request: ModelRequest): Promise<ModelResponse> {
       const completion = await client.chat.completions.create(
         {
@@ -45,7 +51,20 @@ export function openAICompatible(options: OpenAICompatibleOptions): Model {
 
 function toWire(message: ChatMessage): OpenAI.Chat.ChatCompletionMessageParam {
   if (message.role === "tool") return { role: "tool", tool_call_id: message.toolCallId, content: message.content };
-  if (message.role === "user") return { role: "user", content: message.content };
+  if (message.role === "user") {
+    const media = (message.media ?? []).filter((m) => m.data);
+    if (!media.length) return { role: "user", content: message.content };
+    return {
+      role: "user",
+      content: [
+        { type: "text", text: message.content },
+        ...media.map((m): OpenAI.Chat.ChatCompletionContentPart => {
+          const url = `data:${m.mime};base64,${m.data}`;
+          return m.kind === "image" ? { type: "image_url", image_url: { url } } : { type: "file", file: { filename: m.name ?? "document.pdf", file_data: url } };
+        }),
+      ],
+    };
+  }
   return {
     role: "assistant",
     content: message.content,

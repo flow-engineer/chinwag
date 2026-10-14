@@ -59,6 +59,32 @@ test("a message the channel refuses goes back to the agent to fix", async () => 
   assert.deepEqual(sent, [{ type: "message", text: "Pick one", buttons: ["Mon", "Tue", "Wed"] }]);
 });
 
+test("WhatsApp's rules for links and images go back to the agent to fix: no link with buttons, no image with a list, a caption's length, https only", async () => {
+  const h = harness([], 50, { ...WHATSAPP, linkButton: { labelMax: 20 }, images: { captionMax: 1024 } });
+  h.send("w3", "show me flats");
+  const link = { label: "Open in app", url: "https://example.com/l/7" };
+  const photo = { url: "https://example.com/flat.jpg" };
+  const rows = [{ id: "r1", title: "2 BHK" }];
+  (await h.nextCall(0)).answer(
+    respond(
+      call("send_chat", { text: "Pick one", link, buttons: ["Yes"] }),
+      call("send_chat", { text: "Pick one", image: photo, list: { button: "Flats", rows } }),
+      call("send_chat", { text: "x".repeat(1025), image: photo }),
+      call("send_chat", { text: "Here", image: { url: "http://example.com/flat.jpg" } }),
+    ),
+  );
+  const second = await h.nextCall(1);
+  const results = second.request.messages.filter((m) => m.role === "tool").map((m) => (m as { content: string }).content);
+  assert.equal(results.length, 4);
+  assert.match(results[0], /link cannot also have buttons or a list/);
+  assert.match(results[1], /image cannot also have a list/);
+  assert.match(results[2], /caption, at most 1024 characters/);
+  assert.match(results[3], /Not sent, fix and send again/);
+  second.answer(respond(call("send_chat", { text: "2 BHK, Indiranagar", image: photo, link })));
+  await h.agent.conversation("w3")!.whenIdle();
+  assert.deepEqual(h.out.filter((o) => o.type === "message"), [{ type: "message", text: "2 BHK, Indiranagar", image: photo, link }]);
+});
+
 test("a reaction from the person is noted for the next turn without starting one", async () => {
   const h = harness([], 50, WHATSAPP);
   h.send("w4", "thanks");

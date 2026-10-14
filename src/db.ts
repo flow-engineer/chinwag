@@ -1,10 +1,10 @@
-// The database under Parley's state. Parley talks to it through this small interface, so any
+// The database under Chinwag's state. Chinwag talks to it through this small interface, so any
 // engine can sit behind it: SQLite is built in (Node's own node:sqlite), and a Postgres adapter
 // wraps a client the app already has. SQL is written once with `?` placeholders; an adapter turns
 // them into its own.
 
 // node:sqlite is loaded when sqlite() is called, not on import, so hosts without it (Cloudflare
-// Workers) can run Parley over their own Database.
+// Workers) can run Chinwag over their own Database.
 import type { DatabaseSync } from "node:sqlite";
 
 export type Row = Record<string, unknown>;
@@ -12,7 +12,7 @@ export type Row = Record<string, unknown>;
 export interface Database {
   /** The database survives a restart (a file, or a server); in-memory SQLite does not. */
   readonly durable: boolean;
-  /** The SQL it speaks, where engines differ (column types in Parley's tables). Default "sqlite". */
+  /** The SQL it speaks, where engines differ (column types in Chinwag's tables). Default "sqlite". */
   readonly dialect?: "sqlite" | "postgres";
   /** Rows of a SELECT, or [] for a statement that returns none. */
   query(sql: string, params?: unknown[]): Promise<Row[]>;

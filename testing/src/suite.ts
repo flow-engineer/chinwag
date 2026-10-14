@@ -3,7 +3,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { extname, isAbsolute, join } from "node:path";
 import { parse } from "yaml";
 import { z } from "../../src/index.ts";
 
@@ -47,7 +47,18 @@ const scenarioSchema = z.object({
     goal: z.string(),
     knows: z.array(z.string()).optional(),
   }),
-  opening: z.array(z.object({ say: z.string().min(1), after_ms: z.number().int().min(0).optional() })).min(1),
+  opening: z
+    .array(
+      z
+        .object({
+          say: z.string().default(""),
+          /** A file the person sends with it (say is its caption): a path in the tests folder. */
+          attach: z.object({ kind: z.enum(["image", "audio", "document"]), file: z.string().refine(inTests, "a path inside the tests folder, such as fixtures/receipt.jpg") }).optional(),
+          after_ms: z.number().int().min(0).optional(),
+        })
+        .refine((step) => step.say || step.attach, "say something, attach a file, or both"),
+    )
+    .min(1),
   world: z.string().optional(),
   max_turns: z.number().int().min(1).max(50).default(8),
   expect: z
@@ -73,6 +84,17 @@ const toolFileSchema = z.object({
     )
     .min(1),
 });
+
+/** A relative path that stays inside the tests folder. */
+function inTests(path: string): boolean {
+  return !!path && !isAbsolute(path) && !path.split(/[\\/]/).includes("..");
+}
+
+/** The type of a file a scenario attaches, from its extension. */
+export function mimeOf(path: string): string {
+  const types: Record<string, string> = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", pdf: "application/pdf", ogg: "audio/ogg", opus: "audio/ogg", mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav" };
+  return types[extname(path).slice(1).toLowerCase()] ?? "application/octet-stream";
+}
 
 export type Scenario = z.infer<typeof scenarioSchema>;
 export type ToolFile = z.infer<typeof toolFileSchema>;
