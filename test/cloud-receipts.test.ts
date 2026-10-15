@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createAgent, type ChinwagEvent, type EventSink } from "../src/index.ts";
 import { scriptedModel, respond, say } from "./helpers.ts";
-import { runInCloud, type AgentUnderTest } from "../testing/src/client.ts";
+import { runInCloud, SessionStopped, type AgentUnderTest } from "../testing/src/client.ts";
 import type { Command, Receipt } from "../testing/src/protocol.ts";
 
 function gate<T = void>() {
@@ -238,7 +238,7 @@ test("an event backlog is byte/count bounded and retains lifecycle order", { tim
   } finally { cloud.close(); }
 });
 
-for (const kind of ["receive", "outbound", "receipt", "events", "oversized"] as const) {
+for (const kind of ["receipt", "events", "oversized"] as const) {
   test(`${kind} failure rejects explicitly, closes the stream and never retries ambiguous events`, { timeout: 10_000 }, async () => {
     const logs: string[] = [];
     let eventPosts = 0;
@@ -252,14 +252,10 @@ for (const kind of ["receive", "outbound", "receipt", "events", "oversized"] as 
     try {
       const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: (line) => logs.push(line), build: ({ events }) => {
         emit = events[0];
-        return { channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
-          if (kind === "receive") throw new Error("broken receive");
-          if (kind === "outbound") { void deliver({ type: "message", text: "reply" }); return null; }
-          return "m";
-        } } satisfies AgentUnderTest;
+        return { channels: () => [], reacted: () => {}, receive: () => "m" } satisfies AgentUnderTest;
       } });
       // Attach the rejection assertion before triggering any fire-and-forget work.
-      const rejected = assert.rejects(running, kind === "events" ? /event upload failed/ : kind === "oversized" ? /5MB/ : kind === "outbound" ? /outbound delivery/ : kind === "receipt" ? /delivery receipt/ : /receive: broken receive/);
+      const rejected = assert.rejects(running, kind === "events" ? /event upload failed/ : kind === "oversized" ? /5MB/ : /delivery receipt/);
       const stream = await cloud.connected;
       if (kind === "events" || kind === "oversized") {
         emit({ type: "turn.end", conversationId: "c", at: 1, data: { text: kind === "oversized" ? "x".repeat(5_000_000) : "private event content" } });
@@ -267,7 +263,6 @@ for (const kind of ["receive", "outbound", "receipt", "events", "oversized"] as 
       } else stream.write(frame(message("m1")));
       await rejected;
       await cloud.closed;
-      if (kind === "receive" || kind === "outbound") assert.equal(receiptPosts, 0);
       if (kind === "events") {
         assert.equal(eventPosts, 1);
         const diagnostic = logs.find((line) => line.startsWith("event upload failed:"));
@@ -278,3 +273,100 @@ for (const kind of ["receive", "outbound", "receipt", "events", "oversized"] as 
     } finally { cloud.close(); }
   });
 }
+
+test("a 503 from the tunnel frontend is tried again, and the suite still finishes", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  let outbound = 0;
+  const cloud = await tunnel((path, _body, res) => {
+    if (!path.endsWith("/outbound")) return ok(res);
+    outbound++;
+    if (outbound === 1) return void res.writeHead(503).end("<html><title>503 Server Error</title><h1>Error: Server Error</h1>Service error -27.</html>");
+    ok(res);
+  });
+  try {
+    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: (line) => logs.push(line), build: () => ({
+      channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
+        void deliver({ type: "message", text: "reply" });
+        return "m";
+      },
+    }) });
+    const stream = await cloud.connected;
+    stream.write(frame(message("m1")));
+    cloud.finish();
+    assert.deepEqual(await running, { runs: [] });
+    assert.equal(outbound, 2);
+    assert.match(logs.join("\n"), /outbound delivery unavailable \(503\), trying again/);
+    assert.ok(!logs.join("\n").includes("Server Error"));
+  } finally { cloud.close(); }
+});
+
+test("an outbound the tunnel keeps refusing does not discard the rest of the session", { timeout: 10_000 }, async () => {
+  let outbound = 0;
+  const cloud = await tunnel((path, _body, res) => {
+    if (path.endsWith("/outbound")) {
+      outbound++;
+      return void res.writeHead(503).end("<html><h1>Error: Server Error</h1></html>");
+    }
+    ok(res);
+  });
+  try {
+    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: () => {}, build: () => ({
+      channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
+        void deliver({ type: "message", text: "reply" });
+        return null;
+      },
+    }) });
+    const stream = await cloud.connected;
+    stream.write(frame(message("m1")));
+    cloud.finish();
+    assert.deepEqual(await running, { runs: [] });
+    assert.equal(outbound, 3);
+    assert.ok(!cloud.posts.some((path) => path.endsWith("/receipts")), "a reply the tunnel never took is not acknowledged");
+  } finally { cloud.close(); }
+});
+
+test("a JSON refusal on outbound ends the session", { timeout: 10_000 }, async () => {
+  const cloud = await tunnel((path, _body, res) => {
+    if (path.endsWith("/outbound")) return void res.writeHead(400).end('{"error":"invalid_request"}');
+    ok(res);
+  });
+  try {
+    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: () => {}, build: () => ({
+      channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
+        void deliver({ type: "message", text: "reply" });
+        return "m";
+      },
+    }) });
+    const stream = await cloud.connected;
+    stream.write(frame(message("m1")));
+    await assert.rejects(running, (error: unknown) => {
+      assert.ok(!(error instanceof SessionStopped));
+      assert.match((error as Error).message, /invalid_request/);
+      return true;
+    });
+  } finally { cloud.close(); }
+});
+
+test("an outbound timeout is not sent again", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  let outbound = 0;
+  const cloud = await tunnel((path, _body, res) => {
+    if (path.endsWith("/outbound")) { outbound++; return; }
+    ok(res);
+  });
+  try {
+    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: (line) => logs.push(line), postTimeoutMs: 120, build: () => ({
+      channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
+        void deliver({ type: "message", text: "reply" });
+        return "m";
+      },
+    }) });
+    const stream = await cloud.connected;
+    stream.write(frame(message("m1")));
+    cloud.finish();
+    assert.deepEqual(await running, { runs: [] });
+    assert.equal(outbound, 1);
+    assert.match(logs.join("\n"), /outbound delivery failed \(timed out\)/);
+    assert.ok(!logs.join("\n").includes("trying again"));
+  } finally { cloud.close(); }
+});
