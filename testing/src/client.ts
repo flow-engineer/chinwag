@@ -3,8 +3,8 @@
 // cloud's platform simulators, and the person's messages arrive over one stream.
 
 import { readFile } from "node:fs/promises";
-import { request as httpRequest, type IncomingMessage } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { basename, relative, resolve } from "node:path";
 import { toSpec, type Agent, type Incoming, type EventSink, type Outbound, type ChinwagEvent, type Tool } from "../../src/index.ts";
 import type { Command, Opened, WireIncoming, OpenSession, Receipt, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
@@ -153,7 +153,14 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
         // Keep the batch until acknowledged. An ambiguous failure ends the session, never retries
         // lifecycle events which the cloud might already have applied.
         queued.splice(0, count);
-      } catch {
+      } catch (error) {
+        const closed = error instanceof PostError && error.status === 409 && error.code === "session_closed";
+        const aborted = stopped && error instanceof Error && error.name === "AbortError";
+        if (closed || aborted) {
+          log(`session already finished, dropped ${count} events`);
+          queued.splice(0, count);
+          continue;
+        }
         failed = true;
         throw new Error("event upload failed; acceptance unknown, not retried");
       } finally {
@@ -278,8 +285,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
 }
 
 /** The stream on a connection of its own. fetch shares one HTTP/2 connection per origin, and over
- * HTTPS a POST behind an open stream on it was held until the stream closed: the cloud heard no
- * reply and ended every run agent_quiet. */
+ * HTTPS a request behind another open one on it waits until that one finishes: a tool call the
+ * cloud has not answered held every later event and reply, and the run ended agent_quiet. */
 function openStream(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<IncomingMessage> {
   const request = url.startsWith("https:") ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
@@ -303,13 +310,49 @@ class PostError extends Error {
   }
 }
 
+/** POSTs share a keep-alive agent and speak HTTP/1.1, so each request still in flight has its own
+ * socket. A tool call the cloud has not answered cannot hold the later ones, and a finished
+ * connection is reused. The stream stays on a connection of its own (openStream). */
+const httpPosts = new HttpAgent({ keepAlive: true });
+const httpsPosts = new HttpsAgent({ keepAlive: true });
+
+function requestOnce(url: string, payload: string, headers: Record<string, string>, signal?: AbortSignal): Promise<{ status: number; text: string }> {
+  const secure = url.startsWith("https:");
+  const request = secure ? httpsRequest : httpRequest;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const req = request(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers, "content-length": Buffer.byteLength(payload) },
+      agent: secure ? httpsPosts : httpPosts,
+      signal,
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("error", fail);
+      response.on("aborted", () => fail(new Error("The request was aborted")));
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => {
+        if (settled) return;
+        settled = true;
+        resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") });
+      });
+    });
+    req.on("error", fail);
+    req.end(payload);
+  });
+}
+
 async function post<T = unknown>(url: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal, serialized?: string): Promise<T> {
-  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: serialized ?? JSON.stringify(body), signal });
-  const text = await response.text();
-  if (!response.ok) {
+  const { status, text } = await requestOnce(url, serialized ?? JSON.stringify(body ?? {}), headers, signal);
+  if (status < 200 || status >= 300) {
     let code: string | undefined;
-    try { code = JSON.parse(text).error; } catch {}
-    throw new PostError(url, response.status, text, code);
+    try { code = JSON.parse(text).error; } catch { /* the body was not JSON */ }
+    throw new PostError(url, status, text, code);
   }
   return (text ? JSON.parse(text) : {}) as T;
 }

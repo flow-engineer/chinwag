@@ -1,7 +1,8 @@
 // covers: testing/src/client.ts testing/src/protocol.ts
 // The CLI against a hosted cloud: the open carries the CI key and the synthetic attestation, and the
 // session is played at the tunnel the open answers, which never sees the key; the agent's posts reach
-// the cloud while the stream is open, also over HTTPS with HTTP/2 as a hosted cloud speaks it.
+// the cloud while the stream is open, also over HTTPS with HTTP/2 as a hosted cloud speaks it, and a
+// tool call the cloud has not answered does not hold the later ones.
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign, X509Certificate } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -12,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { getCACertificates, setDefaultCACertificates } from "node:tls";
+import { z } from "zod";
 import { cloudHeaders, runInCloud, tunnelBase } from "../testing/src/client.ts";
 import type { Agent, Incoming } from "../src/index.ts";
 
@@ -115,11 +117,52 @@ test("a file a scenario attaches is read from the tests folder on this machine, 
   await assert.rejects(outside.data(), /not a file in the tests folder/);
 });
 
+test("a late session_closed drops the leftover events instead of failing the run", async () => {
+  const logs: string[] = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      if (req.url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+      if (req.url === "/api/sessions/s/events") return void res.writeHead(409, { "content-type": "application/json" }).end('{"error":"session_closed"}');
+      if (req.url === "/api/sessions/s/outbound") {
+        res.writeHead(200, { "content-type": "application/json" }).end("{}");
+        return;
+      }
+      if (req.url === "/api/sessions/s/receipts") return void res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ type: "message", conversationId: "c", messageId: "m1", channel: { reactions: false, status: false }, incoming: { text: "hi" } })}\n\n`);
+      res.end(`data: ${JSON.stringify({ type: "finished", summary: { runs: [] } })}\n\n`);
+    });
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  try {
+    const summary = await runInCloud({
+      cloud: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      name: "cafe",
+      tools: [],
+      build: ({ events }) => ({
+        channels: () => [],
+        receive: (id: string, _message: Incoming, deliver: (o: unknown) => Promise<void>) => {
+          events[0]({ type: "turn.start", conversationId: id, at: 1 });
+          void deliver({ type: "message", text: "hello" });
+          return "m1";
+        },
+      }) as unknown as Agent,
+      files: [],
+      log: (line) => logs.push(line),
+    });
+    assert.deepEqual(summary, { runs: [] });
+  } finally {
+    server.close();
+  }
+  assert.match(logs.join("\n"), /session already finished, dropped \d+ events/);
+});
+
 test("the agent's posts reach the cloud while the stream is open, over HTTPS with HTTP/2", { timeout: 10_000 }, async (t) => {
   // A hosted cloud speaks HTTP/2, and fetch multiplexes onto one connection per origin: a POST
   // behind the open stream was held until the stream closed, so the cloud heard nothing (agent_quiet).
-  const { key, cert } = selfSignedCert();
-  setDefaultCACertificates([...getCACertificates("default"), cert]); // this test file's process only
+  const { key, cert } = httpsCert;
   const outbound: unknown[] = [];
   let stream: Http2ServerResponse | undefined;
   const server = createSecureServer({ key, cert, allowHTTP1: true }, (req, res) => {
@@ -158,6 +201,84 @@ test("the agent's posts reach the cloud while the stream is open, over HTTPS wit
   }
   assert.deepEqual(outbound, [{ conversationId: "c", outbound: { type: "message", text: "hello" } }]);
 });
+
+test("a tool call the cloud has not answered does not hold later posts, over HTTPS with HTTP/2", { timeout: 10_000 }, async (t) => {
+  // The stream test only keeps the stream off fetch's connection. A tool call stays open until the
+  // simulator answers, and on one shared HTTP/2 connection that held every later POST, so the
+  // cloud never saw the reply or the turn and scored the run agent_quiet.
+  const { key, cert } = httpsCert;
+  const arrived: string[] = [];
+  let stream: Http2ServerResponse | undefined;
+  let heldOpen = true;
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const server = createSecureServer({ key, cert, allowHTTP1: true }, (req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      const path = req.url ?? "";
+      if (path === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+      if (path.endsWith("/tool-calls")) {
+        held.then(() => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, output: {} })));
+        stream!.write(`data: ${JSON.stringify({ type: "message", conversationId: "c", messageId: "m2", channel: { reactions: false, status: false }, incoming: { text: "next" } })}\n\n`);
+        return;
+      }
+      if (path.endsWith("/events") || path.endsWith("/outbound")) {
+        if (heldOpen) arrived.push(path.endsWith("/events") ? "events" : "outbound");
+        res.writeHead(200, { "content-type": "application/json" }).end("{}");
+        if (arrived.includes("events") && arrived.includes("outbound")) {
+          release!();
+          stream!.end(`data: ${JSON.stringify({ type: "finished", summary: { runs: [] } })}\n\n`);
+        }
+        return;
+      }
+      if (path.endsWith("/receipts") || path.endsWith("/drained")) return void res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ type: "message", conversationId: "c", messageId: "m1", channel: { reactions: false, status: false }, incoming: { text: "first" } })}\n\n`);
+    });
+  });
+  const sessions = new Set<Http2Session>();
+  server.on("session", (session) => sessions.add(session));
+  const close = () => (sessions.forEach((s) => s.destroy()), server.close());
+  const giveUp = setTimeout(() => {
+    heldOpen = false;
+    release!();
+    stream?.end(`data: ${JSON.stringify({ type: "finished", summary: { runs: [] } })}\n\n`);
+  }, 2_000);
+  t.signal.addEventListener("abort", close);
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  try {
+    await runInCloud({
+      cloud: `https://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      name: "cafe",
+      tools: [{ name: "lookup", description: "Look something up", input: z.object({}), run: () => null }],
+      build: ({ tools, events }) => ({
+        channels: () => [],
+        receive: (id: string, message: Incoming, deliver: (o: unknown) => Promise<void>) => {
+          if (message.text === "first") {
+            void Promise.resolve(tools[0].run({}, { conversationId: id, person: "p", channel: "sms" })).catch(() => {});
+            return "m1";
+          }
+          events[0]({ type: "turn.start", conversationId: id, at: 1 });
+          void deliver({ type: "message", text: "hello" });
+          return "m2";
+        },
+      }) as unknown as Agent,
+      files: [],
+      log: () => {},
+    });
+  } finally {
+    clearTimeout(giveUp);
+    close();
+  }
+  assert.deepEqual(arrived.filter((p) => p === "events" || p === "outbound").sort(), ["events", "outbound"]);
+});
+
+/** One certificate for both HTTPS tests. Two with the same subject and serial can be mixed up when
+ * the connection is checked, and the earlier test's certificate then fails the later one. */
+const httpsCert = selfSignedCert();
+setDefaultCACertificates([...getCACertificates("default"), httpsCert.cert]);
 
 /** A throwaway self-signed certificate for 127.0.0.1, made here so no key is ever checked in. */
 function selfSignedCert(): { key: string; cert: string } {
