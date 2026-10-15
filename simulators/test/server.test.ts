@@ -1,11 +1,11 @@
-// covers: simulators/src/server.ts simulators/src/platforms.ts src/agent.ts src/conversation.ts
+// covers: simulators/src/server.ts simulators/src/platforms.ts src/agent.ts src/conversation.ts src/channels.ts
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { sqlite, type ChannelInfo, type ChannelSummary, type Deliver } from "../../src/index.ts";
+import { sqlite, type ChannelInfo, type ChannelSummary, type Deliver, type Incoming, type TemplateDefinition } from "../../src/index.ts";
 import { WHATSAPP, call, multi, respond } from "../../test/helpers.ts";
 import { simulators, type AgentConnection, type Line } from "../src/index.ts";
 
@@ -17,10 +17,12 @@ function fakeAgent(channels?: ChannelSummary[]) {
     reactions: [] as { conversationId: string; emoji: string; toText: string }[],
     count: 0,
     options: [] as Array<{ channel: ChannelInfo; channelName?: string }>,
+    incomings: [] as Incoming[],
   };
   const connection: AgentConnection = {
-    receive: (conversationId, _incoming, deliver, options) => {
+    receive: (conversationId, incoming, deliver, options) => {
       fake.deliver = deliver;
+      fake.incomings.push(incoming);
       fake.conversationIds.push(conversationId);
       fake.options.push(options);
       return `m${++fake.count}`;
@@ -44,7 +46,7 @@ async function start(helpReply?: string, channels?: ChannelSummary[]) {
 }
 
 test("SMS: after STOP the carrier answers and blocks the agent; START lets it through; HELP is the configured reply", async () => {
-  const { fake, server, send, lines } = await start("Cafe: reply STOP to opt out.");
+  const { fake, server, send, lines } = await start("Pip: reply STOP to opt out.");
   try {
     await send("sms", "stop");
     const stopped = (await lines("sms")).at(-1);
@@ -62,7 +64,7 @@ test("SMS: after STOP the carrier answers and blocks the agent; START lets it th
     await send("sms", "HELP");
     const help = (await lines("sms")).at(-1);
     assert.ok(help?.kind === "out" && help.carrier);
-    assert.equal(help.text, "Cafe: reply STOP to opt out.");
+    assert.equal(help.text, "Pip: reply STOP to opt out.");
   } finally {
     await server.close();
   }
@@ -80,6 +82,26 @@ test("a person can react to an agent message on WhatsApp, not on SMS", async () 
     assert.equal(fake.reactions.length, 0);
     assert.equal((await react("whatsapp")).status, 202);
     assert.deepEqual(fake.reactions, [{ conversationId: "whatsapp:p", emoji: "👍", toText: "hello on whatsapp" }]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("WhatsApp and web show a link button and a photo the agent sends; SMS offers neither", async () => {
+  const { fake, server, send, lines } = await start();
+  try {
+    const link = { label: "Open in app", url: "https://example.com/l/7" };
+    const image = { url: "https://example.com/flat.jpg" };
+    for (const platform of ["whatsapp", "web"]) {
+      await send(platform, "show me flats");
+      assert.ok(fake.options.at(-1)!.channel.linkButton && fake.options.at(-1)!.channel.images);
+      await fake.deliver!({ type: "message", text: "2 BHK, Indiranagar", link, image });
+      const out = (await lines(platform)).at(-1);
+      assert.ok(out?.kind === "out");
+      assert.deepEqual([out.link, out.image], [link, image]);
+    }
+    await send("sms", "show me flats");
+    assert.ok(!fake.options.at(-1)!.channel.linkButton && !fake.options.at(-1)!.channel.images);
   } finally {
     await server.close();
   }
@@ -103,11 +125,11 @@ test("the web simulator plays the agent's own custom UI, and shows the params it
   }
 });
 
-const MARIA = { name: "Maria", phone: "+15555550101" };
+const SAM = { name: "Sam", phone: "+15555550101" };
 
-/** Pip-like agent with one WhatsApp channel and Maria as its test person, on `database`. */
+/** Pip-like agent with one WhatsApp channel and Sam as its test person, on `database`. */
 function agentOn(database: ReturnType<typeof sqlite>, dir?: string) {
-  return multi({ channels: { whatsapp: { info: WHATSAPP, phone: true } }, testPeople: [MARIA], database, dir });
+  return multi({ channels: { whatsapp: { info: WHATSAPP, phone: true } }, testPeople: [SAM], database, dir });
 }
 
 test("a deployed playground lets in only its token, then only the agent's test people", async () => {
@@ -148,8 +170,24 @@ test("a deployed playground lets in only its token, then only the agent's test p
   }
 });
 
+test("a file sent from a simulator reaches the agent with its bytes, the message box as its caption", async () => {
+  const { fake, server, post, lines } = await start();
+  try {
+    const bytes = new Uint8Array(50_000).fill(7);
+    const sent = await post("/api/messages", { platform: "whatsapp", person: "p", text: "", attachments: [{ kind: "document", mime: "application/pdf", name: "invoice.pdf", data: Buffer.from(bytes).toString("base64") }] });
+    assert.equal(sent.status, 202);
+    const [file] = fake.incomings[0].attachments ?? [];
+    assert.deepEqual({ text: fake.incomings[0].text, kind: file.kind, mime: file.mime, name: file.name }, { text: "", kind: "document", mime: "application/pdf", name: "invoice.pdf" });
+    assert.deepEqual(await file.data(), bytes);
+    const [line] = await lines("whatsapp");
+    assert.deepEqual(line.kind === "in" && line.attachments, [{ kind: "document", name: "invoice.pdf" }]);
+  } finally {
+    await server.close();
+  }
+});
+
 test("the playground shows the person's conversation from the agent's store, also after a restart", async () => {
-  const path = join(mkdtempSync(join(tmpdir(), "parley-play-")), "parley.db");
+  const path = join(mkdtempSync(join(tmpdir(), "chinwag-play-")), "chinwag.db");
   const first = agentOn(sqlite(path));
   await first.agent.resume();
   const play = simulators();
@@ -157,11 +195,13 @@ test("the playground shows the person's conversation from the agent's store, als
   const send = await fetch(`${server.url}/api/messages`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ channel: "whatsapp", person: MARIA.phone, text: "a latte please" }),
+    body: JSON.stringify({ channel: "whatsapp", person: SAM.phone, text: "a latte please" }),
   });
   assert.equal(send.status, 202);
-  (await first.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Which size?", buttons: ["Small", "Large"] })));
-  const id = (await first.agent.testConversation(MARIA.phone))!;
+  // This WhatsApp has no link button: the link's URL went after the text, and shows so again after a restart.
+  const menu = { label: "Menu", url: "https://example.com/menu" };
+  (await first.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Which size?", buttons: ["Small", "Large"] }), call("send_whatsapp", { text: "Our menu", link: menu })));
+  const id = (await first.agent.testConversation(SAM.phone))!;
   await first.agent.conversation(id)!.whenIdle();
   await server.close();
 
@@ -169,10 +209,128 @@ test("the playground shows the person's conversation from the agent's store, als
   await again.agent.resume();
   const restarted = await simulators().listen(again.agent, 0);
   try {
-    const { lines } = (await (await fetch(`${restarted.url}/api/transcript?channel=whatsapp&person=${encodeURIComponent(MARIA.phone)}`)).json()) as { lines: Line[] };
+    const { lines } = (await (await fetch(`${restarted.url}/api/transcript?channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`)).json()) as { lines: Line[] };
     const said = lines.flatMap((l) => (l.kind === "in" || l.kind === "out" ? [[l.kind, l.text, l.kind === "out" ? l.buttons : undefined]] : []));
-    assert.deepEqual(said, [["in", "a latte please", undefined], ["out", "Which size?", ["Small", "Large"]]]);
+    assert.deepEqual(said, [["in", "a latte please", undefined], ["out", "Which size?", ["Small", "Large"]], ["out", "Our menu\nhttps://example.com/menu", undefined]]);
   } finally {
     await restarted.close();
+  }
+});
+
+test("a page the live stream can't reach gets the same events by polling, each once and in order", async () => {
+  const h = agentOn(sqlite());
+  await h.agent.resume();
+  const token = "t".repeat(40);
+  const server = createServer(simulators().handler(h.agent, { token, base: "/play" }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/play`;
+  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  const where = `channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`;
+  type Event = { type: string; seq: number; line?: Line };
+  type Polled = { seq: number; events: Event[] };
+  const get = async (path: string, after?: number) => (await fetch(`${url}${path}?${where}${after === undefined ? "" : `&after=${after}`}`, { headers })).json();
+  const send = async (text: string) =>
+    assert.equal((await fetch(`${url}/api/messages`, { method: "POST", headers, body: JSON.stringify({ channel: "whatsapp", person: SAM.phone, text }) })).status, 202);
+  const said = (events: Event[]) => events.flatMap((e) => (e.line && (e.line.kind === "in" || e.line.kind === "out") ? [e.line.text] : []));
+  const idle = async () => h.agent.conversation((await h.agent.testConversation(SAM.phone))!)!.whenIdle();
+  try {
+    const { seq: start } = await get("/api/transcript");
+    await send("a latte please");
+    (await h.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Which size?" })));
+    await idle();
+
+    const first = (await get("/api/poll", start)) as Polled;
+    assert.deepEqual(said(first.events), ["a latte please", "Which size?"]);
+
+    // Nothing newer yet: this poll waits, and answers with the next message only.
+    const waiting = get("/api/poll", first.seq);
+    await send("large");
+    const second = (await waiting) as Polled;
+    assert.deepEqual(said(second.events), ["large"]);
+    assert.ok(second.events.every((e) => e.seq > first.seq));
+
+    (await h.nextCall(1)).answer(respond(call("send_whatsapp", { text: "Coming up" })));
+    await idle();
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("WhatsApp shows a declared template as WhatsApp would, and one not declared by its name and values, also after a reload", async () => {
+  const ready: TemplateDefinition = {
+    name: "order_ready",
+    language: "en",
+    category: "utility",
+    header: { kind: "text", text: "Order {{1}}" },
+    body: "Hi {{1}}, your {{2}} is ready.",
+    footer: "Reply STOP to opt out",
+    buttons: [{ type: "quick_reply", text: "On my way" }, { type: "url", text: "Track", url: "https://example.com/o/{{1}}" }, { type: "phone", text: "Call us", phone: "+15555550100" }],
+  };
+  const h = multi({ channels: { whatsapp: { info: WHATSAPP, phone: true, kind: "whatsapp" } }, testPeople: [SAM], database: sqlite(), templates: [ready] });
+  await h.agent.resume();
+  const server = await simulators().listen(h.agent, 0);
+  const where = `channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`;
+  const transcript = async () => (await (await fetch(`${server.url}/api/transcript?${where}`)).json()) as { seq: number; lines: Line[] };
+  try {
+    await fetch(`${server.url}/api/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "whatsapp", person: SAM.phone, text: "hi" }) });
+    (await h.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Hi Sam!" })));
+    await h.agent.conversation((await h.agent.testConversation(SAM.phone))!)!.whenIdle();
+    const { seq } = await transcript();
+
+    const to = { channel: "whatsapp", address: SAM.phone };
+    await h.agent.nudge({ to, template: { name: "order_ready", header: { kind: "text", text: "1042" }, body: ["Sam", "latte"], buttons: [{ index: 0, value: "omw_1042" }, { index: 1, value: "1042" }] } });
+    await h.agent.nudge({ to, template: { name: "loyalty", body: ["Sam", "120"] } });
+    const polled = (await (await fetch(`${server.url}/api/poll?${where}&after=${seq}`)).json()) as { events: Array<{ line?: Line }> };
+    const [declared, other] = polled.events.flatMap((e) => (e.line?.kind === "out" ? [e.line] : []));
+    assert.deepEqual([declared.text, declared.template], [
+      "Hi Sam, your latte is ready.",
+      {
+        name: "order_ready",
+        header: { kind: "text", text: "Order 1042" },
+        footer: "Reply STOP to opt out",
+        buttons: [{ type: "quick_reply", text: "On my way", payload: "omw_1042" }, { type: "url", text: "Track", url: "https://example.com/o/1042" }, { type: "phone", text: "Call us", phone: "+15555550100" }],
+      },
+    ]);
+    assert.deepEqual([other.text, other.template], ["Sam\n120", { name: "loyalty" }]);
+
+    // From the store, after a reload: the body as it read, the rest as declared.
+    const reloaded = (await transcript()).lines.flatMap((l) => (l.kind === "out" && l.template ? [[l.text, l.template.name, l.template.footer]] : []));
+    assert.deepEqual(reloaded, [["Hi Sam, your latte is ready.", "order_ready", "Reply STOP to opt out"], ["", "loyalty", undefined]]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the playground's Backend buttons run on the server behind its token, and their results reach the trace, polled too", async () => {
+  const h = agentOn(sqlite());
+  await h.agent.resume();
+  const token = "t".repeat(40);
+  const ran: string[] = [];
+  const actions = [
+    { label: "Order 1042 ships", run: async () => (ran.push("ships"), "sent") },
+    { label: "Price drops", run: () => { throw new Error("skipped: quiet hours"); } },
+  ];
+  const server = createServer(simulators({ actions }).handler(h.agent, { token, base: "/play" }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/play`;
+  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  const where = `channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`;
+  const press = (index: number, auth = headers) => fetch(`${url}/api/actions`, { method: "POST", headers: auth, body: JSON.stringify({ index }) });
+  try {
+    assert.deepEqual((await (await fetch(`${url}/api/platforms`, { headers })).json()).actions, ["Order 1042 ships", "Price drops"]);
+    assert.equal((await press(0, { authorization: "Bearer wrong", "content-type": "application/json" })).status, 401);
+    assert.deepEqual(ran, [], "nothing runs without the token");
+
+    const { seq } = await (await fetch(`${url}/api/transcript?${where}`, { headers })).json();
+    assert.deepEqual(await (await press(0)).json(), { ok: true, result: "sent" });
+    assert.deepEqual(await (await press(1)).json(), { ok: false, error: "skipped: quiet hours" });
+    assert.equal((await press(2)).status, 400);
+    const polled = (await (await fetch(`${url}/api/poll?${where}&after=${seq}`, { headers })).json()) as { events: Array<Record<string, unknown>> };
+    assert.deepEqual(polled.events.map(({ type, label, ok, result, error }) => ({ type, label, ok, result, error })), [
+      { type: "action", label: "Order 1042 ships", ok: true, result: "sent", error: undefined },
+      { type: "action", label: "Price drops", ok: false, result: undefined, error: "skipped: quiet hours" },
+    ]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });

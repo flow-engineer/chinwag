@@ -1,4 +1,4 @@
-// covers: src/conversation.ts src/talk.ts
+// covers: src/conversation.ts src/talk.ts src/channels.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SMS, WHATSAPP, call, harness, respond, say, users } from "./helpers.ts";
@@ -15,15 +15,16 @@ test("a channel without reactions or status offers only its send tool", async ()
   await h.agent.conversation("c11")!.whenIdle();
 });
 
-test("SMS offers no buttons, replies or reactions, and asks for plain text", async () => {
+test("SMS offers no buttons, replies, reactions or images, and asks for plain text; a link's URL goes after the text", async () => {
   const h = harness([], 50, SMS);
   h.send("w1", "hi");
   const first = await h.nextCall(0);
   const send = first.request.tools.find((t) => t.name === "send_chat")!;
-  assert.deepEqual(Object.keys((send.parameters as { properties: object }).properties), ["text"]);
+  assert.deepEqual(Object.keys((send.parameters as { properties: object }).properties), ["text", "link"]);
   assert.match(first.request.system, /Write plain text, not Markdown/);
-  first.answer(respond(say("Hi!")));
+  first.answer(respond(call("send_chat", { text: "Your order:", link: { label: "Track it", url: "https://example.com/o/42" } })));
   await h.agent.conversation("w1")!.whenIdle();
+  assert.deepEqual(h.out.filter((o) => o.type === "message"), [{ type: "message", text: "Your order:\nhttps://example.com/o/42" }]);
 });
 
 test("WhatsApp: read receipts when the agent picks a message up, quotes and taps both ways", async () => {

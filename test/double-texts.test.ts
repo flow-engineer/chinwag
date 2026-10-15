@@ -24,7 +24,7 @@ test("a double text folds into the reply being written", async () => {
 });
 
 test("a double text that comes before the first model call (the turn still loading) joins that call", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "parley-"));
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
   const scripted = scriptedModel();
   const loading = gate();

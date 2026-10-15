@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "allowImportingTsExtensions": false,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true,
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  "include": [
+    "src",
+    "simulators/src",
+    "testing/src/index.ts",
+    "testing/src/client.ts",
+    "testing/src/http-agent.ts",
+    "testing/src/cli.ts",
+    "testing/src/new.ts",
+    "testing/src/suite.ts",
+    "testing/src/protocol.ts"
+  ]
+}

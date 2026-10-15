@@ -1,4 +1,4 @@
-// Parley's own state in the database: who each person is and on which channels, every
+// Chinwag's own state in the database: who each person is and on which channels, every
 // conversation's history, the inbox of events not yet handled, background tools in flight,
 // scheduled messages and their runs, nudges, and what each person asked not to be messaged about.
 // The author's data never lives here. Every row carries the agent's id, so one database can hold
@@ -159,7 +159,7 @@ export class Store {
     return this.db.durable;
   }
 
-  /** Creates or upgrades Parley's tables; safe to call any number of times. */
+  /** Creates or upgrades Chinwag's tables; safe to call any number of times. */
   migrate(): Promise<void> {
     this.ready ??= (async () => {
       const types = TYPES[this.db.dialect ?? "sqlite"];

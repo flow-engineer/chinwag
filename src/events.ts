@@ -3,7 +3,7 @@
 
 import { appendFileSync } from "node:fs";
 
-export interface ParleyEvent {
+export interface ChinwagEvent {
   type:
     | "message.in"
     | "message.out"
@@ -23,13 +23,14 @@ export interface ParleyEvent {
     | "reaction"
     | "status"
     | "message.undelivered"
-    | "reaction.in";
+    | "reaction.in"
+    | "attachment.failed";
   conversationId: string;
   at: number;
   [detail: string]: unknown;
 }
 
-export type EventSink = (event: ParleyEvent) => void;
+export type EventSink = (event: ChinwagEvent) => void;
 
 /** One JSON line per event, to a file. */
 export function jsonlSink(path: string): EventSink {
@@ -37,13 +38,13 @@ export function jsonlSink(path: string): EventSink {
 }
 
 export function emitter(sinks: EventSink[]) {
-  return (conversationId: string, type: ParleyEvent["type"], detail: Record<string, unknown> = {}) => {
-    const event: ParleyEvent = { type, conversationId, at: Date.now(), ...detail };
+  return (conversationId: string, type: ChinwagEvent["type"], detail: Record<string, unknown> = {}) => {
+    const event: ChinwagEvent = { type, conversationId, at: Date.now(), ...detail };
     for (const sink of sinks) {
       try {
         sink(event);
       } catch (error) {
-        console.warn("parley: an event sink failed:", error);
+        console.warn("chinwag: an event sink failed:", error);
       }
     }
   };

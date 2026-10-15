@@ -62,7 +62,7 @@ test("each channel's send tool is named for it from the first message; a second 
   assert.ok(earlier >= 0);
   assert.equal((c.request.messages[earlier + 1] as { content: string }).content, JSON.stringify({ delivered: true, channel: "sms" }));
   const props = (name: string) => Object.keys((c.request.tools.find((t) => t.name === name)!.parameters as { properties: object }).properties);
-  assert.deepEqual(props("send_sms"), ["text", "confirm"]);
+  assert.deepEqual(props("send_sms"), ["text", "confirm", "link"]);
   assert.ok(props("send_web").includes("buttons"));
   c.answer(respond(call("send_web", { text: "Hey!" })));
   await h.agent.conversation(b!.conversationId)!.whenIdle();

@@ -1,4 +1,4 @@
-// Channels: where people reach an agent. Parley knows each platform (what WhatsApp can show, its
+// Channels: where people reach an agent. Chinwag knows each platform (what WhatsApp can show, its
 // limits, its 24-hour window); a provider only says how to send through its own API. A provider
 // implements one sendMessage, which gets everything the agent's send tool carries, plus the
 // optional actions that are not messages (react, typing, markRead, sendTemplate). A feature the
@@ -10,7 +10,7 @@
 //   customUI("app", new MyApp())                         your own web or mobile UI, with your params
 
 import type { z } from "zod";
-import type { ChannelInfo, ListRow, Outbound } from "./types.ts";
+import type { ChannelInfo, ListRow, Outbound, Template, TemplateDefinition } from "./types.ts";
 
 export type ChannelKind = "sms" | "whatsapp" | "custom";
 
@@ -43,18 +43,16 @@ export interface Message {
   replyTo?: string;
   buttons?: string[];
   list?: { button: string; rows: ListRow[] };
-}
-
-export interface Template {
-  name: string;
-  language?: string;
-  variables?: Record<string, string>;
+  /** A button that opens this page. Never with buttons or a list. */
+  link?: { label: string; url: string };
+  /** A photo, the text its caption. Never with a list. */
+  image?: { url: string };
 }
 
 export interface WhatsAppProvider {
   sendMessage(to: string, message: Message): Promise<void>;
   /** Which parts of a message this provider can send. Default: all. */
-  features?: { buttons?: boolean; lists?: boolean; replies?: boolean };
+  features?: { buttons?: boolean; lists?: boolean; replies?: boolean; links?: boolean; images?: boolean };
   react?(to: string, messageId: string, emoji: string): Promise<void>;
   typing?(to: string, on: boolean): Promise<void>;
   markRead?(to: string, messageIds: string[]): Promise<void>;
@@ -89,6 +87,10 @@ export const WHATSAPP: ChannelInfo = {
   replies: true,
   buttons: { max: 3, labelMax: 20 },
   lists: { maxRows: 10, titleMax: 24, buttonMax: 20 },
+  // An interactive cta_url message: one URL button, its label up to 20 characters.
+  linkButton: { labelMax: 20 },
+  // An image's caption is at most 1,024 characters (as is an interactive message's body).
+  images: { captionMax: 1024 },
   readReceipts: true,
   replyWindowHours: 24,
 };
@@ -96,7 +98,7 @@ export const WHATSAPP: ChannelInfo = {
 /** SMS: plain text; providers join up to 10 segments into one text (1,530 GSM-7 characters). */
 export const SMS: ChannelInfo = { reactions: false, status: false, formatting: "plain", maxLength: 1530 };
 
-export type WhatsAppFeature = "buttons" | "lists" | "replies" | "reactions" | "typing" | "readReceipts" | "templates";
+export type WhatsAppFeature = "buttons" | "lists" | "links" | "images" | "replies" | "reactions" | "typing" | "readReceipts" | "templates";
 
 export function whatsapp(provider: WhatsAppProvider, options: { name?: string; disable?: WhatsAppFeature[]; instructions?: string } = {}): Channel {
   const off = new Set(options.disable ?? []);
@@ -109,6 +111,8 @@ export function whatsapp(provider: WhatsAppProvider, options: { name?: string; d
     replies: has("replies", f.replies !== false),
     buttons: has("buttons", f.buttons !== false) ? WHATSAPP.buttons : undefined,
     lists: has("lists", f.lists !== false) ? WHATSAPP.lists : undefined,
+    linkButton: has("links", f.links !== false) ? WHATSAPP.linkButton : undefined,
+    images: has("images", f.images !== false) ? WHATSAPP.images : undefined,
   };
   return {
     name: options.name ?? "whatsapp",
@@ -126,9 +130,11 @@ export function whatsapp(provider: WhatsAppProvider, options: { name?: string; d
           return has("typing", true) ? provider.typing?.(to, outbound.on) : undefined;
         case "read":
           return info.readReceipts ? provider.markRead?.(to, outbound.messageIds) : undefined;
-        case "template":
+        case "template": {
           if (!provider.sendTemplate || off.has("templates")) throw new Error("this WhatsApp provider sends no templates");
-          return provider.sendTemplate(to, { name: outbound.name, language: outbound.language, variables: outbound.variables });
+          const { type: _type, ...template } = outbound;
+          return provider.sendTemplate(to, template);
+        }
         case "status":
           return;
       }
@@ -190,7 +196,90 @@ function message(outbound: Extract<Outbound, { type: "message" }>): Message {
     ...(outbound.replyTo ? { replyTo: outbound.replyTo } : {}),
     ...(outbound.buttons ? { buttons: outbound.buttons } : {}),
     ...(outbound.list ? { list: outbound.list } : {}),
+    ...(outbound.link ? { link: outbound.link } : {}),
+    ...(outbound.image ? { image: outbound.image } : {}),
   };
+}
+
+/**
+ * A message as this channel can show it: without a link button the link's URL goes on a line after
+ * the text, and without images the text goes alone. So a provider only gets what it declared.
+ */
+export function fitMessage<M extends { text: string; link?: { label: string; url: string }; image?: { url: string } }>(info: ChannelInfo, message: M): M {
+  const { link, image, ...rest } = message;
+  return {
+    ...rest,
+    ...(link && !info.linkButton ? { text: `${message.text}\n${link.url}` } : {}),
+    ...(link && info.linkButton ? { link } : {}),
+    ...(image && info.images ? { image } : {}),
+  } as M;
+}
+
+/** A declared template filled with the values of one send: what the person sees. */
+export interface FilledTemplate {
+  header?: { kind: "text"; text: string } | { kind: "image" | "video" | "document"; url?: string; fileId?: string };
+  body: string;
+  footer?: string;
+  /** A quick reply's tap comes back with its payload (its text when the send gave none). */
+  buttons: Array<{ type: "quick_reply"; text: string; payload: string } | { type: "url"; text: string; url: string } | { type: "phone"; text: string; phone: string }>;
+}
+
+/**
+ * A declared template filled with one send's values. Throws, saying what is wrong, when the values
+ * don't fit it (Meta would refuse the send): a missing or extra body value, header value or button
+ * value.
+ */
+export function fillTemplate(definition: TemplateDefinition, template: Template): FilledTemplate {
+  const fail = (problem: string): never => {
+    throw new Error(`chinwag: template "${definition.name}" (${definition.language}) ${problem}`);
+  };
+  if (template.body && template.variables) fail("got both body and variables: give one");
+  const values = template.body ?? numbered(template.variables);
+  const wanted = new Set([...definition.body.matchAll(/\{\{(\d+)\}\}/g)].map((m) => m[1])).size;
+  if (values.length !== wanted) fail(`takes ${wanted} body value${wanted === 1 ? "" : "s"}, got ${values.length}`);
+  const body = definition.body.replace(/\{\{(\d+)\}\}/g, (_m, n: string) => values[Number(n) - 1] ?? "");
+
+  const shape = definition.header;
+  const given = template.header;
+  let header: FilledTemplate["header"];
+  if (shape?.kind === "text" && shape.text.includes("{{1}}")) {
+    if (given?.kind !== "text") fail("takes a text value for its header");
+    header = { kind: "text", text: shape.text.replace("{{1}}", (given as { text: string }).text) };
+  } else if (shape && shape.kind !== "text") {
+    if (given?.kind !== shape.kind || !(given.url || given.fileId)) fail(`takes a ${shape.kind} for its header, by url or fileId`);
+    header = given;
+  } else {
+    if (given) fail("takes no header value");
+    header = shape;
+  }
+
+  const buttonValues = new Map((template.buttons ?? []).map((b) => [b.index, b.value]));
+  for (const index of buttonValues.keys()) {
+    const button = definition.buttons?.[index];
+    if (!button || button.type === "phone" || (button.type === "url" && !button.url.endsWith("{{1}}"))) fail(`takes no value for button ${index}`);
+  }
+  const buttons = (definition.buttons ?? []).map((button, index): FilledTemplate["buttons"][number] => {
+    const value = buttonValues.get(index);
+    if (button.type === "quick_reply") return { ...button, payload: value ?? button.text };
+    if (button.type === "url" && button.url.endsWith("{{1}}")) {
+      if (value === undefined) fail(`takes the end of button ${index}'s URL ("${button.text}")`);
+      return { ...button, url: button.url.slice(0, -5) + value };
+    }
+    return button;
+  });
+  return { ...(header ? { header } : {}), body, ...(definition.footer ? { footer: definition.footer } : {}), buttons };
+}
+
+/** The declared template a send is of: by name, and by language when the send names one. */
+export function declaredTemplate(definitions: TemplateDefinition[] | undefined, template: Template): TemplateDefinition | undefined {
+  return definitions?.find((d) => d.name === template.name && (!template.language || d.language === template.language));
+}
+
+/** The older `variables` as body values: by number when every key is one, else in the order given. */
+function numbered(variables: Record<string, string> | undefined): string[] {
+  const entries = Object.entries(variables ?? {});
+  if (entries.every(([k]) => /^\d+$/.test(k))) entries.sort(([a], [b]) => Number(a) - Number(b));
+  return entries.map(([, v]) => v);
 }
 
 export function summarize(channel: Channel): ChannelSummary {

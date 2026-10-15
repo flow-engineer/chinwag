@@ -29,8 +29,8 @@ const runRows = async (db: Database) => (await db.query("SELECT outcome, reason 
 
 test("a schedule that comes due becomes a turn, and its message goes out", async () => {
   const h = await withSam();
-  await h.message("sms", SAM, "remind me in an hour to water the plants");
-  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Will do." }), call("schedule_message", { message: "remind them to water the plants", repeat: "once", in_minutes: 60 })));
+  await h.message("sms", SAM, "remind me in an hour to pick up my order");
+  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Will do." }), call("schedule_message", { message: "remind them their order is ready", repeat: "once", in_minutes: 60 })));
   const result = await h.nextCall(2);
   assert.match(last(result.request.messages).content, /"summary":"once, Mon 12 Oct 2026 13:00 \(New York time\)"/);
   result.answer(respond());
@@ -39,16 +39,16 @@ test("a schedule that comes due becomes a turn, and its message goes out", async
   h.clock.now += 61 * 60_000;
   assert.equal(await h.agent.runDue(), 1);
   const turn = await h.nextCall(3);
-  assert.match(last(turn.request.messages).content, /^\[Scheduled message, not from the person: .* Do it now: remind them to water the plants\]/);
-  turn.answer(respond(call("send_sms", { text: "Time to water the plants!" })));
+  assert.match(last(turn.request.messages).content, /^\[Scheduled message, not from the person: .* Do it now: remind them their order is ready\]/);
+  turn.answer(respond(call("send_sms", { text: "Your order is ready!" })));
   await h.conversation.whenIdle();
-  assert.deepEqual(h.texts("sms").at(-1), "Time to water the plants!");
+  assert.deepEqual(h.texts("sms").at(-1), "Your order is ready!");
   assert.deepEqual(await runRows(h.db), [{ outcome: "sent", reason: null }]);
   assert.equal(await h.agent.runDue(), 0, "a once is done");
 });
 
 test("two runners claim a due run only once", async () => {
-  const path = join(mkdtempSync(join(tmpdir(), "parley-db-")), "parley.db");
+  const path = join(mkdtempSync(join(tmpdir(), "chinwag-db-")), "chinwag.db");
   const h = await withSam(sqlite(path));
   await h.store.addSchedule({ id: "s1", conversationId: h.conversationId, channel: "sms", instruction: "check in", fixedText: false, mode: "message", rule: { repeat: "daily", time: "11:00" }, timeZone: "America/New_York", nextRunAt: NOON_NY - 60_000, maxRuns: null, endsOn: null, origin: "person" });
   const other = multi({ channels: CHANNELS, database: sqlite(path), now: () => h.clock.now, dir: h.dir });
