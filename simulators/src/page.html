@@ -733,6 +733,7 @@
   }
 
   function showLine(line, live) {
+    document.querySelector("#thread .empty")?.remove();
     if (line.kind === "tool") { addTool(line); return; }
     if (line.kind === "in") { addMessage(line); startTurn(line.text, line.at); }
     else if (line.kind === "out") { addMessage(line); if (!line.carrier) onSeen("message", line.at); }
@@ -797,6 +798,12 @@
     const { lines, seq } = await (await fetch(BASE + "/api/transcript" + query())).json();
     if (mine !== opened) return;
     for (const l of lines) showLine(l, false);
+    if (!lines.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "This channel has no messages yet.";
+      $("thread").appendChild(empty);
+    }
     lastSeq = seq;
     if (polling) { poll(mine); return; }
     let heard = false;

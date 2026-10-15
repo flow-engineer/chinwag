@@ -177,28 +177,47 @@ function only(files: ReturnType<typeof loadSuite>) {
   return kept;
 }
 
-const summary = await runInCloud({
-  cloud: values.cloud!,
-  name,
-  title,
-  ...agent,
-  files: forUrl(only(loadSuite(join(dir, "tests")))),
-  testsDir: join(dir, "tests"),
-  runs: Number(values.runs),
-  openHeaders,
-});
+let summary: Awaited<ReturnType<typeof runInCloud>>;
+try {
+  summary = await runInCloud({
+    cloud: values.cloud!,
+    name,
+    title,
+    ...agent,
+    files: forUrl(only(loadSuite(join(dir, "tests")))),
+    testsDir: join(dir, "tests"),
+    runs: Number(values.runs),
+    openHeaders,
+  });
+} catch (error) {
+  const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+  const message = error instanceof Error ? error.message : String(error);
+  if (code === "ECONNREFUSED" || message.includes("ECONNREFUSED")) {
+    const cloud = values.cloud ?? "";
+    let host = "";
+    try { host = new URL(cloud).hostname; } catch { /* the address was not a URL */ }
+    console.error(host === "localhost" || host === "127.0.0.1"
+      ? "No local cloud is listening. Set CHINWAG_CLOUD or pass --cloud."
+      : `Could not connect to ${cloud}.`);
+    process.exit(1);
+  }
+  throw error;
+}
 
 const usd = (n: number) => `$${n.toFixed(4)}`;
 console.log("");
 for (const r of summary.runs) {
-  console.log(`${r.passed ? "PASS" : "FAIL"}  ${r.scenario} #${r.run} (${r.channel}): ${r.turns} turns, ended: ${r.ended}; slowest acknowledgement ${r.slowestAckMs === null ? "never" : `${r.slowestAckMs} ms`}; cost ${usd(r.agentUsage.costUsd)} agent + ${usd(r.testUsage.costUsd)} test`);
+  const gaveUp = r.passed && r.ended === "gave_up" ? " (passed, the person gave up)" : "";
+  console.log(`${r.passed ? "PASS" : "FAIL"}  ${r.scenario} #${r.run} (${r.channel}): ${r.turns} turns, ended: ${r.ended}${gaveUp}; slowest acknowledgement ${r.slowestAckMs === null ? "never" : `${r.slowestAckMs} ms`}; cost ${usd(r.agentUsage.costUsd)} agent + ${usd(r.testUsage.costUsd)} test`);
   for (const c of r.checks.filter((c) => !c.pass)) console.log(`      ✗ ${c.kind}: ${c.text}\n        ${c.reason}`);
   console.log(`      watch: ${r.watch}`);
 }
 const passed = summary.runs.filter((r) => r.passed).length;
 const total = (pick: (r: (typeof summary.runs)[number]) => number) => summary.runs.reduce((n, r) => n + pick(r), 0);
 const agentModels = [...new Set(summary.runs.flatMap((r) => r.agentModels))].join(", ") || "unknown";
-console.log(`\n${passed} of ${summary.runs.length} runs passed. Agent: ${agentModels}; person, tools and judge: ${summary.testModel}.`);
+const noModel = summary.runs.filter((r) => r.agentModels.length === 0 && r.agentUsage.input + r.agentUsage.output === 0).length;
+const checkFails = summary.runs.filter((r) => r.checks.some((c) => !c.pass)).length;
+console.log(`\n${passed} of ${summary.runs.length} runs passed. ${noModel} received no agent model call. ${checkFails} failed a check. Agent: ${agentModels}; person, tools and judge: ${summary.testModel}.`);
 for (const channel of [...new Set(summary.runs.map((r) => r.channel))]) {
   const runs = summary.runs.filter((r) => r.channel === channel);
   console.log(`  ${channel}: ${runs.filter((r) => r.passed).length} of ${runs.length} passed`);

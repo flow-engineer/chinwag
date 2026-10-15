@@ -86,6 +86,8 @@ export interface Traces {
   flush(): Promise<void>;
 }
 
+let warnedMetadataOnly = false;
+
 export function traces(options: TracesOptions, agent: { service: string; kindOf(channel: string): string | undefined }): Traces {
   const base = (options.url ?? "").replace(/\/+$/, "");
   if (!options.key) throw new Error("chinwag: traces need a key");
@@ -93,6 +95,10 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
   if (!allowedUrl(base)) throw new Error("chinwag: traces go over https (http only to this machine)");
   const endpoint = `${base}/v1/traces`;
   const content = options.content === true;
+  if (!content && !warnedMetadataOnly) {
+    warnedMetadataOnly = true;
+    console.warn("chinwag: traces are metadata only. Set CHINWAG_TRACES_CONTENT=1 to send what was written.");
+  }
   const open = new Map<string, Turn>();
   /** Messages and background results that came while no turn was open: they join the next one. */
   const waiting = new Map<string, { inbound: Inbound[]; spans: Array<(turn: Turn) => Span> }>();
