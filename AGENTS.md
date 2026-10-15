@@ -7,13 +7,14 @@ Telegram or a web or app chat, that feel like a person texting back.
 - Nothing specific to one business goes in this repository: no customer names, data, prompts
   or business rules. Agents built on Chinwag live in their own repositories and depend on it;
   Chinwag never imports from outside this repository.
+- Internal decisions are kept privately, not in this repository.
 
 ## Be deliberate: nothing goes in that has not earned its place
 - Every file, function, dependency and test must have a reason. No speculative code, helpers
   "for later", extra options, or files nobody asked for.
 - Propose a design choice (behaviour, defaults, models, prompts, dependencies, file layout) with
   a recommendation before writing code that depends on it.
-- No new dependency without agreement.
+- A new dependency or a new file needs a maintainer's yes.
 - Remove what stops being used (scripts, options, tests) in the same change.
 
 ## Tests
