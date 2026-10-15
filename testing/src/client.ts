@@ -2,6 +2,7 @@
 // own model and key; its tools are replaced by calls the cloud simulates, its replies go to the
 // cloud's platform simulators, and the person's messages arrive over one stream.
 
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
@@ -36,6 +37,8 @@ export interface ConnectOptions {
   postTimeoutMs?: number;
   /** How long the stream may sit with no bytes, including the cloud's 15s ping. Default 45s. */
   streamIdleMs?: number;
+  /** How long to keep retrying one call. Default about 30s. */
+  retryBudgetMs?: number;
 }
 
 /** The tunnel, the stream, or the connection failed after the session opened. `runs` are the ones already received. The CLI prints them and exits 2. */
@@ -50,7 +53,7 @@ export class SessionStopped extends Error {
   }
 }
 
-/** A POST that sat until its own deadline. It fails that one call. It is not sent again: the cloud may already have done the work. The session abort is not one of these. */
+/** A POST that sat until its own deadline. It fails that one call. Only a cloud that stores keys sends it again. The session abort is not one of these. */
 export class TimeoutError extends Error {
   constructor() {
     super("timed out");
@@ -68,6 +71,8 @@ export class StreamLost extends Error {
 
 const POST_TIMEOUT_MS = 30_000;
 const STREAM_IDLE_MS = 45_000;
+/** Backoff between tries of one call, not the time a single try may sit. */
+export const RETRY_BUDGET_MS = 30_000;
 /** The cloud abandons one model attempt at 90s and tries a timeout once more, then this POST has its 30s. */
 export const CLOUD_MODEL_BUDGET_MS = 90_000 * 2 + POST_TIMEOUT_MS;
 
@@ -161,6 +166,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   const log = options.log ?? ((line: string) => console.log(line));
   const postTimeoutMs = options.postTimeoutMs ?? POST_TIMEOUT_MS;
   const streamIdleMs = options.streamIdleMs ?? STREAM_IDLE_MS;
+  const retryBudgetMs = options.retryBudgetMs ?? RETRY_BUDGET_MS;
+  let idempotent = false;
   const base = options.cloud.replace(/\/$/, "");
 
   // The session's address is known once it opens; tools and events only use it after that.
@@ -200,7 +207,9 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     ...t,
     run: async (input: unknown, context: { conversationId: string }) => {
       const request: ToolCallRequest = { conversationId: context.conversationId, tool: t.name, input };
-      const result = await post<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal, undefined, toolWait.get(t.name) ?? postTimeoutMs);
+      const result = await postRetry<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal, log, toolWait.get(t.name) ?? postTimeoutMs, {
+        mode: idempotent ? "idempotent" : "never", key: `tool:${randomUUID()}`, budgetMs: retryBudgetMs, what: "tool call",
+      });
       if (!result.ok) throw new Error(result.error);
       return result.output;
     },
@@ -210,6 +219,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   const queued: Array<{ json: string; bytes: number; at: number }> = [];
   let flushing: Promise<void> | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let eventSeq = 0;
   const flush = async () => {
     while (queued.length) {
       let bytes = Buffer.byteLength('{"events":[]}');
@@ -222,13 +232,18 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       }
       if (!count) throw new Error("one event exceeds the 5MB upload limit");
       const batch = queued.slice(0, count);
+      const seq = ++eventSeq;
       const started = Date.now();
       const wait = started - batch[0].at;
       let failed = false;
       try {
-        await post(`${session}/events`, undefined, auth, controller.signal, `{"events":[${batch.map((e) => e.json).join(",")}]}`, postTimeoutMs);
-        // Keep the batch until acknowledged. An ambiguous failure ends the session, never retries
-        // lifecycle events which the cloud might already have applied.
+        await postRetry(`${session}/events`, undefined, auth, controller.signal, log, postTimeoutMs, {
+          mode: idempotent ? "idempotent" : "never",
+          key: `events:${seq}`,
+          serialized: `{"seq":${seq},"events":[${batch.map((e) => e.json).join(",")}]}`,
+          budgetMs: retryBudgetMs,
+          what: "event upload",
+        });
         queued.splice(0, count);
       } catch (error) {
         const closed = error instanceof PostError && error.status === 409 && error.code === "session_closed";
@@ -239,7 +254,9 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
           continue;
         }
         failed = true;
-        throw new Error("event upload failed; acceptance unknown, not retried", { cause: error });
+        // An older cloud does not store the key, so a retry might apply the batch twice.
+        const again = idempotent ? "retried" : "not retried";
+        throw new Error(`event upload failed; acceptance unknown, ${again}`, { cause: error });
       } finally {
         const roundtrip = Date.now() - started;
         if (failed || roundtrip >= 1_000 || wait >= 1_000) {
@@ -270,13 +287,22 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     files: options.files.map(({ path, hash }) => ({ path, hash })),
     runs: options.runs ?? 1,
     deliveryReceipts: true,
+    retries: true,
   };
   const opened = await post<Opened>(`${base}/api/sessions`, open, options.openHeaders, controller.signal, undefined, postTimeoutMs);
+  idempotent = opened.idempotency === true;
   const tunnel = tunnelBase(base, opened);
   auth = { authorization: `Bearer ${opened.token}` };
   const missing = new Set(opened.missing);
   const uploads = options.files.filter((f) => missing.has(f.hash));
-  if (uploads.length) await post(`${tunnel}/api/files`, { files: uploads }, auth, controller.signal, undefined, postTimeoutMs);
+  if (uploads.length) {
+    await postRetry(`${tunnel}/api/files`, { files: uploads }, auth, controller.signal, log, postTimeoutMs, {
+      mode: idempotent ? "idempotent" : "never",
+      key: `files:${createHash("sha256").update(uploads.map((file) => file.hash).join("\n")).digest("hex")}`,
+      budgetMs: retryBudgetMs,
+      what: "file upload",
+    });
+  }
   log(`Session ${opened.sessionId}: suite ${suiteHash(options.files).slice(0, 12)}, ${options.files.length} files (${uploads.length} uploaded).`);
   dashboard = opened.dashboard;
   options.onDashboard?.(dashboard);
@@ -337,8 +363,15 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
         const deliveries: Promise<unknown>[] = [];
         // Not async: register the promise during receive(), before its fire-and-forget
         // interceptor returns null. Each command owns its deliveries, even in a burst.
+        let outboundIndex = 0;
         const deliver = (outbound: Outbound): Promise<void> => {
-          const delivery = postOutbound(`${session}/outbound`, { conversationId: command.conversationId, outbound }, auth, controller.signal, log, postTimeoutMs).then(() => {});
+          const index = outboundIndex++;
+          const delivery = postRetry(`${session}/outbound`, { conversationId: command.conversationId, outbound }, auth, controller.signal, log, postTimeoutMs, {
+            mode: idempotent ? "idempotent" : "outbound",
+            key: `outbound:${command.conversationId}:${command.messageId}:${index}`,
+            budgetMs: retryBudgetMs,
+            what: "outbound delivery",
+          }).then(() => {});
           deliveries.push(delivery);
           // Keep the rejection for the normal conversation's delivery recovery, but
           // attach a handler immediately for fire-and-forget interceptor sends too.
@@ -364,7 +397,12 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
         }
         receiveFails = 0;
         const receipt: Receipt = { conversationId: command.conversationId, messageId: command.messageId, status: taken === null ? "intercepted" : "taken" };
-        const sendReceipt = () => post(`${session}/receipts`, receipt, auth, controller.signal, undefined, postTimeoutMs);
+        const sendReceipt = () => postRetry(`${session}/receipts`, receipt, auth, controller.signal, log, postTimeoutMs, {
+          mode: idempotent ? "idempotent" : "never",
+          key: `receipt:${receipt.conversationId}:${receipt.messageId}`,
+          budgetMs: retryBudgetMs,
+          what: "delivery receipt",
+        });
         // An intercepted reply waits until its outbound bodies land. A tunnel blip on one of them
         // is not a receipt failure: this run can time out, and the later runs still play. A real
         // refusal still ends the session, the same as a receipt the tunnel rejected.
@@ -382,7 +420,12 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
         draining = true;
         pauseIdle();
         await drainWork();
-        await post(`${session}/drained`, {}, auth, controller.signal, undefined, postTimeoutMs);
+        await postRetry(`${session}/drained`, {}, auth, controller.signal, log, postTimeoutMs, {
+          mode: idempotent ? "idempotent" : "never",
+          key: `drained:${opened.sessionId}`,
+          budgetMs: retryBudgetMs,
+          what: "drained",
+        });
         drained = true;
         arm();
       } else if (command.type === "finished") {
@@ -432,15 +475,17 @@ function openStream(url: string, headers: Record<string, string>, signal: AbortS
 class PostError extends Error {
   readonly status: number;
   readonly code?: string;
-  constructor(url: string, status: number, text: string, code?: string) {
+  readonly retryAfterMs?: number;
+  constructor(url: string, status: number, text: string, code?: string, retryAfterMs?: number) {
     super(`${url}: ${status} ${shown(text)}`);
     this.status = status;
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
 /** This call can be dropped and the session continues: a frontend page with no JSON, a
- * timeout, or a connection that died. A timeout or a reset is not sent again. */
+ * timeout, or a connection that died. */
 function unavailable(error: unknown): boolean {
   if (error instanceof TimeoutError) return true;
   if (error instanceof PostError) return !error.code && (error.status === 502 || error.status === 503 || error.status === 504);
@@ -478,9 +523,6 @@ function shown(text: string): string {
   return plain.slice(0, 180);
 }
 
-const OUTBOUND_TRIES = 3;
-const OUTBOUND_WAIT_MS = [200, 500];
-
 function pause(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
@@ -490,27 +532,58 @@ function pause(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** One outbound. A 502, 503 or 504 with no JSON, or a failure before connecting, is tried again.
- * The Google frontend's HTML 503 means the instance was down and the body never arrived. A
- * timeout, a reset, or a JSON error is not tried again. */
-async function postOutbound(url: string, body: unknown, headers: Record<string, string>, signal: AbortSignal | undefined, log: (line: string) => void, timeoutMs: number): Promise<void> {
-  for (let attempt = 0; attempt < OUTBOUND_TRIES; attempt++) {
+type RetryMode = "never" | "outbound" | "idempotent";
+
+/** Whether this failure may be sent again. A JSON refusal never is. An older cloud retries an
+ * outbound only when the body cannot have arrived. A cloud that stores keys also retries a
+ * timeout, a reset, a 429, and its own 503 unavailable. */
+function retryable(error: unknown, mode: RetryMode): boolean {
+  if (mode === "never") return false;
+  if (mode === "outbound") return retryableOutbound(error);
+  if (error instanceof TimeoutError) return true;
+  if (error instanceof PostError) {
+    if (error.status === 429) return true;
+    if (error.status === 503 && error.code === "unavailable") return true;
+    return !error.code && (error.status === 502 || error.status === 503 || error.status === 504);
+  }
+  if (!(error instanceof Error) || error.name === "AbortError") return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ECONNRESET" || code === "ECONNREFUSED" || code === "EPIPE" || code === "ETIMEDOUT" || code === "EAI_AGAIN" || code === "ENOTFOUND" || error.message === "socket hang up";
+}
+
+function retryStatus(error: unknown): string {
+  if (error instanceof PostError) return String(error.status);
+  if (error instanceof TimeoutError) return "timed out";
+  return "no response";
+}
+
+/** Wait between tries: Retry-After when the cloud set one, otherwise exponential with jitter. */
+function retryWaitMs(attempt: number, error: unknown): number {
+  if (error instanceof PostError && error.retryAfterMs !== undefined) return error.retryAfterMs;
+  const base = 200 * 2 ** attempt;
+  return base + Math.random() * base * 0.2;
+}
+
+/** One call, sent again until the budget when that is safe. The same Idempotency-Key goes on every try. */
+async function postRetry<T>(url: string, body: unknown, headers: Record<string, string>, signal: AbortSignal | undefined, log: (line: string) => void, timeoutMs: number, options: { mode: RetryMode; key: string; budgetMs: number; what: string; serialized?: string }): Promise<T> {
+  const started = Date.now();
+  let attempt = 0;
+  const headersWithKey = { ...headers, "idempotency-key": options.key };
+  for (;;) {
     try {
-      await post(url, body, headers, signal, undefined, timeoutMs);
-      return;
+      return await post<T>(url, body, headersWithKey, signal, options.serialized, timeoutMs);
     } catch (error) {
-      const again = attempt < OUTBOUND_TRIES - 1 && retryableOutbound(error);
-      if (!again) {
-        if (retryableOutbound(error)) log(`outbound delivery failed after ${OUTBOUND_TRIES} tries`);
-        else if (unavailable(error)) {
-          const status = error instanceof PostError ? String(error.status) : error instanceof TimeoutError ? "timed out" : "no response";
-          log(`outbound delivery failed (${status})`);
-        }
+      const again = retryable(error, options.mode);
+      const elapsed = Date.now() - started;
+      const wait = again ? retryWaitMs(attempt, error) : 0;
+      if (!again || elapsed + wait >= options.budgetMs) {
+        if (again) log(`${options.what} failed after ${attempt + 1} tries`);
+        else if (options.mode !== "never" && unavailable(error)) log(`${options.what} failed (${retryStatus(error)})`);
         throw error;
       }
-      const status = error instanceof PostError ? String(error.status) : "no response";
-      log(`outbound delivery unavailable (${status}), trying again`);
-      await pause(OUTBOUND_WAIT_MS[attempt] ?? 500, signal);
+      log(`${options.what} unavailable (${retryStatus(error)}), trying again`);
+      await pause(wait, signal);
+      attempt++;
     }
   }
 }
@@ -521,14 +594,14 @@ async function postOutbound(url: string, body: unknown, headers: Record<string, 
 const httpPosts = new HttpAgent({ keepAlive: true });
 const httpsPosts = new HttpsAgent({ keepAlive: true });
 
-function requestOnce(url: string, payload: string, headers: Record<string, string>, signal: AbortSignal | undefined, timeoutMs: number): Promise<{ status: number; text: string }> {
+function requestOnce(url: string, payload: string, headers: Record<string, string>, signal: AbortSignal | undefined, timeoutMs: number): Promise<{ status: number; text: string; headers: Record<string, string> }> {
   const secure = url.startsWith("https:");
   const request = secure ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;
-    const finish = (error?: Error, result?: { status: number; text: string }) => {
+    const finish = (error?: Error, result?: { status: number; text: string; headers: Record<string, string> }) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
@@ -545,7 +618,7 @@ function requestOnce(url: string, payload: string, headers: Record<string, strin
       response.on("error", finish);
       response.on("aborted", () => finish(new Error("The request was aborted")));
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
-      response.on("end", () => finish(undefined, { status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
+      response.on("end", () => finish(undefined, { status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8"), headers: flatHeaders(response.headers) }));
     });
     timer = setTimeout(() => { finish(new TimeoutError()); req.destroy(); }, timeoutMs);
     if (signal) {
@@ -562,13 +635,32 @@ function abortError(signal: AbortSignal): Error {
   return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
 }
 
+function flatHeaders(headers: IncomingMessage["headers"]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value === "string") out[name] = value;
+    else if (Array.isArray(value)) out[name] = value.join(", ");
+  }
+  return out;
+}
+
+function retryAfterOf(headers: Record<string, string>): number | undefined {
+  const value = headers["retry-after"];
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const date = Date.parse(value);
+  if (Number.isNaN(date)) return undefined;
+  return Math.max(0, date - Date.now());
+}
+
 async function post<T = unknown>(url: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal, serialized?: string, timeoutMs = POST_TIMEOUT_MS): Promise<T> {
   const payload = serialized ?? JSON.stringify(body ?? {});
-  const { status, text } = await requestOnce(url, payload, headers, signal, postBudgetMs(timeoutMs, Buffer.byteLength(payload)));
+  const { status, text, headers: responseHeaders } = await requestOnce(url, payload, headers, signal, postBudgetMs(timeoutMs, Buffer.byteLength(payload)));
   if (status < 200 || status >= 300) {
     let code: string | undefined;
     try { code = JSON.parse(text).error; } catch { /* the body was not JSON */ }
-    throw new PostError(url, status, text, code);
+    throw new PostError(url, status, text, code, retryAfterOf(responseHeaders));
   }
   return (text ? JSON.parse(text) : {}) as T;
 }
