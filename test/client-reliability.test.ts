@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z, type Tool } from "../src/index.ts";
-import { postBudgetMs, runInCloud, SessionStopped, TimeoutError, toolTimeoutMs } from "../testing/src/client.ts";
+import { CLOUD_MODEL_BUDGET_MS, postBudgetMs, runInCloud, SessionStopped, TimeoutError, toolTimeoutMs } from "../testing/src/client.ts";
 import type { Command } from "../testing/src/protocol.ts";
 import { rollFault, startFaultProxy } from "./fault-proxy.ts";
 
@@ -81,8 +81,9 @@ test("a thrown receive, a bad frame and an unreadable attachment leave the sessi
 
 test("a tool call waits out the simulator's latency, then the POST budget, and a timeout is a timeout", { timeout: 10_000 }, async () => {
   const slow = "tool: lookup\nresponses:\n  - { when: slow, latency_ms: 11000 }\n  - { when: ok, latency_ms: 400 }\n";
-    assert.equal(toolTimeoutMs([{ path: "tools/lookup.yaml", hash: "h", content: slow }], "lookup", 30_000), 41_000);
-  assert.equal(toolTimeoutMs([], "lookup", 30_000), 90_000);
+  assert.equal(CLOUD_MODEL_BUDGET_MS, 210_000);
+  assert.equal(toolTimeoutMs([{ path: "tools/lookup.yaml", hash: "h", content: slow }], "lookup"), 11_000 + CLOUD_MODEL_BUDGET_MS);
+  assert.equal(toolTimeoutMs([], "lookup"), 60_000 + CLOUD_MODEL_BUDGET_MS);
   assert.equal(postBudgetMs(30_000, 5_000_000), 80_000);
   assert.equal(postBudgetMs(30_000, 99_999), 30_000);
   let timed: unknown;

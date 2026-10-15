@@ -32,7 +32,7 @@ export interface ConnectOptions {
   onRun?: (run: RunSummary) => void;
   /** Called once the session has a dashboard link. */
   onDashboard?: (url: string) => void;
-  /** How long one POST waits before the size allowance. Default 30s, plus 1s per 100KB of body. Tool calls add the simulator's latency on top. */
+  /** How long one POST waits before the size allowance. Default 30s, plus 1s per 100KB of body. A tool call waits {@link CLOUD_MODEL_BUDGET_MS} plus the simulator's latency, unless this is set. */
   postTimeoutMs?: number;
   /** How long the stream may sit with no bytes, including the cloud's 15s ping. Default 45s. */
   streamIdleMs?: number;
@@ -58,14 +58,26 @@ export class TimeoutError extends Error {
   }
 }
 
-/** How long a tool call may take: the longest latency its suite file declares, plus the POST budget.
- * A tool with no file gets the simulator's own cap (60s) plus that budget.
+/** The stream stopped carrying bytes: the idle watch fired, or the cloud closed it before finished. */
+export class StreamLost extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StreamLost";
+  }
+}
+
+const POST_TIMEOUT_MS = 30_000;
+const STREAM_IDLE_MS = 45_000;
+/** The cloud abandons one model attempt at 90s and tries a timeout once more, then this POST has its 30s. */
+export const CLOUD_MODEL_BUDGET_MS = 90_000 * 2 + POST_TIMEOUT_MS;
+
+/** How long a tool call may take: the longest latency its suite file declares, plus {@link CLOUD_MODEL_BUDGET_MS} (210s).
+ * A tool with no file gets the simulator's own cap (60s) plus that 210s.
  *
- * The cloud asks its model before that latency, and the model's own time counts toward it. One
- * attempt is abandoned at 90s and a timeout is tried once more, so a stuck model can hold the
- * call for about 180s. This budget does not cover that. When it runs out, the agent sees an
- * error while the cloud may still record the call in the world log once the model returns. */
-export function toolTimeoutMs(files: SuiteFile[], tool: string, postTimeoutMs: number): number {
+ * The cloud asks its model before the declared latency, and the model's own time counts toward it.
+ * 210s is two 90s attempts plus the 30s POST budget, so a stuck model can finish before this POST gives up.
+ * When it runs out, the agent sees an error while the cloud may still record the call in the world log once the model returns. */
+export function toolTimeoutMs(files: SuiteFile[], tool: string, budgetMs = CLOUD_MODEL_BUDGET_MS): number {
   let declared = 0;
   let known = false;
   for (const file of files) {
@@ -77,7 +89,7 @@ export function toolTimeoutMs(files: SuiteFile[], tool: string, postTimeoutMs: n
       for (const response of parsed.responses) declared = Math.max(declared, response.latency_ms);
     } catch { /* the cloud refuses the file; the call still waits the simulator's cap */ }
   }
-  return postTimeoutMs + (known ? declared : 60_000);
+  return budgetMs + (known ? declared : 60_000);
 }
 
 /** The base budget plus 1s per 100KB, so a 5MB event batch or file upload is not cut off at 30s. */
@@ -145,9 +157,6 @@ function isLoopback(cloud: string): boolean {
   return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
-const POST_TIMEOUT_MS = 30_000;
-const STREAM_IDLE_MS = 45_000;
-
 export async function runInCloud(options: ConnectOptions): Promise<SessionSummary> {
   const log = options.log ?? ((line: string) => console.log(line));
   const postTimeoutMs = options.postTimeoutMs ?? POST_TIMEOUT_MS;
@@ -184,7 +193,9 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
 
   // Tools: same name, description and input; running one asks the cloud, which holds the request
   // until its simulator has answered and the chosen latency has passed.
-  const toolWait = new Map(options.tools.map((t) => [t.name, toolTimeoutMs(options.files, t.name, postTimeoutMs)]));
+  // 210s already includes the default POST budget. A session that sets its own uses that instead, so a test can still watch a timeout.
+  const toolBudget = options.postTimeoutMs == null ? CLOUD_MODEL_BUDGET_MS : postTimeoutMs;
+  const toolWait = new Map(options.tools.map((t) => [t.name, toolTimeoutMs(options.files, t.name, toolBudget)]));
   const tools: Tool[] = options.tools.map((t) => ({
     ...t,
     run: async (input: unknown, context: { conversationId: string }) => {
@@ -279,7 +290,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   // The cloud writes ": ping" every 15s. Three missed pings and the stream is dead.
   const arm = () => {
     if (idle) clearTimeout(idle);
-    idle = setTimeout(() => fail("the stream is dead", new Error(`no bytes for ${streamIdleMs / 1000}s`)), streamIdleMs);
+    idle = setTimeout(() => fail("the stream is dead", new StreamLost(`no bytes for ${streamIdleMs / 1000}s`)), streamIdleMs);
   };
   arm();
   let buffer = "";
@@ -383,7 +394,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       }
     }
   }
-  throw new Error("the cloud closed the stream before the session finished");
+  throw new StreamLost("the cloud closed the stream before the session finished");
   } catch (error) {
     if (error instanceof SessionStopped) throw error;
     const reason = failure ?? (error instanceof Error ? error : new Error(String(error)));
@@ -442,9 +453,8 @@ function unavailable(error: unknown): boolean {
 function isTransportFailure(error: unknown): boolean {
   let current: unknown = error;
   for (let guard = 0; current instanceof Error && guard < 6; guard++) {
-    if (current instanceof TimeoutError) return true;
+    if (current instanceof TimeoutError || current instanceof StreamLost) return true;
     if (current instanceof PostError) return !current.code && (current.status === 502 || current.status === 503 || current.status === 504);
-    if (/the stream is dead|the cloud closed the stream before the session finished/.test(current.message)) return true;
     if (/^could not open the stream \((502|503|504)\)$/.test(current.message)) return true;
     const code = (current as NodeJS.ErrnoException).code;
     if (code === "ECONNRESET" || code === "ECONNREFUSED" || code === "EPIPE" || code === "ETIMEDOUT" || code === "EAI_AGAIN" || code === "ENOTFOUND" || current.message === "socket hang up") return true;
