@@ -7,7 +7,7 @@ import type { ToolSpec } from "./types.ts";
 export interface ToolContext {
   conversationId: string;
   /**
-   * Who the person is, as Parley verified it: the owner's own key from `resolve`, a phone number
+   * Who the person is, as Chinwag verified it: the owner's own key from `resolve`, a phone number
    * the channel verified, or the channel and its address. Key a person's data by this, never by an
    * id the model passed.
    */

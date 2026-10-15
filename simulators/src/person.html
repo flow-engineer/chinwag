@@ -46,8 +46,8 @@
   const remember = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
   const recall = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
 
-  let person = params.get("person") || recall("parley.person");
-  let debug = recall("parley.debug") === "1";
+  let person = params.get("person") || recall("chinwag.person");
+  let debug = recall("chinwag.debug") === "1";
   let people = [];
   let channels = [];
 
@@ -56,7 +56,7 @@
   }
 
   function draw() {
-    remember("parley.person", person);
+    remember("chinwag.person", person);
     $("person").value = person;
     $("debug").setAttribute("aria-pressed", String(debug));
     const devices = $("devices");
@@ -75,7 +75,7 @@
   }
 
   $("person").addEventListener("change", () => { person = $("person").value; draw(); });
-  $("debug").addEventListener("click", () => { debug = !debug; remember("parley.debug", debug ? "1" : "0"); draw(); });
+  $("debug").addEventListener("click", () => { debug = !debug; remember("chinwag.debug", debug ? "1" : "0"); draw(); });
   $("clear").addEventListener("click", async () => {
     const who = people.find((p) => p.phone === person);
     if (!who || !confirm(`Forget ${who.name}? Their history, schedules and everything the agent kept about them go, on every channel.`)) return;

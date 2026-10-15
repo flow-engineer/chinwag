@@ -6,13 +6,16 @@
 //   GET  /api/sessions/:id/stream      server-sent Commands     the person's side, cloud → agent
 //   POST /api/sessions/:id/outbound    { conversationId, outbound } → { ok } | 409 { error }
 //   POST /api/sessions/:id/tool-calls  ToolCallRequest → ToolCallResult   held open while the tool is simulated
-//   POST /api/sessions/:id/events      { events: ParleyEvent[] }
+//   POST /api/sessions/:id/events      { events: ChinwagEvent[] }
+//   POST /api/sessions/:id/receipts    Receipt → { ok }
+//   POST /api/sessions/:id/drained     {} → { ok }   flush before the terminal command
 //
-// Calls after the first carry `authorization: Bearer <token>` from Opened.
+// The open goes to the cloud's front door; every later call goes to Opened.tunnel (else the same
+// address) and carries `authorization: Bearer <token>` from Opened.
 
-import type { ChannelInfo, ChannelSummary, Incoming, ToolSpec } from "../../src/index.ts";
+import type { Attachment, ChannelInfo, ChannelSummary, Incoming, ToolSpec } from "../../src/index.ts";
 
-/** One graded item of a run: an outcome against what the tools did, or a judged line against the transcript. */
+/** One graded expect item of a run. */
 export interface Check {
   kind: "outcome" | "judge";
   text: string;
@@ -20,7 +23,7 @@ export interface Check {
   reason: string;
 }
 
-/** Tokens and cost of a run's model calls. */
+/** Model tokens and their cost, added up over a run. */
 export interface Usage {
   input: number;
   output: number;
@@ -34,6 +37,14 @@ export interface OpenSession {
   files: Array<{ path: string; hash: string }>;
   /** How many times each scenario runs. */
   runs: number;
+  /** Acknowledge each message independently of the serial event uploads. */
+  deliveryReceipts?: boolean;
+}
+
+export interface Receipt {
+  conversationId: string;
+  messageId: string;
+  status: "taken" | "intercepted";
 }
 
 export interface Opened {
@@ -43,6 +54,9 @@ export interface Opened {
   missing: string[];
   /** Where to watch this session's runs. */
   dashboard: string;
+  /** The tunnel's absolute URL, where every later call goes (a hosted cloud's front door serves
+   * only the open). Absent or empty: the open's own address (a local cloud). */
+  tunnel?: string;
 }
 
 export interface UploadFile {
@@ -52,11 +66,18 @@ export interface UploadFile {
 }
 
 export type Command =
-  | { type: "message"; conversationId: string; messageId: string; incoming: Incoming; channel: ChannelInfo; channelName?: string }
+  | { type: "message"; conversationId: string; messageId: string; incoming: WireIncoming; channel: ChannelInfo; channelName?: string }
   | { type: "reaction"; conversationId: string; emoji: string; toText: string }
+  | { type: "drain" }
   | { type: "finished"; summary: SessionSummary }
   /** The session stopped before it finished; the CLI exits with this error. */
   | { type: "failed"; error: string };
+
+/**
+ * A person's message as it travels: a scenario's file goes by its path in the tests folder, and the
+ * agent's side reads it there, so the file never leaves the developer's machine.
+ */
+export type WireIncoming = Omit<Incoming, "attachments"> & { attachments?: Array<{ kind: Attachment["kind"]; file: string }> };
 
 export interface ToolCallRequest {
   conversationId: string;

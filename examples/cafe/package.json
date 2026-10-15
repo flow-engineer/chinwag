@@ -1,8 +1,8 @@
 {
-  "name": "parley-example-cafe",
+  "name": "chinwag-example-cafe",
   "version": "0.1.0",
   "private": true,
-  "description": "Pip, an ordering assistant for a café: Parley's first example agent.",
+  "description": "Pip, an ordering assistant for a café: Chinwag's first example agent.",
   "type": "module",
   "engines": {
     "node": ">=22.18"

@@ -52,7 +52,7 @@ test("plain text from the model is never shown, and the agent is reminded to rep
   h.send("c10", "hey");
   (await h.nextCall(0)).answer({ text: "Hello!", toolCalls: [] });
   const second = await h.nextCall(1);
-  assert.match(last(second.request.messages).content, /^\[Parley\] INTERNAL MESSAGE, not from them: your text above never reached them\. Reply with send_chat, without mentioning this note, that text or any delay\./);
+  assert.match(last(second.request.messages).content, /^\[Chinwag\] INTERNAL MESSAGE, not from them: your text above never reached them\. Reply with send_chat, without mentioning this note, that text or any delay\./);
   second.answer(respond(say("Hey! How can I help?")));
   await h.agent.conversation("c10")!.whenIdle();
   assert.deepEqual(h.sent(), ["Hey! How can I help?"]);

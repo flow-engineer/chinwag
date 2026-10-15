@@ -1,11 +1,11 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, tool, type Database, type TestPerson } from "../src/index.ts";
-import type { ChannelInfo, ChatMessage, Model, ModelRequest, ModelResponse, Outbound, ParleyEvent, ToolCall } from "../src/index.ts";
+import { createAgent, tool, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
+import type { ChannelInfo, ChannelKind, ChatMessage, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
 
 /**
- * A model the test drives: each call waits for the test to answer it. The step Parley adds after a
+ * A model the test drives: each call waits for the test to answer it. The step Chinwag adds after a
  * reply that was only delivered messages is answered with nothing, and counted in `followUps`,
  * unless `followUps: "manual"`: then it is a call like any other.
  */
@@ -61,10 +61,10 @@ export const respond = (...toolCalls: ToolCall[]): ModelResponse => ({ text: nul
 export const WEB: ChannelInfo = { reactions: true, status: true };
 
 export function harness(tools = [] as ReturnType<typeof tool>[], deadlineMs = 50, channel: ChannelInfo = WEB, followUps: "auto" | "manual" = "auto") {
-  const dir = mkdtempSync(join(tmpdir(), "parley-"));
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
   const scripted = scriptedModel({ followUps });
-  const events: ParleyEvent[] = [];
+  const events: ChinwagEvent[] = [];
   const agent = createAgent({ dir, model: scripted.model, tools, deadlineMs, partialAfterMs: 20, debounceMs: 0, events: [(e) => events.push(e)] });
   const out: Outbound[] = [];
   let fail: string | null = null;
@@ -96,7 +96,8 @@ export const WEB_APP: ChannelInfo = { reactions: true, status: true, formatting:
 
 /** An agent with real channels (by name), for one person across several of them. */
 export function multi(options: {
-  channels: Record<string, { info: ChannelInfo; phone?: boolean }>;
+  /** Each channel is custom unless it names its kind. */
+  channels: Record<string, { info: ChannelInfo; phone?: boolean; kind?: ChannelKind }>;
   tools?: ReturnType<typeof tool>[];
   database?: Database;
   resolve?: (identity: { channel: string; address: string }) => string | null;
@@ -104,11 +105,12 @@ export function multi(options: {
   timeZone?: string;
   dir?: string;
   testPeople?: TestPerson[];
+  templates?: TemplateDefinition[];
 }) {
-  const dir = options.dir ?? mkdtempSync(join(tmpdir(), "parley-"));
+  const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
   const scripted = scriptedModel();
-  const events: ParleyEvent[] = [];
+  const events: ChinwagEvent[] = [];
   const out: Array<{ channel: string; address: string; outbound: Outbound }> = [];
   const channels = Object.entries(options.channels).map(([name, c]) => ({
     name,
@@ -129,6 +131,7 @@ export function multi(options: {
     now: options.now,
     timeZone: options.timeZone,
     testPeople: options.testPeople,
+    templates: options.templates,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>

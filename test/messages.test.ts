@@ -7,17 +7,17 @@ import { WEB, WHATSAPP, call, harness, last, respond, say, users } from "./helpe
 
 test("the person's messages carry ids the agent can react to", async () => {
   const h = harness();
-  const id = h.send("c1", "table for 2 at 7pm");
+  const id = h.send("c1", "order 1042");
   assert.equal(id, "m1");
   const first = await h.nextCall(0);
-  assert.equal(users(first.request.messages).at(-1), "[m1] table for 2 at 7pm");
+  assert.equal(users(first.request.messages).at(-1), "[m1] order 1042");
   first.answer(respond(call("react", { message_id: "m1", emoji: "👍" })));
   await h.agent.conversation("c1")!.whenIdle();
   assert.deepEqual(h.out.filter((o) => o.type === "reaction"), [{ type: "reaction", emoji: "👍", messageId: "m1" }]);
 });
 
 test("after their message, a reply of only messages gets one more step, to act on what it said", async () => {
-  const plan = tool({ name: "get_plan", description: "", input: z.object({}), run: () => "soup of the day, then the pasta" });
+  const plan = tool({ name: "get_plan", description: "", input: z.object({}), run: () => "DASH, sodium under 1,500 mg" });
   const h = harness([plan], 50, WEB, "manual");
   h.send("c4", "send me my plan");
   (await h.nextCall(0)).answer(respond(say("Getting your plan."), say("One moment.")));
@@ -25,9 +25,9 @@ test("after their message, a reply of only messages gets one more step, to act o
   const results = followUp.request.messages.filter((m) => m.role === "tool").map((m) => (m as { content: string }).content);
   assert.deepEqual(results, Array(2).fill(JSON.stringify({ delivered: true, channel: "chat" })), "it sees its messages were delivered");
   followUp.answer(respond(call("get_plan")));
-  (await h.nextCall(2)).answer(respond(say("Your plan: soup of the day, then the pasta.")));
+  (await h.nextCall(2)).answer(respond(say("Your plan: DASH, sodium under 1,500 mg.")));
   await h.agent.conversation("c4")!.whenIdle();
-  assert.deepEqual(h.sent(), ["Getting your plan.", "One moment.", "Your plan: soup of the day, then the pasta."]);
+  assert.deepEqual(h.sent(), ["Getting your plan.", "One moment.", "Your plan: DASH, sodium under 1,500 mg."]);
   assert.equal(h.calls.length, 3, "one more step only: a second reply of only messages ends the turn");
 });
 
@@ -57,6 +57,32 @@ test("a message the channel refuses goes back to the agent to fix", async () => 
   await h.agent.conversation("w2")!.whenIdle();
   const sent = h.out.filter((o) => o.type === "message");
   assert.deepEqual(sent, [{ type: "message", text: "Pick one", buttons: ["Mon", "Tue", "Wed"] }]);
+});
+
+test("WhatsApp's rules for links and images go back to the agent to fix: no link with buttons, no image with a list, a caption's length, https only", async () => {
+  const h = harness([], 50, { ...WHATSAPP, linkButton: { labelMax: 20 }, images: { captionMax: 1024 } });
+  h.send("w3", "show me flats");
+  const link = { label: "Open in app", url: "https://example.com/l/7" };
+  const photo = { url: "https://example.com/flat.jpg" };
+  const rows = [{ id: "r1", title: "2 BHK" }];
+  (await h.nextCall(0)).answer(
+    respond(
+      call("send_chat", { text: "Pick one", link, buttons: ["Yes"] }),
+      call("send_chat", { text: "Pick one", image: photo, list: { button: "Flats", rows } }),
+      call("send_chat", { text: "x".repeat(1025), image: photo }),
+      call("send_chat", { text: "Here", image: { url: "http://example.com/flat.jpg" } }),
+    ),
+  );
+  const second = await h.nextCall(1);
+  const results = second.request.messages.filter((m) => m.role === "tool").map((m) => (m as { content: string }).content);
+  assert.equal(results.length, 4);
+  assert.match(results[0], /link cannot also have buttons or a list/);
+  assert.match(results[1], /image cannot also have a list/);
+  assert.match(results[2], /caption, at most 1024 characters/);
+  assert.match(results[3], /Not sent, fix and send again/);
+  second.answer(respond(call("send_chat", { text: "2 BHK, Indiranagar", image: photo, link })));
+  await h.agent.conversation("w3")!.whenIdle();
+  assert.deepEqual(h.out.filter((o) => o.type === "message"), [{ type: "message", text: "2 BHK, Indiranagar", image: photo, link }]);
 });
 
 test("a reaction from the person is noted for the next turn without starting one", async () => {

@@ -9,7 +9,7 @@ import { createAgent, sqlite, tool, type Outbound } from "../src/index.ts";
 import { SMS, call, gate, multi, respond, scriptedModel, users } from "./helpers.ts";
 
 const CHANNELS = { sms: { info: SMS, phone: true } };
-const file = () => join(mkdtempSync(join(tmpdir(), "parley-db-")), "parley.db");
+const file = () => join(mkdtempSync(join(tmpdir(), "chinwag-db-")), "chinwag.db");
 
 test("an agent started again on the same database carries on the conversation", async () => {
   const path = file();

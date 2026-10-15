@@ -1,0 +1,16 @@
+id: opening-hours
+title: Asks when the shop is open
+channels: [whatsapp]
+
+person:
+  persona: Alex, friendly, writes short messages.
+  goal: Find out when the shop is open today.
+
+opening:
+  - say: "hi, what time are you open today?"
+
+max_turns: 4
+
+expect:
+  judge:
+    - Alex is told the opening hours.
