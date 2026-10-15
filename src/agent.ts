@@ -184,7 +184,8 @@ export class Agent {
     this.now = options.now ?? Date.now;
     const tracing = options.traces ?? tracesFromEnv();
     this.traces = tracing ? traces(tracing, { service: options.id ?? "chinwag", kindOf: (name) => this.channelsByName.get(name)?.kind }) : null;
-    const emit = emitter([...(options.events ?? []), ...(this.traces ? [this.traces.sink] : [])]);
+    const sinks = [...(options.events ?? []), ...(this.traces ? [this.traces.sink] : [])];
+    const emit = emitter(sinks);
     if ((options.dir === undefined) === (options.files === undefined)) throw new Error("chinwag: give an agent exactly one of dir or files");
     const files = options.files ?? readAgentFolder(options.dir!);
     const skills = loadSkills(files);
@@ -199,6 +200,7 @@ export class Agent {
       specs: tools.map(toSpec),
       instructions: loadInstructions(files, skills, options.inlineSkills),
       context: options.context,
+      contextSinks: sinks.filter((sink) => sink.context === true),
       deadlineMs: options.deadlineMs ?? 60_000,
       partialAfterMs: options.partialAfterMs ?? 5_000,
       debounceMs: options.debounceMs ?? 300,

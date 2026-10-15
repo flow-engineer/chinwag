@@ -16,6 +16,7 @@ import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { cloudHeaders, runInCloud, type ConnectOptions } from "./client.ts";
+import { runPrinter } from "./print-run.ts";
 import { httpAgent } from "./http-agent.ts";
 import { newStandalone } from "./new.ts";
 import { loadSuite, parseScenario } from "./suite.ts";
@@ -177,6 +178,9 @@ function only(files: ReturnType<typeof loadSuite>) {
   return kept;
 }
 
+const usd = (n: number) => `$${n.toFixed(4)}`;
+const printRun = runPrinter();
+
 let summary: Awaited<ReturnType<typeof runInCloud>>;
 try {
   summary = await runInCloud({
@@ -188,6 +192,7 @@ try {
     testsDir: join(dir, "tests"),
     runs: Number(values.runs),
     openHeaders,
+    onRun: printRun,
   });
 } catch (error) {
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
@@ -204,14 +209,8 @@ try {
   throw error;
 }
 
-const usd = (n: number) => `$${n.toFixed(4)}`;
 console.log("");
-for (const r of summary.runs) {
-  const gaveUp = r.passed && r.ended === "gave_up" ? " (passed, the person gave up)" : "";
-  console.log(`${r.passed ? "PASS" : "FAIL"}  ${r.scenario} #${r.run} (${r.channel}): ${r.turns} turns, ended: ${r.ended}${gaveUp}; slowest acknowledgement ${r.slowestAckMs === null ? "never" : `${r.slowestAckMs} ms`}; cost ${usd(r.agentUsage.costUsd)} agent + ${usd(r.testUsage.costUsd)} test`);
-  for (const c of r.checks.filter((c) => !c.pass)) console.log(`      ✗ ${c.kind}: ${c.text}\n        ${c.reason}`);
-  console.log(`      watch: ${r.watch}`);
-}
+for (const r of summary.runs) printRun(r);
 const passed = summary.runs.filter((r) => r.passed).length;
 const total = (pick: (r: (typeof summary.runs)[number]) => number) => summary.runs.reduce((n, r) => n + pick(r), 0);
 const agentModels = [...new Set(summary.runs.flatMap((r) => r.agentModels))].join(", ") || "unknown";

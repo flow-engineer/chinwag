@@ -6,8 +6,10 @@ import { appendFileSync } from "node:fs";
 export interface ChinwagEvent {
   type:
     | "message.in"
+    | "message.arrived"
     | "message.out"
     | "turn.start"
+    | "turn.context"
     | "turn.end"
     | "model.call"
     | "model.restarted"
@@ -30,7 +32,11 @@ export interface ChinwagEvent {
   [detail: string]: unknown;
 }
 
-export type EventSink = (event: ChinwagEvent) => void;
+/** A place events go. `context` asks for `turn.context`; without it the person's record is not sent. */
+export interface EventSink {
+  (event: ChinwagEvent): void;
+  context?: boolean;
+}
 
 /** One JSON line per event, to a file. */
 export function jsonlSink(path: string): EventSink {
