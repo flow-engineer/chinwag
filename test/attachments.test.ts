@@ -73,6 +73,28 @@ test("a voice note is read as its transcript, and a message sent while it is tra
   await t.agent.conversation("c3")!.whenIdle();
 });
 
+test("a voice note reports that it arrived before its transcript is ready", async () => {
+  const transcribed = gate<string>();
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
+  writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
+  const scripted = scriptedModel();
+  const events: string[] = [];
+  const agent = createAgent({
+    dir,
+    model: scripted.model,
+    debounceMs: 0,
+    transcribe: () => transcribed.promise,
+    events: [(e) => events.push(e.type)],
+  });
+  agent.receive("c3b", { text: "", attachments: [file("audio", "audio/ogg", 40)] }, () => undefined);
+  assert.deepEqual(events, ["message.arrived"]);
+  transcribed.open("Friday");
+  const first = await scripted.nextCall(0);
+  assert.ok(events.indexOf("message.arrived") < events.indexOf("message.in"));
+  first.answer(respond(say("Friday.")));
+  await agent.conversation("c3b")!.whenIdle();
+});
+
 test("without transcribe, the agent is told a voice note came that it can't listen to", async () => {
   const t = agentWith();
   t.agent.receive("c4", { text: "", attachments: [file("audio", "audio/ogg", 40)] }, () => undefined);

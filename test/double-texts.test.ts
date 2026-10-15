@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
-import { createAgent, tool } from "../src/index.ts";
+import { createAgent, tool, type EventSink } from "../src/index.ts";
 import { call, gate, harness, last, respond, say, scriptedModel, users } from "./helpers.ts";
 
 test("a double text folds into the reply being written", async () => {
@@ -39,6 +39,48 @@ test("a double text that comes before the first model call (the turn still loadi
   assert.deepEqual(users(first.request.messages), ["[m1] hi", "[m2] can I move Thursday?"]);
   first.answer(respond(say("Hi! Sure, which day works?")));
   await agent.conversation("c9")!.whenIdle();
+});
+
+test("the context block is an event, so a judge can see what the agent was given", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
+  writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
+  const scripted = scriptedModel();
+  const events: Array<{ type: string; text?: unknown }> = [];
+  const sink: EventSink = (e) => events.push(e);
+  sink.context = true;
+  const agent = createAgent({
+    dir,
+    model: scripted.model,
+    debounceMs: 0,
+    context: () => "Name: Sam. Next: Thursday 10:00.",
+    events: [sink],
+  });
+  agent.receive("c1", "when is it?", () => undefined);
+  const first = await scripted.nextCall(0);
+  assert.match(String(first.request.system ?? ""), /Name: Sam/);
+  first.answer(respond(say("Thursday at 10.")));
+  await agent.conversation("c1")!.whenIdle();
+  assert.equal(events.find((e) => e.type === "turn.context")?.text, "Name: Sam. Next: Thursday 10:00.");
+});
+
+test("turn.context stays off unless a sink asks for it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
+  writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
+  const scripted = scriptedModel();
+  const events: string[] = [];
+  const agent = createAgent({
+    dir,
+    model: scripted.model,
+    debounceMs: 0,
+    context: () => "Name: Sam. Next: Thursday 10:00.",
+    events: [(e) => events.push(e.type)],
+  });
+  agent.receive("c1", "when is it?", () => undefined);
+  const first = await scripted.nextCall(0);
+  assert.match(String(first.request.system ?? ""), /Name: Sam/);
+  first.answer(respond(say("Thursday at 10.")));
+  await agent.conversation("c1")!.whenIdle();
+  assert.equal(events.includes("turn.context"), false);
 });
 
 test("a message sent while tools run is read at once: the tool moves to the background", async () => {

@@ -36,7 +36,7 @@
 import { Buffer } from "node:buffer";
 import type { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
-import type { Emit } from "./events.ts";
+import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
 import type { ConversationRow, InboxRow, StoreApi } from "./store.ts";
@@ -53,6 +53,8 @@ export interface ConversationSettings {
   instructions: string;
   /** Per-turn context for the system prompt (the person's profile, the time). */
   context?: (conversationId: string) => Promise<string> | string;
+  /** Sinks that asked for turn.context. Others, traces included, do not receive it. */
+  contextSinks: EventSink[];
   /** The longest a reply waits for a tool that sets no limit of its own. */
   deadlineMs: number;
   /** When one tool of a response is done and others still run this long after, the finished results go back. */
@@ -271,6 +273,9 @@ export class Conversation {
     const id = options.messageId ?? `m${++this.messageCount}`;
     this.messageIds.set(id, channel);
     void this.typing(true, channel);
+    // A file or voice note is read before message.in. Say the message arrived first, so a test
+    // run is not settled as silence while the transcript is still being made.
+    if (incoming.attachments?.length) this.settings.emit(this.id, "message.arrived", { messageId: id, channel });
     if (!incoming.attachments?.length && !this.preparing) {
       this.arrive(incoming, id, channel, options.messageId !== undefined, { marks: [], media: [] });
       return id;
@@ -616,6 +621,16 @@ export class Conversation {
       return;
     }
     const context = this.settings.context ? await this.settings.context(this.id) : "";
+    if (context.trim()) {
+      const event: ChinwagEvent = { type: "turn.context", conversationId: this.id, at: Date.now(), text: context };
+      for (const sink of this.settings.contextSinks) {
+        try {
+          sink(event);
+        } catch (error) {
+          console.warn("chinwag: an event sink failed:", error);
+        }
+      }
+    }
     const rules = rulesSection(await store.noContact(this.id, this.settings.now()), this.timeZone ?? this.settings.timeZone ?? "UTC");
     // A message that came while those loaded had no step to restart: it joins the first one.
     this.absorb();

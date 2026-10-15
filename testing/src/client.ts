@@ -7,7 +7,7 @@ import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { basename, relative, resolve } from "node:path";
 import { toSpec, type Agent, type Incoming, type EventSink, type Outbound, type ChinwagEvent, type Tool } from "../../src/index.ts";
-import type { Command, Opened, WireIncoming, OpenSession, Receipt, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
+import type { Command, Opened, WireIncoming, OpenSession, Receipt, RunSummary, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
 import { mimeOf, suiteHash, type SuiteFile } from "./suite.ts";
 
 export interface ConnectOptions {
@@ -28,6 +28,8 @@ export interface ConnectOptions {
   log?: (line: string) => void;
   /** Headers for the open only (cloudHeaders: the CI key and the attestation); never sent to the tunnel. */
   openHeaders?: Record<string, string>;
+  /** Called as each run finishes, before the session's summary. An older cloud sends none. */
+  onRun?: (run: RunSummary) => void;
 }
 
 /** What the cloud plays: a Chinwag Agent's channels, messages in and reactions. */
@@ -183,6 +185,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       if (!flushing && !timer) timer = setTimeout(() => { timer = undefined; startFlush(); }, 100);
     } catch (error) { fail("event serialization", error); }
   };
+  // The test cloud judges from this. Other sinks do not get it unless they ask.
+  events.context = true;
   try {
   const agent = options.build({ tools, events: [events] });
 
@@ -257,6 +261,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
         watch(taken === null ? Promise.all(deliveries).then(sendReceipt) : sendReceipt(), "delivery receipt");
       } else if (command.type === "reaction") {
         agent.reacted(command.conversationId, command.emoji, command.toText);
+      } else if (command.type === "run") {
+        options.onRun?.(command.run);
       } else if (command.type === "drain") {
         if (draining) throw new Error("the cloud sent drain twice");
         draining = true;

@@ -69,6 +69,7 @@ export type Command =
   | { type: "message"; conversationId: string; messageId: string; incoming: WireIncoming; channel: ChannelInfo; channelName?: string }
   | { type: "reaction"; conversationId: string; emoji: string; toText: string }
   | { type: "drain" }
+  | { type: "run"; run: RunSummary }
   | { type: "finished"; summary: SessionSummary }
   /** The session stopped before it finished; the CLI exits with this error. */
   | { type: "failed"; error: string };
@@ -109,6 +110,8 @@ export interface RunSummary {
   /** The test's own model calls in this run: the person, the tool simulator and the judge. */
   testUsage: Usage;
   watch: string;
+  /** The first try never reached the agent, so this run is the second try. */
+  retried?: boolean;
 }
 
 export interface SessionSummary {

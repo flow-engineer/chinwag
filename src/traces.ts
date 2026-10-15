@@ -207,6 +207,9 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
     const id = e.conversationId;
     const turn = open.get(id);
     switch (e.type) {
+      case "message.arrived":
+      case "turn.context":
+        return;
       case "message.in": {
         // A voice note's text is its transcript (and any caption).
         const text = [e.transcript, e.text].filter(Boolean).join(" ");
