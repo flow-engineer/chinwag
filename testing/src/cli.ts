@@ -15,11 +15,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { cloudHeaders, runInCloud, type ConnectOptions } from "./client.ts";
+import { cloudHeaders, runInCloud, SessionStopped, type ConnectOptions } from "./client.ts";
 import { runPrinter } from "./print-run.ts";
 import { httpAgent } from "./http-agent.ts";
 import { newStandalone } from "./new.ts";
 import { loadSuite, parseScenario } from "./suite.ts";
+import type { RunSummary } from "./protocol.ts";
 
 const USAGE = `Usage:
   chinwag new <name>        Make ./<name>/, a new agent started from the café example
@@ -42,6 +43,14 @@ Options for test:
                            platform each run plays, such as whatsapp or sms)
   --agent-timeout <s>      With --agent-url: how long one message waits for its answer (default: 60)
   -h, --help               Show this help
+
+Exit status:
+  0    Every run passed
+  1    The session finished and a run failed
+  2    The session stopped before it finished (the tunnel, the stream, or the connection).
+       The runs that had finished are printed, then "N of M runs finished before: <reason>"
+       and the dashboard link
+  130  Interrupted (Ctrl-C). The same partial report as exit 2
 
 Environment (also read from the agent folder's .env; variables already set win):
   CHINWAG_CLOUD            The test cloud, when --cloud is not given
@@ -180,6 +189,22 @@ function only(files: ReturnType<typeof loadSuite>) {
 
 const usd = (n: number) => `$${n.toFixed(4)}`;
 const printRun = runPrinter();
+const files = forUrl(only(loadSuite(join(dir, "tests"))));
+const perScenario = Number(values.runs);
+const expected = expectedRuns(files, perScenario);
+const seen: RunSummary[] = [];
+let dashboard = "";
+
+function reportStop(done: RunSummary[], reason: string, link: string) {
+  for (const run of done) printRun(run);
+  console.error(`${done.length} of ${expected} runs finished before: ${reason}`);
+  if (link) console.error(link);
+}
+
+process.on("SIGINT", () => {
+  reportStop(seen, "interrupted", dashboard);
+  process.exit(130);
+});
 
 let summary: Awaited<ReturnType<typeof runInCloud>>;
 try {
@@ -188,25 +213,18 @@ try {
     name,
     title,
     ...agent,
-    files: forUrl(only(loadSuite(join(dir, "tests")))),
+    files,
     testsDir: join(dir, "tests"),
-    runs: Number(values.runs),
+    runs: perScenario,
     openHeaders,
-    onRun: printRun,
+    onRun: (run) => { seen.push(run); printRun(run); },
+    onDashboard: (url) => { dashboard = url; },
   });
 } catch (error) {
-  const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-  const message = error instanceof Error ? error.message : String(error);
-  if (code === "ECONNREFUSED" || message.includes("ECONNREFUSED")) {
-    const cloud = values.cloud ?? "";
-    let host = "";
-    try { host = new URL(cloud).hostname; } catch { /* the address was not a URL */ }
-    console.error(host === "localhost" || host === "127.0.0.1"
-      ? "No local cloud is listening. Set CHINWAG_CLOUD or pass --cloud."
-      : `Could not connect to ${cloud}.`);
-    process.exit(1);
-  }
-  throw error;
+  const done = error instanceof SessionStopped ? error.runs : seen;
+  const link = error instanceof SessionStopped && error.dashboard ? error.dashboard : dashboard;
+  reportStop(done, stoppedReason(error, values.cloud!), link);
+  process.exit(2);
 }
 
 console.log("");
@@ -223,3 +241,26 @@ for (const channel of [...new Set(summary.runs.map((r) => r.channel))]) {
 }
 console.log(`Cost: ${usd(total((r) => r.agentUsage.costUsd))} agent (${total((r) => r.agentUsage.input).toLocaleString()} in, ${total((r) => r.agentUsage.output).toLocaleString()} out) + ${usd(total((r) => r.testUsage.costUsd))} test models.\n${summary.dashboard}`);
 process.exit(passed === summary.runs.length ? 0 : 1);
+
+/** Scenarios actually sent, times the channels each one plays, times --runs. */
+function expectedRuns(sent: ReturnType<typeof loadSuite>, runs: number): number {
+  if (!(runs > 0)) return 0;
+  let count = 0;
+  for (const file of sent) {
+    if (!file.path.startsWith("scenarios/")) continue;
+    let channels = 1;
+    try { channels = parseScenario(file).channels.length; } catch { /* the cloud still accounts for the file */ }
+    count += channels * runs;
+  }
+  return count;
+}
+
+function stoppedReason(error: unknown, cloud: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message.includes("ECONNREFUSED")) return message;
+  let host = "";
+  try { host = new URL(cloud).hostname; } catch { /* the address was not a URL */ }
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]"
+    ? "No local cloud is listening. Set CHINWAG_CLOUD or pass --cloud."
+    : `Could not connect to ${cloud}.`;
+}

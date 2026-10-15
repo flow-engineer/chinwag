@@ -228,6 +228,8 @@ npx chinwag test --cloud <test cloud URL> --runs 3 --only latte-correction
 
 A hosted test cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic` (your attestation that the test files hold no real customer data). Your agent stays on your machine with its own model and key; the test cloud plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation.
 
+The command exits 0 when every run passed, and 1 when the session finished and a run failed. If the session stops early (the tunnel, the stream, or the connection) it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report and exits 130.
+
 ### Test an agent you already have
 
 An agent built on any framework is tested through an HTTP endpoint, with no rewrite. From a folder with `tests/scenarios/*.yaml`:

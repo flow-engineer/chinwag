@@ -8,7 +8,7 @@ import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { basename, relative, resolve } from "node:path";
 import { toSpec, type Agent, type Incoming, type EventSink, type Outbound, type ChinwagEvent, type Tool } from "../../src/index.ts";
 import type { Command, Opened, WireIncoming, OpenSession, Receipt, RunSummary, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
-import { mimeOf, suiteHash, type SuiteFile } from "./suite.ts";
+import { mimeOf, parseToolFile, suiteHash, type SuiteFile } from "./suite.ts";
 
 export interface ConnectOptions {
   /** The cloud's address, such as http://127.0.0.1:8900. */
@@ -30,6 +30,49 @@ export interface ConnectOptions {
   openHeaders?: Record<string, string>;
   /** Called as each run finishes, before the session's summary. An older cloud sends none. */
   onRun?: (run: RunSummary) => void;
+  /** Called once the session has a dashboard link. */
+  onDashboard?: (url: string) => void;
+  /** How long one POST waits. Default 30s. Tool calls add the simulator's latency on top. */
+  postTimeoutMs?: number;
+  /** How long the stream may sit with no bytes, including the cloud's 15s ping. Default 45s. */
+  streamIdleMs?: number;
+}
+
+/** The session cannot continue. `runs` are the ones already received. The CLI prints them and exits 2. */
+export class SessionStopped extends Error {
+  readonly runs: RunSummary[];
+  readonly dashboard: string;
+  constructor(reason: string, runs: RunSummary[], dashboard: string) {
+    super(reason);
+    this.name = "SessionStopped";
+    this.runs = runs;
+    this.dashboard = dashboard;
+  }
+}
+
+/** A POST that sat until its own deadline. Retried like a tunnel 503. The session abort is not one of these. */
+export class TimeoutError extends Error {
+  constructor() {
+    super("timed out");
+    this.name = "TimeoutError";
+  }
+}
+
+/** How long a tool call may take: the longest latency its suite file declares, plus the POST budget.
+ * A tool with no file gets the simulator's own cap (60s) plus that budget. */
+export function toolTimeoutMs(files: SuiteFile[], tool: string, postTimeoutMs: number): number {
+  let declared = 0;
+  let known = false;
+  for (const file of files) {
+    if (!file.path.startsWith("tools/") || !file.path.endsWith(".yaml")) continue;
+    try {
+      const parsed = parseToolFile(file);
+      if (parsed.tool !== tool) continue;
+      known = true;
+      for (const response of parsed.responses) declared = Math.max(declared, response.latency_ms);
+    } catch { /* the cloud refuses the file; the call still waits the simulator's cap */ }
+  }
+  return postTimeoutMs + (known ? declared : 60_000);
 }
 
 /** What the cloud plays: a Chinwag Agent's channels, messages in and reactions. */
@@ -92,8 +135,13 @@ function isLoopback(cloud: string): boolean {
   return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
+const POST_TIMEOUT_MS = 30_000;
+const STREAM_IDLE_MS = 45_000;
+
 export async function runInCloud(options: ConnectOptions): Promise<SessionSummary> {
   const log = options.log ?? ((line: string) => console.log(line));
+  const postTimeoutMs = options.postTimeoutMs ?? POST_TIMEOUT_MS;
+  const streamIdleMs = options.streamIdleMs ?? STREAM_IDLE_MS;
   const base = options.cloud.replace(/\/$/, "");
 
   // The session's address is known once it opens; tools and events only use it after that.
@@ -103,6 +151,9 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   let stream: IncomingMessage | undefined;
   let stopped = false;
   let failure: Error | undefined;
+  let dashboard = "";
+  const runs: RunSummary[] = [];
+  let idle: ReturnType<typeof setTimeout> | undefined;
   const fail = (context: string, error: unknown) => {
     if (stopped || failure) return;
     failure = new Error(`${context}: ${error instanceof Error ? error.message : String(error)}`);
@@ -113,6 +164,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   const watch = (work: Promise<unknown>, context: string, allowRefusal = false) => {
     const handled = work.then(() => {}, (error) => {
       if (allowRefusal && error instanceof PostError && error.status === 409 && error.code === "platform_refused") return;
+      // Retried already. The send fails for this reply; the stream stays up for the other runs.
+      if (allowRefusal && unavailable(error)) return;
       fail(context, error);
     });
     pending.add(handled);
@@ -125,7 +178,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     ...t,
     run: async (input: unknown, context: { conversationId: string }) => {
       const request: ToolCallRequest = { conversationId: context.conversationId, tool: t.name, input };
-      const result = await post<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal);
+      const result = await post<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal, undefined, toolTimeoutMs(options.files, t.name, postTimeoutMs));
       if (!result.ok) throw new Error(result.error);
       return result.output;
     },
@@ -151,7 +204,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       const wait = started - batch[0].at;
       let failed = false;
       try {
-        await post(`${session}/events`, undefined, auth, controller.signal, `{"events":[${batch.map((e) => e.json).join(",")}]}`);
+        await post(`${session}/events`, undefined, auth, controller.signal, `{"events":[${batch.map((e) => e.json).join(",")}]}`, postTimeoutMs);
         // Keep the batch until acknowledged. An ambiguous failure ends the session, never retries
         // lifecycle events which the cloud might already have applied.
         queued.splice(0, count);
@@ -196,13 +249,15 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     runs: options.runs ?? 1,
     deliveryReceipts: true,
   };
-  const opened = await post<Opened>(`${base}/api/sessions`, open, options.openHeaders, controller.signal);
+  const opened = await post<Opened>(`${base}/api/sessions`, open, options.openHeaders, controller.signal, undefined, postTimeoutMs);
   const tunnel = tunnelBase(base, opened);
   auth = { authorization: `Bearer ${opened.token}` };
   const missing = new Set(opened.missing);
   const uploads = options.files.filter((f) => missing.has(f.hash));
-  if (uploads.length) await post(`${tunnel}/api/files`, { files: uploads }, auth, controller.signal);
+  if (uploads.length) await post(`${tunnel}/api/files`, { files: uploads }, auth, controller.signal, undefined, postTimeoutMs);
   log(`Session ${opened.sessionId}: suite ${suiteHash(options.files).slice(0, 12)}, ${options.files.length} files (${uploads.length} uploaded).`);
+  dashboard = opened.dashboard;
+  options.onDashboard?.(dashboard);
   log(`Watch it: ${opened.dashboard}`);
   session = `${tunnel}/api/sessions/${opened.sessionId}`;
 
@@ -210,6 +265,12 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   startFlush();
   stream = await openStream(`${session}/stream`, auth, controller.signal);
   if (failure) throw failure;
+  // The cloud writes ": ping" every 15s. Three missed pings and the stream is dead.
+  const arm = () => {
+    if (idle) clearTimeout(idle);
+    idle = setTimeout(() => fail("the stream is dead", new Error(`no bytes for ${streamIdleMs / 1000}s`)), streamIdleMs);
+  };
+  arm();
   let buffer = "";
   let draining = false;
   let drained = false;
@@ -227,6 +288,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   };
   const decoder = new TextDecoder();
   for await (const chunk of stream) {
+    arm();
     buffer += decoder.decode(chunk, { stream: true });
     let end: number;
     while ((end = buffer.indexOf("\n\n")) >= 0) {
@@ -234,40 +296,58 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       buffer = buffer.slice(end + 2);
       const data = frame.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).join("\n");
       if (!data) continue;
-      const command = JSON.parse(data) as Command;
+      let command: Command;
+      try {
+        command = JSON.parse(data) as Command;
+      } catch {
+        log("a stream frame was not valid JSON");
+        continue;
+      }
       if (draining && (command.type === "message" || command.type === "reaction")) throw new Error("the cloud sent a command after drain");
       if (command.type === "message") {
         const deliveries: Promise<unknown>[] = [];
         // Not async: register the promise during receive(), before its fire-and-forget
         // interceptor returns null. Each command owns its deliveries, even in a burst.
         const deliver = (outbound: Outbound): Promise<void> => {
-          const delivery = post(`${session}/outbound`, { conversationId: command.conversationId, outbound }, auth, controller.signal).then(() => {});
+          const delivery = postOutbound(`${session}/outbound`, { conversationId: command.conversationId, outbound }, auth, controller.signal, log, postTimeoutMs).then(() => {});
           deliveries.push(delivery);
           // Keep the rejection for the normal conversation's delivery recovery, but
           // attach a handler immediately for fire-and-forget interceptor sends too.
+          // A tunnel blip (no JSON from the cloud) is not a reason to end the session.
           watch(delivery, "outbound delivery", true);
           return delivery;
         };
         let taken: string | null;
         try {
-          taken = agent.receive(command.conversationId, withFiles(command.incoming, options.testsDir), deliver, {
+          taken = agent.receive(command.conversationId, withFiles(command.incoming, options.testsDir, log), deliver, {
           channel: command.channel,
           channelName: command.channelName,
           messageId: command.messageId,
           });
-        } catch (error) { fail("receive", error); throw failure; }
+        } catch (error) {
+          // This conversation can time out. The other runs still play.
+          log(`receive failed: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
         const receipt: Receipt = { conversationId: command.conversationId, messageId: command.messageId, status: taken === null ? "intercepted" : "taken" };
-        const sendReceipt = () => post(`${session}/receipts`, receipt, auth, controller.signal);
-        watch(taken === null ? Promise.all(deliveries).then(sendReceipt) : sendReceipt(), "delivery receipt");
+        const sendReceipt = () => post(`${session}/receipts`, receipt, auth, controller.signal, undefined, postTimeoutMs);
+        // An intercepted reply waits until its outbound bodies land. A tunnel blip on one of them
+        // is not a receipt failure: this run can time out, and the later runs still play. A real
+        // refusal still ends the session, the same as a receipt the tunnel rejected.
+        const receiptWork = taken === null
+          ? Promise.all(deliveries).then(sendReceipt, (error: unknown) => { if (!unavailable(error)) throw error; })
+          : sendReceipt();
+        watch(receiptWork, "delivery receipt");
       } else if (command.type === "reaction") {
         agent.reacted(command.conversationId, command.emoji, command.toText);
       } else if (command.type === "run") {
+        runs.push(command.run);
         options.onRun?.(command.run);
       } else if (command.type === "drain") {
         if (draining) throw new Error("the cloud sent drain twice");
         draining = true;
         await drainWork();
-        await post(`${session}/drained`, {}, auth, controller.signal);
+        await post(`${session}/drained`, {}, auth, controller.signal, undefined, postTimeoutMs);
         drained = true;
       } else if (command.type === "finished") {
         if (!drained) await drainWork();
@@ -279,10 +359,13 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   }
   throw new Error("the cloud closed the stream before the session finished");
   } catch (error) {
-    throw failure ?? error;
+    if (error instanceof SessionStopped) throw error;
+    const reason = failure ?? (error instanceof Error ? error : new Error(String(error)));
+    throw new SessionStopped(reason.message, runs, dashboard);
   } finally {
     stopped = true;
     if (timer) clearTimeout(timer);
+    if (idle) clearTimeout(idle);
     stream?.destroy();
     controller.abort();
     await Promise.all(pending);
@@ -310,9 +393,55 @@ class PostError extends Error {
   readonly status: number;
   readonly code?: string;
   constructor(url: string, status: number, text: string, code?: string) {
-    super(`${url}: ${status} ${text}`);
+    super(`${url}: ${status} ${shown(text)}`);
     this.status = status;
     this.code = code;
+  }
+}
+
+/** A page from the Google frontend, or a cut-off connection: the tunnel did not answer. */
+function unavailable(error: unknown): boolean {
+  if (error instanceof TimeoutError) return true;
+  if (error instanceof PostError) return !error.code && (error.status === 502 || error.status === 503 || error.status === 504);
+  if (!(error instanceof Error) || error.name === "AbortError") return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ECONNRESET" || code === "ECONNREFUSED" || code === "EPIPE" || code === "ETIMEDOUT" || code === "EAI_AGAIN" || error.message === "socket hang up";
+}
+
+function shown(text: string): string {
+  const plain = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return plain.slice(0, 180);
+}
+
+const OUTBOUND_TRIES = 3;
+const OUTBOUND_WAIT_MS = [200, 500];
+
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", stop); resolve(); }, ms);
+    const stop = () => { clearTimeout(timer); reject(signal?.reason); };
+    signal?.addEventListener("abort", stop, { once: true });
+  });
+}
+
+/** One outbound. A 502, 503 or 504 with no JSON from the tunnel, or a dropped connection, is tried
+ * again: the Google frontend's 503 means the instance was down and the body never arrived. A JSON
+ * error from the tunnel is not tried again. */
+async function postOutbound(url: string, body: unknown, headers: Record<string, string>, signal: AbortSignal | undefined, log: (line: string) => void, timeoutMs: number): Promise<void> {
+  for (let attempt = 0; attempt < OUTBOUND_TRIES; attempt++) {
+    try {
+      await post(url, body, headers, signal, undefined, timeoutMs);
+      return;
+    } catch (error) {
+      if (attempt === OUTBOUND_TRIES - 1 || !unavailable(error)) {
+        if (unavailable(error)) log(`outbound delivery failed after ${OUTBOUND_TRIES} tries`);
+        throw error;
+      }
+      const status = error instanceof PostError ? String(error.status) : error instanceof TimeoutError ? "timed out" : "no response";
+      log(`outbound delivery unavailable (${status}), trying again`);
+      await pause(OUTBOUND_WAIT_MS[attempt] ?? 500, signal);
+    }
   }
 }
 
@@ -322,39 +451,44 @@ class PostError extends Error {
 const httpPosts = new HttpAgent({ keepAlive: true });
 const httpsPosts = new HttpsAgent({ keepAlive: true });
 
-function requestOnce(url: string, payload: string, headers: Record<string, string>, signal?: AbortSignal): Promise<{ status: number; text: string }> {
+function requestOnce(url: string, payload: string, headers: Record<string, string>, signal: AbortSignal | undefined, timeoutMs: number): Promise<{ status: number; text: string }> {
   const secure = url.startsWith("https:");
   const request = secure ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
     let settled = false;
-    const fail = (error: Error) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (error?: Error, result?: { status: number; text: string }) => {
       if (settled) return;
       settled = true;
-      reject(error);
+      if (timer) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(result!);
     };
     const req = request(url, {
       method: "POST",
       headers: { "content-type": "application/json", ...headers, "content-length": Buffer.byteLength(payload) },
       agent: secure ? httpsPosts : httpPosts,
-      signal,
     }, (response) => {
       const chunks: Buffer[] = [];
-      response.on("error", fail);
-      response.on("aborted", () => fail(new Error("The request was aborted")));
+      response.on("error", finish);
+      response.on("aborted", () => finish(new Error("The request was aborted")));
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
-      response.on("end", () => {
-        if (settled) return;
-        settled = true;
-        resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") });
-      });
+      response.on("end", () => finish(undefined, { status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
     });
-    req.on("error", fail);
+    timer = setTimeout(() => { finish(new TimeoutError()); req.destroy(); }, timeoutMs);
+    signal?.addEventListener("abort", () => { finish(abortError(signal)); req.destroy(); }, { once: true });
+    req.on("error", (error) => finish(signal?.aborted ? abortError(signal) : error));
     req.end(payload);
   });
 }
 
-async function post<T = unknown>(url: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal, serialized?: string): Promise<T> {
-  const { status, text } = await requestOnce(url, serialized ?? JSON.stringify(body ?? {}), headers, signal);
+function abortError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
+}
+
+async function post<T = unknown>(url: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal, serialized?: string, timeoutMs = POST_TIMEOUT_MS): Promise<T> {
+  const { status, text } = await requestOnce(url, serialized ?? JSON.stringify(body ?? {}), headers, signal, timeoutMs);
   if (status < 200 || status >= 300) {
     let code: string | undefined;
     try { code = JSON.parse(text).error; } catch { /* the body was not JSON */ }
@@ -364,7 +498,7 @@ async function post<T = unknown>(url: string, body: unknown, headers: Record<str
 }
 
 /** The person's message with the files it names read from the tests folder, and only from there. */
-function withFiles(incoming: WireIncoming, testsDir: string | undefined): Incoming {
+function withFiles(incoming: WireIncoming, testsDir: string | undefined, log: (line: string) => void): Incoming {
   const { attachments, ...rest } = incoming;
   if (!attachments?.length) return rest;
   return {
@@ -373,12 +507,19 @@ function withFiles(incoming: WireIncoming, testsDir: string | undefined): Incomi
       kind: a.kind,
       mime: mimeOf(a.file),
       name: basename(a.file),
-      data: async () => {
-        const path = testsDir ? resolve(testsDir, a.file) : "";
-        const inside = testsDir && !relative(resolve(testsDir), path).startsWith("..") && path !== resolve(testsDir);
-        if (!inside) throw new Error(`${a.file} is not a file in the tests folder`);
-        return new Uint8Array(await readFile(path));
+      data: () => {
+        const reading = readAttachment(testsDir, a.file);
+        // A caller that never awaits still must not become an uncaught exception.
+        reading.catch((error) => log(`attachment could not be read: ${a.file}: ${error instanceof Error ? error.message : String(error)}`));
+        return reading;
       },
     })),
   };
+}
+
+function readAttachment(testsDir: string | undefined, file: string): Promise<Uint8Array> {
+  const path = testsDir ? resolve(testsDir, file) : "";
+  const inside = testsDir && !relative(resolve(testsDir), path).startsWith("..") && path !== resolve(testsDir);
+  if (!inside) return Promise.reject(new Error(`${file} is not a file in the tests folder`));
+  return readFile(path).then((bytes) => new Uint8Array(bytes));
 }
