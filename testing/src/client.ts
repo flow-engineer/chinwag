@@ -32,13 +32,13 @@ export interface ConnectOptions {
   onRun?: (run: RunSummary) => void;
   /** Called once the session has a dashboard link. */
   onDashboard?: (url: string) => void;
-  /** How long one POST waits. Default 30s. Tool calls add the simulator's latency on top. */
+  /** How long one POST waits before the size allowance. Default 30s, plus 1s per 100KB of body. Tool calls add the simulator's latency on top. */
   postTimeoutMs?: number;
   /** How long the stream may sit with no bytes, including the cloud's 15s ping. Default 45s. */
   streamIdleMs?: number;
 }
 
-/** The session cannot continue. `runs` are the ones already received. The CLI prints them and exits 2. */
+/** The tunnel, the stream, or the connection failed after the session opened. `runs` are the ones already received. The CLI prints them and exits 2. */
 export class SessionStopped extends Error {
   readonly runs: RunSummary[];
   readonly dashboard: string;
@@ -50,7 +50,7 @@ export class SessionStopped extends Error {
   }
 }
 
-/** A POST that sat until its own deadline. Retried like a tunnel 503. The session abort is not one of these. */
+/** A POST that sat until its own deadline. It fails that one call. It is not sent again: the cloud may already have done the work. The session abort is not one of these. */
 export class TimeoutError extends Error {
   constructor() {
     super("timed out");
@@ -59,7 +59,12 @@ export class TimeoutError extends Error {
 }
 
 /** How long a tool call may take: the longest latency its suite file declares, plus the POST budget.
- * A tool with no file gets the simulator's own cap (60s) plus that budget. */
+ * A tool with no file gets the simulator's own cap (60s) plus that budget.
+ *
+ * The cloud asks its model before that latency, and the model's own time counts toward it. One
+ * attempt is abandoned at 90s and a timeout is tried once more, so a stuck model can hold the
+ * call for about 180s. This budget does not cover that. When it runs out, the agent sees an
+ * error while the cloud may still record the call in the world log once the model returns. */
 export function toolTimeoutMs(files: SuiteFile[], tool: string, postTimeoutMs: number): number {
   let declared = 0;
   let known = false;
@@ -73,6 +78,11 @@ export function toolTimeoutMs(files: SuiteFile[], tool: string, postTimeoutMs: n
     } catch { /* the cloud refuses the file; the call still waits the simulator's cap */ }
   }
   return postTimeoutMs + (known ? declared : 60_000);
+}
+
+/** The base budget plus 1s per 100KB, so a 5MB event batch or file upload is not cut off at 30s. */
+export function postBudgetMs(baseMs: number, bytes: number): number {
+  return baseMs + Math.floor(Math.max(0, bytes) / 100_000) * 1_000;
 }
 
 /** What the cloud plays: a Chinwag Agent's channels, messages in and reactions. */
@@ -156,7 +166,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   let idle: ReturnType<typeof setTimeout> | undefined;
   const fail = (context: string, error: unknown) => {
     if (stopped || failure) return;
-    failure = new Error(`${context}: ${error instanceof Error ? error.message : String(error)}`);
+    failure = new Error(`${context}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     stream?.destroy(failure);
     controller.abort();
   };
@@ -174,11 +184,12 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
 
   // Tools: same name, description and input; running one asks the cloud, which holds the request
   // until its simulator has answered and the chosen latency has passed.
+  const toolWait = new Map(options.tools.map((t) => [t.name, toolTimeoutMs(options.files, t.name, postTimeoutMs)]));
   const tools: Tool[] = options.tools.map((t) => ({
     ...t,
     run: async (input: unknown, context: { conversationId: string }) => {
       const request: ToolCallRequest = { conversationId: context.conversationId, tool: t.name, input };
-      const result = await post<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal, undefined, toolTimeoutMs(options.files, t.name, postTimeoutMs));
+      const result = await post<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal, undefined, toolWait.get(t.name) ?? postTimeoutMs);
       if (!result.ok) throw new Error(result.error);
       return result.output;
     },
@@ -217,7 +228,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
           continue;
         }
         failed = true;
-        throw new Error("event upload failed; acceptance unknown, not retried");
+        throw new Error("event upload failed; acceptance unknown, not retried", { cause: error });
       } finally {
         const roundtrip = Date.now() - started;
         if (failed || roundtrip >= 1_000 || wait >= 1_000) {
@@ -274,6 +285,13 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   let buffer = "";
   let draining = false;
   let drained = false;
+  let receiveFails = 0;
+  // Drain and the drained POST wait on deliveries that can outlast the idle window. Pings
+  // still arrive, and sit unread until that wait ends, so the timer must be down for it.
+  const pauseIdle = () => {
+    if (idle) clearTimeout(idle);
+    idle = undefined;
+  };
   const drainWork = async () => {
     // Delivery completion may enqueue recovery events or another outbound, so keep
     // draining until both lanes are empty. Event batches remain strictly serial.
@@ -325,10 +343,15 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
           messageId: command.messageId,
           });
         } catch (error) {
-          // This conversation can time out. The other runs still play.
-          log(`receive failed: ${error instanceof Error ? error.message : String(error)}`);
+          const detail = error instanceof Error ? error.message : String(error);
+          receiveFails++;
+          // One broken message can time out. An agent that throws on every message would
+          // wait out the whole suite, one run at a time.
+          if (receiveFails >= 3) throw new Error(`the agent throws on every message: ${detail}`);
+          log(`receive failed: ${detail}`);
           continue;
         }
+        receiveFails = 0;
         const receipt: Receipt = { conversationId: command.conversationId, messageId: command.messageId, status: taken === null ? "intercepted" : "taken" };
         const sendReceipt = () => post(`${session}/receipts`, receipt, auth, controller.signal, undefined, postTimeoutMs);
         // An intercepted reply waits until its outbound bodies land. A tunnel blip on one of them
@@ -346,10 +369,13 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       } else if (command.type === "drain") {
         if (draining) throw new Error("the cloud sent drain twice");
         draining = true;
+        pauseIdle();
         await drainWork();
         await post(`${session}/drained`, {}, auth, controller.signal, undefined, postTimeoutMs);
         drained = true;
+        arm();
       } else if (command.type === "finished") {
+        pauseIdle();
         if (!drained) await drainWork();
         return command.summary;
       } else if (command.type === "failed") {
@@ -361,7 +387,10 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   } catch (error) {
     if (error instanceof SessionStopped) throw error;
     const reason = failure ?? (error instanceof Error ? error : new Error(String(error)));
-    throw new SessionStopped(reason.message, runs, dashboard);
+    // Exit 2 is a transport failure after the session exists. A refusal, or anything
+    // before the open answers, is the error itself (the CLI exits 1 and prints it alone).
+    if (dashboard && isTransportFailure(reason)) throw new SessionStopped(reason.message, runs, dashboard);
+    throw reason;
   } finally {
     stopped = true;
     if (timer) clearTimeout(timer);
@@ -399,13 +428,39 @@ class PostError extends Error {
   }
 }
 
-/** A page from the Google frontend, or a cut-off connection: the tunnel did not answer. */
+/** This call can be dropped and the session continues: a frontend page with no JSON, a
+ * timeout, or a connection that died. A timeout or a reset is not sent again. */
 function unavailable(error: unknown): boolean {
   if (error instanceof TimeoutError) return true;
   if (error instanceof PostError) return !error.code && (error.status === 502 || error.status === 503 || error.status === 504);
   if (!(error instanceof Error) || error.name === "AbortError") return false;
   const code = (error as NodeJS.ErrnoException).code;
   return code === "ECONNRESET" || code === "ECONNREFUSED" || code === "EPIPE" || code === "ETIMEDOUT" || code === "EAI_AGAIN" || error.message === "socket hang up";
+}
+
+/** The tunnel, the stream, or the connection, as opposed to a refusal the cloud wrote as JSON. */
+function isTransportFailure(error: unknown): boolean {
+  let current: unknown = error;
+  for (let guard = 0; current instanceof Error && guard < 6; guard++) {
+    if (current instanceof TimeoutError) return true;
+    if (current instanceof PostError) return !current.code && (current.status === 502 || current.status === 503 || current.status === 504);
+    if (/the stream is dead|the cloud closed the stream before the session finished/.test(current.message)) return true;
+    if (/^could not open the stream \((502|503|504)\)$/.test(current.message)) return true;
+    const code = (current as NodeJS.ErrnoException).code;
+    if (code === "ECONNRESET" || code === "ECONNREFUSED" || code === "EPIPE" || code === "ETIMEDOUT" || code === "EAI_AGAIN" || code === "ENOTFOUND" || current.message === "socket hang up") return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+/** Safe to send again, until the cloud stores an idempotency key. A 502/503/504 with no JSON
+ * never reached the container. A failure before the connection was made did not either.
+ * A timeout or a reset may mean the reply was already delivered. */
+function retryableOutbound(error: unknown): boolean {
+  if (error instanceof PostError) return !error.code && (error.status === 502 || error.status === 503 || error.status === 504);
+  if (!(error instanceof Error) || error.name === "AbortError") return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ECONNREFUSED" || code === "EAI_AGAIN" || code === "ENOTFOUND";
 }
 
 function shown(text: string): string {
@@ -425,20 +480,25 @@ function pause(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** One outbound. A 502, 503 or 504 with no JSON from the tunnel, or a dropped connection, is tried
- * again: the Google frontend's 503 means the instance was down and the body never arrived. A JSON
- * error from the tunnel is not tried again. */
+/** One outbound. A 502, 503 or 504 with no JSON, or a failure before connecting, is tried again.
+ * The Google frontend's HTML 503 means the instance was down and the body never arrived. A
+ * timeout, a reset, or a JSON error is not tried again. */
 async function postOutbound(url: string, body: unknown, headers: Record<string, string>, signal: AbortSignal | undefined, log: (line: string) => void, timeoutMs: number): Promise<void> {
   for (let attempt = 0; attempt < OUTBOUND_TRIES; attempt++) {
     try {
       await post(url, body, headers, signal, undefined, timeoutMs);
       return;
     } catch (error) {
-      if (attempt === OUTBOUND_TRIES - 1 || !unavailable(error)) {
-        if (unavailable(error)) log(`outbound delivery failed after ${OUTBOUND_TRIES} tries`);
+      const again = attempt < OUTBOUND_TRIES - 1 && retryableOutbound(error);
+      if (!again) {
+        if (retryableOutbound(error)) log(`outbound delivery failed after ${OUTBOUND_TRIES} tries`);
+        else if (unavailable(error)) {
+          const status = error instanceof PostError ? String(error.status) : error instanceof TimeoutError ? "timed out" : "no response";
+          log(`outbound delivery failed (${status})`);
+        }
         throw error;
       }
-      const status = error instanceof PostError ? String(error.status) : error instanceof TimeoutError ? "timed out" : "no response";
+      const status = error instanceof PostError ? String(error.status) : "no response";
       log(`outbound delivery unavailable (${status}), trying again`);
       await pause(OUTBOUND_WAIT_MS[attempt] ?? 500, signal);
     }
@@ -457,10 +517,12 @@ function requestOnce(url: string, payload: string, headers: Record<string, strin
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
     const finish = (error?: Error, result?: { status: number; text: string }) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
       if (error) reject(error);
       else resolve(result!);
     };
@@ -476,7 +538,10 @@ function requestOnce(url: string, payload: string, headers: Record<string, strin
       response.on("end", () => finish(undefined, { status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
     });
     timer = setTimeout(() => { finish(new TimeoutError()); req.destroy(); }, timeoutMs);
-    signal?.addEventListener("abort", () => { finish(abortError(signal)); req.destroy(); }, { once: true });
+    if (signal) {
+      onAbort = () => { finish(abortError(signal)); req.destroy(); };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
     req.on("error", (error) => finish(signal?.aborted ? abortError(signal) : error));
     req.end(payload);
   });
@@ -488,7 +553,8 @@ function abortError(signal: AbortSignal): Error {
 }
 
 async function post<T = unknown>(url: string, body: unknown, headers: Record<string, string> = {}, signal?: AbortSignal, serialized?: string, timeoutMs = POST_TIMEOUT_MS): Promise<T> {
-  const { status, text } = await requestOnce(url, serialized ?? JSON.stringify(body ?? {}), headers, signal, timeoutMs);
+  const payload = serialized ?? JSON.stringify(body ?? {});
+  const { status, text } = await requestOnce(url, payload, headers, signal, postBudgetMs(timeoutMs, Buffer.byteLength(payload)));
   if (status < 200 || status >= 300) {
     let code: string | undefined;
     try { code = JSON.parse(text).error; } catch { /* the body was not JSON */ }

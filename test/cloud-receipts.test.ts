@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createAgent, type ChinwagEvent, type EventSink } from "../src/index.ts";
 import { scriptedModel, respond, say } from "./helpers.ts";
-import { runInCloud, type AgentUnderTest } from "../testing/src/client.ts";
+import { runInCloud, SessionStopped, type AgentUnderTest } from "../testing/src/client.ts";
 import type { Command, Receipt } from "../testing/src/protocol.ts";
 
 function gate<T = void>() {
@@ -322,5 +322,51 @@ test("an outbound the tunnel keeps refusing does not discard the rest of the ses
     assert.deepEqual(await running, { runs: [] });
     assert.equal(outbound, 3);
     assert.ok(!cloud.posts.some((path) => path.endsWith("/receipts")), "a reply the tunnel never took is not acknowledged");
+  } finally { cloud.close(); }
+});
+
+test("a JSON refusal on outbound ends the session", { timeout: 10_000 }, async () => {
+  const cloud = await tunnel((path, _body, res) => {
+    if (path.endsWith("/outbound")) return void res.writeHead(400).end('{"error":"invalid_request"}');
+    ok(res);
+  });
+  try {
+    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: () => {}, build: () => ({
+      channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
+        void deliver({ type: "message", text: "reply" });
+        return "m";
+      },
+    }) });
+    const stream = await cloud.connected;
+    stream.write(frame(message("m1")));
+    await assert.rejects(running, (error: unknown) => {
+      assert.ok(!(error instanceof SessionStopped));
+      assert.match((error as Error).message, /invalid_request/);
+      return true;
+    });
+  } finally { cloud.close(); }
+});
+
+test("an outbound timeout is not sent again", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  let outbound = 0;
+  const cloud = await tunnel((path, _body, res) => {
+    if (path.endsWith("/outbound")) { outbound++; return; }
+    ok(res);
+  });
+  try {
+    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: (line) => logs.push(line), postTimeoutMs: 120, build: () => ({
+      channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
+        void deliver({ type: "message", text: "reply" });
+        return "m";
+      },
+    }) });
+    const stream = await cloud.connected;
+    stream.write(frame(message("m1")));
+    cloud.finish();
+    assert.deepEqual(await running, { runs: [] });
+    assert.equal(outbound, 1);
+    assert.match(logs.join("\n"), /outbound delivery failed \(timed out\)/);
+    assert.ok(!logs.join("\n").includes("trying again"));
   } finally { cloud.close(); }
 });

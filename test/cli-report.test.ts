@@ -102,5 +102,44 @@ test("Ctrl-C prints the same partial report and exits 130", { timeout: 15_000 },
     assert.equal(code, 130);
     assert.match(out, /1 of 1 runs finished before: interrupted/);
     assert.match(out, /http:\/\/dash\/s/);
+    assert.match(out, /the cloud keeps playing; stop it from the dashboard: http:\/\/dash\/s/);
   } finally { child.kill(); local.close(); }
+});
+
+test("a refused open exits 1 and prints only the message", { timeout: 15_000 }, async () => {
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(401, { "content-type": "application/json" }).end('{"error":"unauthorized"}');
+  });
+  const local = await new Promise<{ url: string; close: () => void }>((done) => {
+    server.listen(0, "127.0.0.1", () => done({
+      url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      close: () => { server.closeAllConnections(); server.close(); },
+    }));
+  });
+  const child = runCli(local.url, agentDir());
+  let out = "";
+  child.stdout.on("data", (chunk) => { out += chunk; });
+  child.stderr.on("data", (chunk) => { out += chunk; });
+  try {
+    const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+    assert.equal(code, 1);
+    assert.match(out, /unauthorized/);
+    assert.ok(!out.includes("runs finished before"));
+  } finally { child.kill(); local.close(); }
+});
+
+test("an agent that fails to build exits 1 and prints only the message", { timeout: 15_000 }, async () => {
+  const dir = agentDir();
+  writeFileSync(join(dir, "src", "agent.ts"), "export const tools = [];\nexport function buildAgent() { throw new Error(\"agent broke\"); }\n");
+  const child = runCli("http://127.0.0.1:9", dir);
+  let out = "";
+  child.stdout.on("data", (chunk) => { out += chunk; });
+  child.stderr.on("data", (chunk) => { out += chunk; });
+  try {
+    const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+    assert.equal(code, 1);
+    assert.match(out, /agent broke/);
+    assert.ok(!out.includes("runs finished before"));
+  } finally { child.kill(); }
 });

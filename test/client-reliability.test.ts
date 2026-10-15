@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z, type Tool } from "../src/index.ts";
-import { runInCloud, SessionStopped, TimeoutError, toolTimeoutMs } from "../testing/src/client.ts";
+import { postBudgetMs, runInCloud, SessionStopped, TimeoutError, toolTimeoutMs } from "../testing/src/client.ts";
 import type { Command } from "../testing/src/protocol.ts";
 import { rollFault, startFaultProxy } from "./fault-proxy.ts";
 
@@ -81,8 +81,10 @@ test("a thrown receive, a bad frame and an unreadable attachment leave the sessi
 
 test("a tool call waits out the simulator's latency, then the POST budget, and a timeout is a timeout", { timeout: 10_000 }, async () => {
   const slow = "tool: lookup\nresponses:\n  - { when: slow, latency_ms: 11000 }\n  - { when: ok, latency_ms: 400 }\n";
-  assert.equal(toolTimeoutMs([{ path: "tools/lookup.yaml", hash: "h", content: slow }], "lookup", 30_000), 41_000);
+    assert.equal(toolTimeoutMs([{ path: "tools/lookup.yaml", hash: "h", content: slow }], "lookup", 30_000), 41_000);
   assert.equal(toolTimeoutMs([], "lookup", 30_000), 90_000);
+  assert.equal(postBudgetMs(30_000, 5_000_000), 80_000);
+  assert.equal(postBudgetMs(30_000, 99_999), 30_000);
   let timed: unknown;
   const cloud = await listen(({ url }, res) => {
     if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
@@ -180,9 +182,8 @@ test("a faulting proxy still reports every run once and delivers no reply twice"
     fault: ({ kind, path }) => {
       if (kind === "stream" || !path.endsWith("/outbound")) return "ok";
       const which = outbound++;
-      if (which === 0) return "html503";
-      if (which === 1) return "reset";
-      if (which === 2) return "delay";
+      // A reset is not tried again: the cloud may already have the reply. Only the HTML 503 is.
+      if (which === 0 || which === 2) return "html503";
       return "ok";
     },
   });
@@ -202,4 +203,240 @@ test("a faulting proxy still reports every run once and delivers no reply twice"
     assert.deepEqual([...new Set(bodies)].sort(), ["reply m1", "reply m2"]);
     assert.equal(bodies.length, 2);
   } finally { proxy.close(); upstream.close(); }
+});
+
+test("a drain waits out work longer than the idle window", { timeout: 10_000 }, async () => {
+  let stream: ServerResponse | undefined;
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "http://dash/s" }));
+    if (url.endsWith("/stream")) {
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(message("m1")));
+      res.write(frame({ type: "drain" }));
+      return;
+    }
+    if (url.endsWith("/outbound")) {
+      setTimeout(() => {
+        stream?.write(": ping\n\n");
+        res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      }, 250);
+      return;
+    }
+    if (url.endsWith("/drained")) {
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      stream?.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [], dashboard: "http://dash/s" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [], log: () => {}, streamIdleMs: 80,
+      build: () => ({
+        channels: () => [], reacted: () => {},
+        receive: (_id, _incoming, deliver) => {
+          void deliver({ type: "message", text: "held" });
+          return "m";
+        },
+      }),
+    });
+    assert.equal(summary.sessionId, "s");
+  } finally { cloud.close(); }
+});
+
+test("a reset after the outbound was forwarded is not sent again", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  let stream: ServerResponse | undefined;
+  const upstream = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "http://dash/s" }));
+    if (url.endsWith("/stream")) {
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(message("m1")));
+      res.write(frame(run("r1")));
+      res.write(frame({ type: "drain" }));
+      return;
+    }
+    if (url.endsWith("/drained")) {
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      const command = run("r1");
+      const one = command.type === "run" ? [command.run] : [];
+      stream?.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: one, dashboard: "http://dash/s" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  const proxy = await startFaultProxy(upstream.url, {
+    seed: 1,
+    fault: ({ path }) => path.endsWith("/outbound") ? "resetAfter" : "ok",
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: proxy.url, name: "test", tools: [], files: [], log: (line) => logs.push(line),
+      build: () => ({
+        channels: () => [], reacted: () => {},
+        receive: (_id, _incoming, deliver) => {
+          void deliver({ type: "message", text: "once" });
+          return "m";
+        },
+      }),
+    });
+    assert.deepEqual(summary.runs.map((r) => r.runId), ["r1"]);
+    const bodies = proxy.posts.filter((post) => post.path.endsWith("/outbound"));
+    assert.equal(bodies.length, 1);
+    assert.equal(JSON.parse(bodies[0]!.body).outbound.text, "once");
+    assert.ok(!logs.join("\n").includes("trying again"));
+    assert.match(logs.join("\n"), /outbound delivery failed \(no response\)/);
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test("seed 1 with mixed faults reports every run once and delivers no reply twice", { timeout: 10_000 }, async () => {
+  let stream: ServerResponse | undefined;
+  const upstream = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "http://dash/s" }));
+    if (url.endsWith("/stream")) {
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(message("m1")));
+      res.write(frame(message("m2")));
+      setTimeout(() => {
+        res.write(frame(run("r1")));
+        res.write(frame(run("r2")));
+        res.write(frame({ type: "drain" }));
+      }, 1200);
+      return;
+    }
+    if (url.endsWith("/drained")) {
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      const kept = (id: string) => { const command = run(id); if (command.type !== "run") throw new Error("run"); return command.run; };
+      stream?.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [kept("r1"), kept("r2")], dashboard: "http://dash/s" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  const proxy = await startFaultProxy(upstream.url, {
+    seed: 1,
+    fault: ({ kind, path, index }) => {
+      const rolled = rollFault(1, index, kind === "stream" ? "stream" : "post");
+      // A cut stream, or a 503 on a call that is not retried, still ends the session.
+      // A reset on outbound can mean the reply already landed, so it is left through.
+      if (kind === "stream") return "ok";
+      if (path.endsWith("/outbound")) return rolled === "reset" ? "ok" : rolled;
+      return rolled === "html503" || rolled === "reset" ? "ok" : rolled;
+    },
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: proxy.url, name: "test", tools: [], files: [], log: () => {},
+      build: () => ({
+        channels: () => [], reacted: () => {},
+        receive: (_id, _incoming, deliver, options) => {
+          void deliver({ type: "message", text: `reply ${options?.messageId}` });
+          return "m";
+        },
+      }),
+    });
+    assert.deepEqual(summary.runs.map((r) => r.runId), ["r1", "r2"]);
+    assert.ok(proxy.faults.includes("html503"));
+    const bodies = proxy.posts.filter((post) => post.path.endsWith("/outbound")).map((post) => JSON.parse(post.body).outbound.text as string);
+    for (const text of ["reply m1", "reply m2"]) assert.ok(bodies.filter((body) => body === text).length <= 1, text);
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test("a large upload outlives the base POST budget", { timeout: 10_000 }, async () => {
+  const content = "x".repeat(100_000);
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: ["h"], dashboard: "d" }));
+    if (url === "/api/files") return void setTimeout(() => res.writeHead(200, { "content-type": "application/json" }).end("{}"), 200);
+    if (url.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [], dashboard: "d" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [{ path: "scenarios/a.yaml", hash: "h", content }],
+      log: () => {}, postTimeoutMs: 80,
+      build: () => ({ channels: () => [], receive: () => null, reacted: () => {} }),
+    });
+    assert.equal(summary.sessionId, "s");
+  } finally { cloud.close(); }
+});
+
+test("three receives in a row that throw stop the session", { timeout: 10_000 }, async () => {
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+    if (url.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(message("a")));
+      res.write(frame(message("b")));
+      res.write(frame(message("c")));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    await assert.rejects(runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [], log: () => {},
+      build: () => ({ channels: () => [], reacted: () => {}, receive: () => { throw new Error("nope"); } }),
+    }), (error: unknown) => {
+      assert.ok(!(error instanceof SessionStopped));
+      assert.match((error as Error).message, /the agent throws on every message: nope/);
+      return true;
+    });
+  } finally { cloud.close(); }
+});
+
+test("finished posts do not keep their abort listeners", { timeout: 10_000 }, async () => {
+  const proto = AbortSignal.prototype;
+  const add = proto.addEventListener;
+  const remove = proto.removeEventListener;
+  let live = 0;
+  let peak = 0;
+  proto.addEventListener = function (this: AbortSignal, type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) {
+    if (type === "abort") peak = Math.max(peak, ++live);
+    return add.call(this, type, listener, options);
+  } as typeof add;
+  proto.removeEventListener = function (this: AbortSignal, type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions) {
+    if (type === "abort") live--;
+    return remove.call(this, type, listener, options);
+  } as typeof remove;
+  let later = 0;
+  let receipts = 0;
+  let stream: ServerResponse | undefined;
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+    if (url.endsWith("/stream")) {
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      setTimeout(() => res.write(frame(message("m1"))), 30);
+      return;
+    }
+    if (url.endsWith("/receipts")) {
+      receipts++;
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      if (receipts < 12) stream?.write(frame(message(`m${receipts}`)));
+      else setTimeout(() => {
+        later = live;
+        stream?.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [], dashboard: "d" } }));
+      }, 30);
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [], log: () => {},
+      build: () => ({ channels: () => [], receive: () => "m", reacted: () => {} }),
+    });
+    assert.equal(later, 0);
+    assert.ok(peak > 0 && peak < 5, `peak abort listeners ${peak}`);
+  } finally {
+    proto.addEventListener = add;
+    proto.removeEventListener = remove;
+    cloud.close();
+  }
 });

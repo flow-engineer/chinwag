@@ -46,11 +46,13 @@ Options for test:
 
 Exit status:
   0    Every run passed
-  1    The session finished and a run failed
-  2    The session stopped before it finished (the tunnel, the stream, or the connection).
+  1    A run failed, the cloud refused the session, or the session never opened.
+       The message is printed on its own
+  2    The tunnel, the stream, or the connection failed after the session opened.
        The runs that had finished are printed, then "N of M runs finished before: <reason>"
        and the dashboard link
-  130  Interrupted (Ctrl-C). The same partial report as exit 2
+  130  Interrupted (Ctrl-C). The same partial report as exit 2. The cloud keeps
+       playing until it is stopped from the dashboard
 
 Environment (also read from the agent folder's .env; variables already set win):
   CHINWAG_CLOUD            The test cloud, when --cloud is not given
@@ -203,6 +205,7 @@ function reportStop(done: RunSummary[], reason: string, link: string) {
 
 process.on("SIGINT", () => {
   reportStop(seen, "interrupted", dashboard);
+  if (dashboard) console.error(`the cloud keeps playing; stop it from the dashboard: ${dashboard}`);
   process.exit(130);
 });
 
@@ -221,10 +224,12 @@ try {
     onDashboard: (url) => { dashboard = url; },
   });
 } catch (error) {
-  const done = error instanceof SessionStopped ? error.runs : seen;
-  const link = error instanceof SessionStopped && error.dashboard ? error.dashboard : dashboard;
-  reportStop(done, stoppedReason(error, values.cloud!), link);
-  process.exit(2);
+  if (error instanceof SessionStopped) {
+    reportStop(error.runs, stoppedReason(error, values.cloud!), error.dashboard || dashboard);
+    process.exit(2);
+  }
+  console.error(stoppedReason(error, values.cloud!));
+  process.exit(1);
 }
 
 console.log("");

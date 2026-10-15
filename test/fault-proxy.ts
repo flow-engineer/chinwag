@@ -5,7 +5,7 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-export type Fault = "ok" | "html503" | "reset" | "delay" | "cut";
+export type Fault = "ok" | "html503" | "reset" | "delay" | "cut" | "resetAfter";
 
 function mix(n: number): number {
   let x = Math.imul(n ^ 0x9e3779b9, 0x85ebca6b);
@@ -28,15 +28,17 @@ const HTML = "<html><title>503 Server Error</title><h1>Error: Server Error</h1>S
 export async function startFaultProxy(upstream: string, options: {
   seed: number;
   fault?: (info: { kind: "post" | "stream"; path: string; index: number }) => Fault;
-}): Promise<{ url: string; posts: Array<{ path: string; body: string }>; close: () => void }> {
+}): Promise<{ url: string; posts: Array<{ path: string; body: string }>; faults: Fault[]; close: () => void }> {
   const target = new URL(upstream);
   let index = 0;
   const posts: Array<{ path: string; body: string }> = [];
+  const faults: Fault[] = [];
   const decide = options.fault ?? ((info: { kind: "post" | "stream"; path: string; index: number }) => rollFault(options.seed, info.index, info.kind));
   const server = createServer((req, res) => {
     const path = req.url ?? "/";
     const kind = path.endsWith("/stream") ? "stream" as const : "post" as const;
     const fault = decide({ kind, path, index: index++ });
+    faults.push(fault);
     if (fault === "html503") {
       req.resume();
       res.writeHead(503, { "content-type": "text/html" }).end(HTML);
@@ -47,7 +49,7 @@ export async function startFaultProxy(upstream: string, options: {
       res.destroy();
       return;
     }
-    const go = () => forward(target, req, res, path, fault === "cut", posts);
+    const go = () => forward(target, req, res, path, fault === "cut" ? "cut" : fault === "resetAfter" ? "resetAfter" : "ok", posts);
     if (fault === "delay") setTimeout(go, 30);
     else go();
   });
@@ -55,11 +57,12 @@ export async function startFaultProxy(upstream: string, options: {
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     posts,
+    faults,
     close: () => { server.closeAllConnections(); server.close(); },
   };
 }
 
-function forward(target: URL, req: IncomingMessage, res: ServerResponse, path: string, cut: boolean, posts: Array<{ path: string; body: string }>): void {
+function forward(target: URL, req: IncomingMessage, res: ServerResponse, path: string, mode: "ok" | "cut" | "resetAfter", posts: Array<{ path: string; body: string }>): void {
   const chunks: Buffer[] = [];
   req.on("data", (chunk) => chunks.push(chunk));
   req.on("end", () => {
@@ -72,7 +75,12 @@ function forward(target: URL, req: IncomingMessage, res: ServerResponse, path: s
       method: req.method,
       headers: { ...req.headers, host: target.host },
     }, (up) => {
-      if (!cut) {
+      if (mode === "resetAfter") {
+        up.resume();
+        res.destroy();
+        return;
+      }
+      if (mode === "ok") {
         res.writeHead(up.statusCode ?? 200, up.headers);
         up.pipe(res);
         return;
