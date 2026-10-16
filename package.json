@@ -1,6 +1,6 @@
 {
   "name": "chinwag",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "An open-source runtime for chat agents that feel like a person texting back.",
   "license": "MIT",
   "repository": {
