@@ -95,6 +95,13 @@ export class TimeoutError extends Error {
   }
 }
 
+/** The cloud answered a tool call `ok: false`. Its message is the cloud's code: a tool file's own error,
+ * or one of {@link CLOUD_TOOL_ERRORS} when the cloud could not play the call. */
+class ToolFailed extends Error {}
+
+/** A tool call's codes for the cloud's own failure, not the tool's: its simulator failed, or the run had already ended. */
+const CLOUD_TOOL_ERRORS = new Set(["simulator_failed", "run_finished"]);
+
 /** The stream stopped carrying bytes: the idle watch fired, or the cloud closed it before finished. */
 export class StreamLost extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -289,13 +296,24 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
   const toolWait = new Map(options.tools.map((t) => [t.name, toolTimeoutMs(options.files, t.name, toolBudget)]));
   const tools: Tool[] = options.tools.map((t) => ({
     ...t,
-    run: async (input: unknown, context: { conversationId: string }) => {
-      const request: ToolCallRequest = { conversationId: context.conversationId, tool: t.name, input };
-      const result = await postRetry<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal, log, toolWait.get(t.name) ?? postTimeoutMs, {
-        mode: idempotent ? "idempotent" : "never", key: `tool:${randomUUID()}`, budgetMs: retryBudgetMs, what: "tool call",
+    run: (input: unknown, context: { conversationId: string }) => {
+      const call = (async () => {
+        const request: ToolCallRequest = { conversationId: context.conversationId, tool: t.name, input };
+        const result = await postRetry<ToolCallResult>(`${session}/tool-calls`, request, auth, controller.signal, log, toolWait.get(t.name) ?? postTimeoutMs, {
+          mode: idempotent ? "idempotent" : "never", key: `tool:${randomUUID()}`, budgetMs: retryBudgetMs, what: "tool call",
+        });
+        if (!result.ok) throw new ToolFailed(result.error);
+        return result.output;
+      })();
+      // The agent's own code may start a tool and never wait for it (an intercept's hand-off). A call
+      // the cloud failed is then that run's error, never an unhandled rejection that ends the session;
+      // whoever awaits the call still gets the failure.
+      call.catch((error: unknown) => {
+        if (stopped || (error instanceof ToolFailed && !CLOUD_TOOL_ERRORS.has(error.message))) return;
+        const why = error instanceof PostError && error.code ? error.code : error instanceof Error ? error.message : String(error);
+        log(`${context.conversationId}: the cloud failed the tool call ${t.name} (${why}): an infrastructure error for this run, not the agent's; the session plays on.`);
       });
-      if (!result.ok) throw new Error(result.error);
-      return result.output;
+      return call;
     },
   }));
 
