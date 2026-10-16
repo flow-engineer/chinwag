@@ -19,6 +19,10 @@
 // to the last id the client handled (0 for none); the cloud sends the commands after it, and holds
 // them for 2 minutes while no stream is attached. The client skips an id it has handled.
 //
+// When Opened says reopen, a tunnel call or the stream may answer 410 { error: "session_gone" }: the
+// cloud lost the session (its tunnel restarted). The client opens one new session with `only`, the
+// runs that have no result yet, and merges the two reports. Never more than once.
+//
 // The open goes to the cloud's front door; every later call goes to Opened.tunnel (else the same
 // address) and carries `authorization: Bearer <token>` from Opened.
 
@@ -52,6 +56,18 @@ export interface OpenSession {
   retries?: boolean;
   /** The client opens a lost stream again with Last-Event-ID when this cloud resumes. */
   resume?: boolean;
+  /** The client opens one new session for the unfinished runs when this cloud says session_gone. */
+  reopen?: boolean;
+  /** Play only these runs, numbered as given: a re-open after session_gone. Sent only to a cloud whose Opened said reopen,
+   * and only when some run finished: the cloud checks it against the suite's files it already stores. */
+  only?: RunKey[];
+}
+
+/** One run of a suite: a scenario's id, one of its channels, and which of the `runs` times (from 1). */
+export interface RunKey {
+  scenario: string;
+  channel: string;
+  run: number;
 }
 
 export interface Receipt {
@@ -75,6 +91,8 @@ export interface Opened {
   /** This cloud numbers stream commands with an SSE id, sends the ones after Last-Event-ID to a
    * stream opened again, and holds them 2 minutes while none is attached. Absent on an older cloud. */
   resume?: boolean;
+  /** This cloud answers session_gone for a session it lost, and plays `only` on an open. Absent on an older cloud. */
+  reopen?: boolean;
 }
 
 export interface UploadFile {

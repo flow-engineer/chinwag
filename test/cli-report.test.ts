@@ -229,6 +229,44 @@ test("an agent that fails to build exits 1 and prints only the message", { timeo
   } finally { child.kill(); }
 });
 
+test("a session the cloud lost and a second one played prints both dashboards", { timeout: 15_000 }, async () => {
+  let opens = 0;
+  const second = { ...run, run: { ...run.run, runId: "r2", run: 2 } };
+  const server = createServer((req, res) => {
+    req.resume();
+    const reply = (status: number, value: unknown) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
+    if (req.url === "/api/sessions") {
+      opens++;
+      return reply(200, { sessionId: `s${opens}`, token: `t${opens}`, missing: [], dashboard: `http://dash/s${opens}`, reopen: true });
+    }
+    if (req.url?.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (req.url.includes("/s1/")) return void res.write(`data: ${JSON.stringify(run)}\n\ndata: ${JSON.stringify({ type: "drain" })}\n\n`);
+      const finished = { type: "finished", summary: { sessionId: "s2", suiteHash: "h", testModel: "fake", runs: [second.run], dashboard: "http://dash/s2" } };
+      return void res.end(`data: ${JSON.stringify(second)}\n\ndata: ${JSON.stringify(finished)}\n\n`);
+    }
+    if (req.url?.endsWith("/drained")) return reply(410, { error: "session_gone" });
+    reply(200, {});
+  });
+  const local = await new Promise<{ url: string; close: () => void }>((done) => {
+    server.listen(0, "127.0.0.1", () => done({
+      url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      close: () => { server.closeAllConnections(); server.close(); },
+    }));
+  });
+  const child = runCli(local.url, agentDir(), ["--runs", "2"]);
+  let out = "";
+  child.stdout.on("data", (chunk) => { out += chunk; });
+  child.stderr.on("data", (chunk) => { out += chunk; });
+  try {
+    const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+    assert.equal(code, 1, out);
+    assert.match(out, /0 of 2 runs passed/);
+    assert.match(out, /The cloud lost session s1 part way; a second session played its unfinished runs\. The first: http:\/\/dash\/s1/);
+    assert.match(out, /http:\/\/dash\/s2/);
+  } finally { child.kill(); local.close(); }
+});
+
 test("a finished session's results are kept, and --failed runs again only what did not pass, with --runs, until nothing has failed", { timeout: 20_000 }, async () => {
   // b.yaml's id is not its file name: the results and --failed use the file name, as --only does.
   const dir = agentDir({ b: scenarioYaml("bee", "sms"), c: scenarioYaml("c", "sms, whatsapp") });

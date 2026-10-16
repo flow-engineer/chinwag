@@ -16,10 +16,10 @@ const message = (messageId: string, file?: string): Command => ({
   incoming: file ? { text: "hi", attachments: [{ kind: "image", file }] } : { text: "hi" },
 });
 const frame = (command: unknown) => `data: ${JSON.stringify(command)}\n\n`;
-const run = (runId: string): Command => ({
+const run = (runId: string, n = 1): Command => ({
   type: "run",
   run: {
-    runId, scenario: "hello", run: 1, channel: "sms", passed: true, checks: [], ended: "goal",
+    runId, scenario: "hello", run: n, channel: "sms", passed: true, checks: [], ended: "goal",
     turns: 1, messagesIn: 1, messagesOut: 1, toolCalls: 0, slowestAckMs: 1,
     agentUsage: { input: 0, output: 0, costUsd: 0 }, agentModels: [],
     testUsage: { input: 0, output: 0, costUsd: 0 }, watch: `http://watch/${runId}`,
@@ -703,4 +703,92 @@ test("a resumable stream is replaced before the tunnel's hour limit", { timeout:
     assert.deepEqual(asked, [undefined, "1"]);
     assert.match(logs.join("\n"), /stream refreshed before the tunnel's hour limit; resuming after command 1/);
   } finally { cloud.close(); }
+});
+
+const hello = { path: "scenarios/hello.yaml", hash: "h", content: "id: hello\nchannels: [sms]\nperson:\n  persona: a\n  goal: b\nopening:\n  - say: hi\n" };
+const summaryOf = (id: string, runs: Command[]) => ({ type: "finished", summary: { sessionId: id, suiteHash: "h", testModel: "fake", runs: runs.map((c) => c.type === "run" ? c.run : null), dashboard: `http://dash/${id}` } });
+
+/** A cloud that loses its first session: the receipt of that session's message answers session_gone.
+ * The second open plays run 2 and finishes, loses that session too, or is refused for the spend cap. */
+function losingCloud(options: { reopen: boolean; second: "finish" | "gone" | "refused"; firstRuns?: number }) {
+  const opens: Array<Record<string, unknown>> = [];
+  return listen(({ url, body }, res) => {
+    const reply = (status: number, value: unknown) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
+    if (url === "/api/sessions") {
+      opens.push(JSON.parse(body));
+      const id = `s${opens.length}`;
+      if (opens.length === 2 && options.second === "refused") return reply(429, { error: "spend_cap" });
+      return reply(200, { sessionId: id, token: id, missing: [], dashboard: `http://dash/${id}`, ...(options.reopen ? { reopen: true } : {}) });
+    }
+    if (url.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (url.includes("/s1/")) {
+        if (options.firstRuns !== 0) res.write(frame(run("r1", 1)));
+        res.write(frame(message("m1")));
+      } else if (options.second === "gone") {
+        res.write(frame(run("r2", 2)));
+        res.write(frame(message("m2")));
+      } else {
+        res.end(frame(run("r2", 2)) + frame(summaryOf("s2", [run("r2", 2)])));
+      }
+      return;
+    }
+    if (url.endsWith("/receipts")) return reply(410, { error: "session_gone" });
+    reply(200, {});
+  }).then((cloud) => ({ ...cloud, opens }));
+}
+
+test("a session the cloud lost is opened again once, for only the runs with no result, and the two reports merge", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  const cloud = await losingCloud({ reopen: true, second: "finish" });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [hello], runs: 2, log: (line) => logs.push(line),
+      build: () => ({ channels: () => [], receive: () => "m", reacted: () => {} }),
+    });
+    assert.deepEqual(summary.runs.map((r) => [r.runId, r.run]), [["r1", 1], ["r2", 2]]);
+    assert.deepEqual(summary.lost, { sessionId: "s1", dashboard: "http://dash/s1" });
+    assert.equal(summary.dashboard, "http://dash/s2");
+    assert.equal(cloud.opens[0]?.reopen, true);
+    assert.equal(cloud.opens[0]?.only, undefined);
+    assert.deepEqual(cloud.opens[1]?.only, [{ scenario: "hello", channel: "sms", run: 2 }]);
+    assert.match(logs.join("\n"), /The cloud lost session s1 \(.*session_gone.*\)\. Opening a new session to play the 1 run with no result, at the cloud's cost again: hello on sms #2/);
+  } finally { cloud.close(); }
+});
+
+test("a session lost before any run finished is opened again without only, so the cloud need not have its files stored", { timeout: 10_000 }, async () => {
+  const cloud = await losingCloud({ reopen: true, second: "finish", firstRuns: 0 });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [hello], runs: 2, log: () => {},
+      build: () => ({ channels: () => [], receive: () => "m", reacted: () => {} }),
+    });
+    assert.equal(cloud.opens.length, 2);
+    assert.equal(cloud.opens[1]?.only, undefined);
+    assert.equal(cloud.opens[1]?.reopen, true);
+    assert.deepEqual(summary.lost, { sessionId: "s1", dashboard: "http://dash/s1" });
+  } finally { cloud.close(); }
+});
+
+test("a lost session is opened again at most once, only on a cloud that says reopen, and stops if the new open is refused", { timeout: 10_000 }, async () => {
+  const cases = [
+    { reopen: true, second: "gone" as const, opens: 2, runs: ["r1", "r2"], reason: /session_gone/ },
+    { reopen: true, second: "refused" as const, opens: 2, runs: ["r1"], reason: /the cloud lost the session, and a new one did not open: .*spend_cap/ },
+    { reopen: false, second: "finish" as const, opens: 1, runs: ["r1"], reason: /session_gone/ },
+  ];
+  for (const item of cases) {
+    const cloud = await losingCloud(item);
+    try {
+      await assert.rejects(runInCloud({
+        cloud: cloud.url, name: "test", tools: [], files: [hello], runs: 2, log: () => {},
+        build: () => ({ channels: () => [], receive: () => "m", reacted: () => {} }),
+      }), (error: unknown) => {
+        assert.ok(error instanceof SessionStopped, String(error));
+        assert.match(error.message, item.reason);
+        assert.deepEqual(error.runs.map((r) => r.runId), item.runs);
+        return true;
+      });
+      assert.equal(cloud.opens.length, item.opens, JSON.stringify(item));
+    } finally { cloud.close(); }
+  }
 });
