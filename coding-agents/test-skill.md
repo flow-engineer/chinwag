@@ -70,8 +70,8 @@ expect:
     the call's input (nested objects match in part; arrays and strings must be equal).
 - `timezone` (default UTC) and `now`: the test's clock. `now` is when each run starts,
   `YYYY-MM-DDTHH:MM[:SS]`, local to `timezone` unless it ends in `Z` or an offset (`-04:00`); left
-  out, it is the real time. It sets the clock of the simulated tools, the person and the judge,
-  not your agent's: the agent still reads the real time. So set `now` only when the agent takes
+  out, it is the real time. Placeholders are filled from it, and the simulated tools and the judge
+  are told it; your agent's clock is not changed: the agent still reads the real time. So set `now` only when the agent takes
   its dates from its tools or its context; otherwise leave it out and placeholders follow the real
   date.
 
