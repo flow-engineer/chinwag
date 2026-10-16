@@ -44,12 +44,13 @@ expect:
 
 ## The parts
 
-- `channel`: sms, whatsapp, imessage, telegram or web. The run uses that simulator's real rules
-  (SMS has no buttons or reactions; WhatsApp has both).
+- `channels`: one or more of sms, whatsapp, imessage, telegram and web; each is a run of its own.
+  The run uses that simulator's real rules (SMS has no buttons or reactions; WhatsApp has both).
 - `person`: who the model playing the person is (`persona`), what they want (`goal`), and facts
   they only give if asked (`knows`). It sees only what a person would see.
 - `opening`: the first messages, sent exactly as written; `after_ms` sends one that long after
-  the previous one (a double text). Then the person plays on until `goal` is met or `max_turns`.
+  the previous one (a double text). Then the person plays on until `goal` is met or `max_turns`
+  (default 8). A run that uses every turn never passes.
   A step may send a file: `- { say: "here is my receipt", attach: { kind: image, file: fixtures/receipt.jpg } }`
   (`kind`: image, audio or document; `file` a path in `tests/`; `say` is its caption and may be
   left out). The file is read on your machine and never uploaded; the person and the judge see it
@@ -63,6 +64,36 @@ expect:
     order is placed", "no order is placed").
   - `judge`: what the conversation must show, one checkable sentence each; a judge model reads
     the transcript and marks each pass or fail with a reason.
+  - `calls`: tools that must be called at least once (whatever the call returned); `never`: tools
+    that must not be called. Checked by code from the recorded tool calls, not by a model. Each
+    entry is a tool name, or `{ tool, args }`: the call matches when every field in `args` equals
+    the call's input (nested objects match in part; arrays and strings must be equal).
+- `timezone` (default UTC) and `now`: the test's clock. `now` is when each run starts,
+  `YYYY-MM-DDTHH:MM[:SS]`, local to `timezone` unless it ends in `Z` or an offset (`-04:00`); left
+  out, it is the real time. It sets the clock of the simulated tools, the person and the judge,
+  not your agent's: the agent still reads the real time. So set `now` only when the agent takes
+  its dates from its tools or its context; otherwise leave it out and placeholders follow the real
+  date.
+
+```yaml
+timezone: America/New_York
+now: 2026-10-16T09:00
+world: Sam's class is on {{now + 6d @ 10:00}}. There is a free slot s-2 the day after.
+expect:
+  calls:
+    - cancel_session
+    - tool: move_session
+      args: { slot_id: s-2 }
+  never:
+    - delete_account
+```
+
+Dates in test files are placeholders for the test's clock, never written out (a written date goes
+stale): `{{now}}`, then shifts `+` or `-` a number with `m`, `h`, `d` or `w`, then `@ HH:MM` for the
+time of day, then `| iso` (the default, with its offset), `| date` (2026-10-16), `| time` (09:00) or
+`| weekday` (Thursday): `{{now + 7d | date}}`, `{{now - 2h + 30m | time}}`. They work in `world`,
+`person`, `opening`, `expect` and the tool files' `responses`; the cloud fills them on each run. Any other
+`{{...}}` is plain text.
 
 How fast the agent first replies to each message is measured on every run from timestamps, not
 written in scenarios: the dashboard shows it for the whole run (average, p95, min and max).
@@ -72,6 +103,8 @@ written in scenarios: the dashboard shows it for the whole run (average, p95, mi
 - One situation per scenario, named for it (`order-fails`, `latte-correction`).
 - Test what would hurt a real person if it broke: wrong order, a claim the order was placed when
   it wasn't, a missed escalation, a slow or missing acknowledgement.
+- One fact per check. "Called X" or "never called Z" is a `calls` or `never` entry, not an
+  `outcome` or `judge` sentence: code checks it the same way every run.
 - Write `judge` items as facts a reader can check from the transcript, not taste ("asks Sam to
   confirm before placing the order", not "is helpful").
 - Cover the unhappy paths the tool files list (busy, down, unknown item) as their own scenarios.
@@ -97,7 +130,8 @@ connects out to the cloud, which plays the person and the tools and judges.
    the last line printed, on every exit): `sessionId`, `dashboard`, `suiteHash`, `endedAt`, `ended`
    (`finished`, `stopped` or `interrupted`), `only` (the scenarios it was limited to, else `null`) and
    per run `scenario` (file name without `.yaml`), `channel`, `run`, `verdict` (`passed`, `failed`,
-   `errored`: the cloud could not play or judge it, or `not_played`: the session ended first) and
+   `errored`: the cloud could not play or judge it, such as a failed tool simulator or person
+   model, which is not a failure of your agent, or `not_played`: the session ended first) and
    `failedChecks` (`kind` and `text`). Read it instead of parsing the printed report; the judge's
    reasons are in the printed report and the dashboard, not in the file.
 5. `--only a,b` runs only those scenarios (file names without `.yaml`). `--failed` runs only the ones
@@ -156,7 +190,7 @@ To implement one:
    a token). Fix every FAIL line; it must end "5 of 5 cases passed". Give the agent a mode with no
    model call (the examples' `FAKE_MODEL=1`) so the check costs nothing.
 4. Then write scenarios as above, with one difference: the agent's own tools run for real, so there
-   are no `tests/tools/*.yaml`, no `world` for tools and no `outcome` checks; write what must be true
-   as `judge` items. Run `npx chinwag test --agent-url <url>`.
+   are no `tests/tools/*.yaml`, no `world` for tools and no `outcome`, `calls` or `never` checks
+   (the cloud sees no tool calls); write what must be true as `judge` items. Run `npx chinwag test --agent-url <url>`.
 
 `examples/http-agent-python` and `examples/http-agent-go` are the café's agent done this way.

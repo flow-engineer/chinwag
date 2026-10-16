@@ -241,7 +241,7 @@ expect:
     - The agent asks Sam to confirm before placing the order.
 ```
 
-`tests/tools/*.yaml` describe how each tool behaves (normal, slow, each error). Run the suite from the agent's folder:
+`expect.calls` and `expect.never` name tools that must or must not be called, checked by code from the recorded calls. `now` and `timezone` set the test's clock, and dates in test files are written against it (`{{now + 1d | date}}`), so they never go stale ([coding-agents/test-skill.md](coding-agents/test-skill.md)). `tests/tools/*.yaml` describe how each tool behaves (normal, slow, each error). Run the suite from the agent's folder:
 
 ```bash
 npx chinwag test --cloud https://flow.engineer/observe --synthetic --runs 3 --only latte-correction
@@ -332,7 +332,7 @@ createServer(async (req, res) => {
 
 Each reply is checked against what the run's platform can show, as a Chinwag agent's is: one that does not fit (buttons on SMS, text over the limit) is not sent, and the run says why. A status other than 200, a body that is not `{ "replies": [...] }` or no answer within 60 seconds (`--agent-timeout <s>`) fails that message's turn, with the reason in the run; the session goes on. A conversation's messages are sent one at a time: the next waits for the last one's answer.
 
-Your agent's own tools run on its side, for real, so `tests/tools/*.yaml` are not used, and outcome checks (which read simulated tool calls) see none: write what must be true as `judge` items. The agent's model cost shows as $0, since Chinwag does not see its model calls. Not yet supported: agents that answer later through a callback instead of in the response, and the person's reactions to the agent's messages.
+Your agent's own tools run on its side, for real, so `tests/tools/*.yaml` are not used, and outcome, `calls` and `never` checks (which read simulated tool calls) see none: write what must be true as `judge` items. The agent's model cost shows as $0, since Chinwag does not see its model calls. Not yet supported: agents that answer later through a callback instead of in the response, and the person's reactions to the agent's messages.
 
 ### Any language
 
