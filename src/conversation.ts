@@ -35,14 +35,14 @@
 
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { z } from "zod";
+import type { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
 import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
-import { render, tool, toSpec, type Tool } from "./tools.ts";
+import { render, toSpec, type Tool } from "./tools.ts";
 import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, PersonMessage, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
@@ -104,9 +104,7 @@ const ACKNOWLEDGE_FIRST =
   "(react to their message or send a short line) and make your tool calls again.";
 const INTERRUPTED = "[Chinwag] Cut off by a restart: this may or may not have happened. Check before you rely on it.";
 const APOLOGY = "Sorry, something went wrong on my side. Could you send that again?";
-const EARLIER = "[Chinwag] Older messages of this conversation are no longer shown to you. What you pinned about them is in your instructions.";
-/** The most notes the agent may pin about one person. */
-const PINS_MAX = 20;
+const EARLIER = "[Chinwag] Older messages of this conversation are no longer shown to you.";
 const NOT_SHOWN = "[Chinwag] You are no longer shown the photos or documents in these messages; ask them to send one again if you need it.";
 
 /** Photos and PDFs the model is shown at once, the latest; each is resent on every model call. */
@@ -266,7 +264,6 @@ export class Conversation {
         agentZone: settings.timeZone,
       }),
       ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone ?? settings.timeZone ?? "UTC" }),
-      ...pinTools(settings.store, id),
     ];
     this.builtins = new Map(builtins.map((t) => [t.name, t]));
     this.builtinSpecs = builtins.map(toSpec);
@@ -724,7 +721,6 @@ export class Conversation {
       }
     }
     const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC");
-    const pinned = pinsSection(await store.pins(this.id));
     // A message that came while those loaded had no step to restart: it joins the first one.
     this.absorb();
     let restarts = 0;
@@ -739,7 +735,7 @@ export class Conversation {
       const views = this.views();
       const several = views.length > 1;
       this.sendTools = new Map(views.map((v) => [sendToolName(v.name), v.name]));
-      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, pinned, context].filter(Boolean).join("\n\n");
+      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, context].filter(Boolean).join("\n\n");
       const specs = [...this.settings.specs, ...this.builtinSpecs, ...talkSpecs(views, this.settings.talk)];
       const abort = new AbortController();
       if (restarts < this.settings.maxRestarts) this.stepAbort = abort;
@@ -1325,35 +1321,6 @@ function size(entry: ChatMessage): number {
   if (entry.role === "assistant") return tokens(entry.content) + tokens(JSON.stringify(entry.toolCalls ?? []));
   if (entry.role === "tool") return tokens(entry.content);
   return tokens(entry.content) + (entry.media?.filter((m) => m.data).length ?? 0) * 1_500;
-}
-
-/** Pin and unpin: what the agent keeps about a person outside the history, so it is never left out. */
-function pinTools(store: StoreApi, conversationId: string): Tool[] {
-  return [
-    tool({
-      name: "pin",
-      description: "Keep a short fact about this person that must not be lost however long the chat gets: their name, an allergy, a goal. Pinned notes are in your instructions every turn; old messages may not be.",
-      input: z.object({ text: z.string().min(1).max(300) }),
-      run: async ({ text }) => {
-        if ((await store.pins(conversationId)).length >= PINS_MAX) return { error: `They already have ${PINS_MAX} pinned notes. Unpin one first.` };
-        const id = `pin_${randomUUID().slice(0, 6)}`;
-        await store.addPin(conversationId, id, text);
-        return { pinned: { id, text } };
-      },
-    }),
-    tool({
-      name: "unpin",
-      description: "Remove a pinned note, by id, when it is no longer true.",
-      input: z.object({ id: z.string() }),
-      run: async ({ id }) => ({ removed: await store.removePin(conversationId, id) }),
-    }),
-  ];
-}
-
-/** The pinned notes as the agent reads them each turn; empty when there are none. */
-function pinsSection(pins: Array<{ id: string; text: string }>): string {
-  if (!pins.length) return "";
-  return ["## What you pinned about them", ...pins.map((p) => `- [${p.id}] ${p.text}`)].join("\n");
 }
 
 /** A photo or PDF as it is stored: named, without its bytes. */

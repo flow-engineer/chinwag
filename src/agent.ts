@@ -67,8 +67,7 @@ export interface AgentOptions {
   maxSteps?: number;
   /**
    * How much of a long conversation each model call carries. The latest messages are kept, older
-   * ones are left out (the agent is told so), and what it pinned about the person is always in its
-   * instructions. `maxTokens` is the whole call's budget, roughly: default 60% of the model's
+   * ones are left out (the agent is told so). `maxTokens` is the whole call's budget, roughly: default 60% of the model's
    * `contextTokens` when it gives one, else 50,000. A tool result is cut to `toolResultChars`
    * characters (default 12,000).
    */
