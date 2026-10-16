@@ -38,8 +38,13 @@ export function openAICompatible(options: OpenAICompatibleOptions = {}): Model {
   // An explicit key or address is that provider. Otherwise the first key in the environment wins.
   const fromEnv = options.apiKey !== undefined || options.baseURL !== undefined ? undefined : modelFromKeys(process.env);
   const baseURL = options.baseURL ?? fromEnv?.baseURL ?? KEYS[0].baseURL;
+  const apiKey = options.apiKey ?? fromEnv?.apiKey ?? (process.env.OPENROUTER_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim());
+  // A server at a base URL you name (a local one) may need no key; the client still sends one.
+  if (!apiKey && options.baseURL === undefined) {
+    throw new Error(`No model key: set one of ${KEYS.map((k) => k.env).join(", ")} (in the agent's .env), or pass apiKey, or baseURL for a server that needs none.`);
+  }
   const client = new OpenAI({
-    apiKey: options.apiKey ?? fromEnv?.apiKey ?? process.env.OPENROUTER_API_KEY,
+    apiKey: apiKey || "none",
     baseURL,
     maxRetries: 1,
   });

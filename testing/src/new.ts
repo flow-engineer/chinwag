@@ -39,6 +39,29 @@ const TSCONFIG = {
   include: ["src"],
 };
 
+const ENV_EXAMPLE = `# One model key. The first line with a value is the one used.
+# Make it at the provider, then paste it here. Never commit this file.
+#   OPENROUTER_API_KEY   https://openrouter.ai/keys
+#   OPENAI_API_KEY       https://platform.openai.com/api-keys
+#   ANTHROPIC_API_KEY    https://console.anthropic.com/settings/keys
+#   GEMINI_API_KEY       https://aistudio.google.com/apikey
+OPENROUTER_API_KEY=
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+
+# Optional. The model id for that provider; empty is that provider's default.
+# CAFE_MODEL=
+
+# The test cloud (npx chinwag test --synthetic) and traces. Sign in at https://flow.engineer/observe,
+# add the agent, and on its Developers page make a CI key (oci_..., shown once); the trace key is
+# from the same site.
+CHINWAG_CLOUD=https://flow.engineer/observe
+CHINWAG_CLOUD_KEY=
+CHINWAG_TRACES_URL=https://flow.engineer/observe
+CHINWAG_TRACES_KEY=
+`;
+
 const agentsMd = (name: string) => `# ${name}
 
 A chat agent on Chinwag (https://github.com/flow-engineer/chinwag), started from its café example (Pip).
@@ -46,9 +69,10 @@ A chat agent on Chinwag (https://github.com/flow-engineer/chinwag), started from
 - Load the skills in \`.claude/skills/\` before changing it: \`chinwag\` to build the agent, \`chinwag-tools\`
   for its tools and their test files, \`chinwag-tests\` for its test scenarios.
 - \`agent/AGENTS.md\` is the agent's own prompt, not instructions for coding agents.
-- \`npm start\` runs it in the playground; the owner puts \`OPENROUTER_API_KEY\` in \`.env\` (never read or
-  print it). \`npm run typecheck\` checks the types, \`npm test\` runs the tests in a test cloud
-  (\`npx chinwag --help\`).
+- \`npm start\` runs it in the playground. The owner puts one model key in \`.env\` (never read or
+  print it): \`OPENROUTER_API_KEY\`, \`OPENAI_API_KEY\`, \`ANTHROPIC_API_KEY\` or \`GEMINI_API_KEY\`.
+  \`npm run typecheck\` checks the types, \`npm test -- --synthetic\` runs the tests in the test
+  cloud at https://flow.engineer/observe with the owner's \`CHINWAG_CLOUD_KEY\` (\`npx chinwag --help\`).
 `;
 
 /** Makes `<into>/<name>` (the current folder by default) and returns it. */
@@ -84,7 +108,9 @@ export function newStandalone(name: string, options: { into?: string; root?: str
   writeFileSync(join(dir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`);
   writeFileSync(join(dir, "tsconfig.json"), `${JSON.stringify(TSCONFIG, null, 2)}\n`);
   writeFileSync(join(dir, ".gitignore"), "node_modules/\n.env\n");
-  writeFileSync(join(dir, ".env.example"), "OPENROUTER_API_KEY=\n");
+  // npm install then refuses a Node older than the engines field says, before .ts files fail to load.
+  writeFileSync(join(dir, ".npmrc"), "engine-strict=true\n");
+  writeFileSync(join(dir, ".env.example"), ENV_EXAMPLE);
 
   const skills = join(root, "coding-agents");
   for (const file of readdirSync(skills).filter((f) => f.endsWith(".md"))) {

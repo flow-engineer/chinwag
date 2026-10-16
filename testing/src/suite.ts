@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { extname, isAbsolute, join } from "node:path";
-import { parse } from "yaml";
+import { isMap, isSeq, LineCounter, parseDocument, type Node } from "yaml";
 import { z } from "../../src/index.ts";
 
 export interface SuiteFile {
@@ -99,15 +99,48 @@ export function mimeOf(path: string): string {
 export type Scenario = z.infer<typeof scenarioSchema>;
 export type ToolFile = z.infer<typeof toolFileSchema>;
 
-/** Parse and check a scenario; the error names the file and what is wrong. */
+/** Parse and check a scenario. The error has one line per problem: `file:line: field: what is wrong`. */
 export function parseScenario(file: Pick<SuiteFile, "path" | "content">): Scenario {
-  const result = scenarioSchema.safeParse(parse(file.content));
-  if (!result.success) throw new Error(`${file.path}: ${result.error.message}`);
-  return result.data;
+  return parseFile(scenarioSchema, file);
 }
 
 export function parseToolFile(file: Pick<SuiteFile, "path" | "content">): ToolFile {
-  const result = toolFileSchema.safeParse(parse(file.content));
-  if (!result.success) throw new Error(`${file.path}: ${result.error.message}`);
-  return result.data;
+  return parseFile(toolFileSchema, file);
+}
+
+function parseFile<T extends z.ZodType>(schema: T, file: Pick<SuiteFile, "path" | "content">): z.infer<T> {
+  const lines = new LineCounter();
+  const doc = parseDocument(file.content, { lineCounter: lines });
+  const at = (offset: number | undefined) => `${file.path}:${offset === undefined ? 1 : lines.linePos(offset).line}`;
+  if (doc.errors.length) {
+    // The YAML parser's own message ends with where it is and a drawing of the line; the prefix says where.
+    throw new Error(doc.errors.map((e) => `${at(e.pos[0])}: ${e.message.split("\n")[0]!.replace(/ at line \d+, column \d+:?$/, "")}`).join("\n"));
+  }
+  const result = schema.safeParse(doc.toJS());
+  if (result.success) return result.data;
+  throw new Error(result.error.issues.map((issue) => {
+    const field = issue.path.map((key, i) => (typeof key === "number" ? `[${key}]` : `${i ? "." : ""}${String(key)}`)).join("");
+    const what = /received undefined$/.test(issue.message) ? "missing" : issue.message;
+    return `${at(offsetOf(doc.contents, issue.path))}: ${field ? `${field}: ` : ""}${what}`;
+  }).join("\n"));
+}
+
+/** Where the deepest part of `path` that the file has starts: the value, or for a missing key the key that holds it. */
+function offsetOf(root: unknown, path: PropertyKey[]): number | undefined {
+  let node = root;
+  let offset = (root as Node | null)?.range?.[0];
+  let holder: number | undefined;
+  for (const key of path) {
+    if (isMap(node)) {
+      const pair = node.items.find((p) => (p.key as { value?: unknown } | null)?.value === key);
+      if (!pair) return holder ?? offset;
+      holder = (pair.key as Node).range?.[0];
+      node = pair.value;
+    } else if (isSeq(node) && typeof key === "number" && node.items[key]) {
+      holder = undefined;
+      node = node.items[key];
+    } else break;
+    offset = (node as Node | null)?.range?.[0] ?? offset;
+  }
+  return offset;
 }

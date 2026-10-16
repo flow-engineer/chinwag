@@ -121,9 +121,10 @@ test("the endpoint refusing traces never touches the conversation, is logged onc
   assert.doesNotMatch(warnings.join(""), /do-not-log-me/);
 });
 
-test("from the environment: on with a trace key and its URL (a key alone fails), content only with CHINWAG_TRACES_CONTENT=1, never under node --test", () => {
+test("from the environment: a trace key goes to flow.engineer/observe unless a URL is set, content only with CHINWAG_TRACES_CONTENT=1, never under node --test", () => {
   assert.equal(tracesFromEnv({}), undefined);
-  assert.throws(() => tracesFromEnv({ CHINWAG_TRACES_KEY: KEY }), /CHINWAG_TRACES_URL/);
+  assert.deepEqual(tracesFromEnv({ CHINWAG_TRACES_KEY: KEY }), { key: KEY, url: "https://flow.engineer/observe", content: false });
+  assert.deepEqual(tracesFromEnv({ CHINWAG_TRACES_KEY: KEY, CHINWAG_TRACES_URL: "  " }), { key: KEY, url: "https://flow.engineer/observe", content: false });
   assert.deepEqual(tracesFromEnv({ CHINWAG_TRACES_KEY: KEY, CHINWAG_TRACES_URL: "https://example.test/traces" }), { key: KEY, url: "https://example.test/traces", content: false });
   assert.deepEqual(tracesFromEnv({ CHINWAG_TRACES_KEY: KEY, CHINWAG_TRACES_URL: "https://example.test/traces", CHINWAG_TRACES_CONTENT: "1" }), { key: KEY, url: "https://example.test/traces", content: true });
   assert.equal(tracesFromEnv({ CHINWAG_TRACES_KEY: KEY, NODE_TEST_CONTEXT: "child-v8" }), undefined);

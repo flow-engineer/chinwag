@@ -33,7 +33,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(1);
   }
   console.log(`Made agents/${name}/ from the café example (Pip). Next:
-  1. Add your key: echo "OPENROUTER_API_KEY=sk-or-..." > agents/${name}/.env
+  1. Add one model key to agents/${name}/.env: OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY or GEMINI_API_KEY
   2. Run it: cd agents/${name} && npm start, then open the link it prints
   3. Point your coding agent at coding-agents/ (skill.md first) and tell it what to build`);
 }
