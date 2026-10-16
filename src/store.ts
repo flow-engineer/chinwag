@@ -75,10 +75,11 @@ const MIGRATIONS: Array<(t: Types) => string> = [
          AND other.person_key = 'phone:+' || substr(conversations.person_key, CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 9 ELSE 7 END))
        AND NOT EXISTS (SELECT 1 FROM conversations other WHERE other.agent_id = conversations.agent_id
          AND other.person_key = CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 'phone:' || substr(conversations.person_key, 9) ELSE 'phone:00' || substr(conversations.person_key, 7) END)`,
-  // A provider's message ids, so a webhook's retry is taken once; and each conversation's turn count, for tools' idempotency keys.
+  // A provider's message ids, so a webhook's retry is taken once (per conversation: some providers
+  // number messages per chat); and each conversation's turn count, for tools' idempotency keys.
   (t) => `CREATE TABLE inbound (
-     agent_id TEXT NOT NULL, channel TEXT NOT NULL, message_id TEXT NOT NULL, conversation_id TEXT NOT NULL, at ${t.int} NOT NULL,
-     PRIMARY KEY (agent_id, channel, message_id));
+     agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, channel TEXT NOT NULL, message_id TEXT NOT NULL, at ${t.int} NOT NULL,
+     PRIMARY KEY (agent_id, conversation_id, channel, message_id));
    ALTER TABLE conversations ADD COLUMN turns INTEGER NOT NULL DEFAULT 0`,
 ];
 
@@ -295,11 +296,11 @@ export class Store {
   }
 
   /**
-   * Records a message id a channel's provider gave; false when it was already taken (a webhook
-   * sent again), so the message is not taken twice.
+   * Records a message id a channel's provider gave in this conversation; false when it was
+   * already taken (a webhook sent again), so the message is not taken twice.
    */
   async inbound(conversationId: string, channel: string, messageId: string): Promise<boolean> {
-    return (await this.db.run("INSERT INTO inbound (agent_id, channel, message_id, conversation_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, channel, messageId, conversationId, Date.now()])) > 0;
+    return (await this.db.run("INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, conversationId, channel, messageId, Date.now()])) > 0;
   }
 
   // The inbox.

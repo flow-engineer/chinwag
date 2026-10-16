@@ -292,7 +292,7 @@ export class Conversation {
   receive(input: string | Incoming, options: { channel: string; messageId?: string }): string {
     const incoming: Incoming = typeof input === "string" ? { text: input } : input;
     const channel = options.channel;
-    if (options.messageId !== undefined && this.messageIds.has(options.messageId)) {
+    if (options.messageId !== undefined && this.messageIds.get(options.messageId) === channel) {
       // The channel gave this message before (a retry): it is taken once.
       this.settings.emit(this.id, "message.duplicate", { messageId: options.messageId, channel });
       return options.messageId;

@@ -100,19 +100,36 @@ test("a reaction from the person is noted for the next turn without starting one
   await h.agent.conversation("w4")!.whenIdle();
 });
 
-test("a message the provider sends again (a webhook retried) is taken once", async () => {
-  const h = multi({ channels: { sms: { info: SMS, phone: true } } });
+test("a message the provider sends again (a webhook retried) is taken once; the same id from someone else, or on another channel, is new", async () => {
+  const h = multi({ channels: { sms: { info: SMS, phone: true }, whatsapp: { info: WHATSAPP, phone: true } } });
   const first = { channel: "sms", from: "+15550100100", message: "first", messageId: "SM9f2c" };
   const [a, b] = await Promise.all([h.agent.message(first), h.agent.message(first)]);
   assert.deepEqual(a, b);
   const turn = await h.nextCall(0);
-  assert.deepEqual(users(turn.request.messages), ["[SM9f2c] first"]);
+  assert.deepEqual(users(turn.request.messages), ["[sms · SM9f2c] first"]);
   turn.answer(respond(call("send_sms", { text: "Got it." })));
   await h.agent.conversation(a!.conversationId)!.whenIdle();
   await h.agent.message(first);
   await h.agent.conversation(a!.conversationId)!.whenIdle();
   assert.equal(h.calls.length, 1, "no turn for the repeat");
   assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2);
+
+  // Some providers number messages per chat, so the same id from someone else is a new message.
+  const other = await h.agent.message({ ...first, from: "+15550100200" });
+  assert.notEqual(other!.conversationId, a!.conversationId);
+  assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2, "not taken as a repeat");
+  const theirs = await h.nextCall(1);
+  assert.deepEqual(users(theirs.request.messages), ["[sms · SM9f2c] first"]);
+  theirs.answer(respond(call("send_sms", { text: "Got it." })));
+  await h.agent.conversation(other!.conversationId)!.whenIdle();
+
+  const sameId = await h.agent.message({ channel: "whatsapp", from: "15550100100", message: "second", messageId: "SM9f2c" });
+  assert.equal(sameId!.conversationId, a!.conversationId);
+  assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2, "not taken as a repeat");
+  const next = await h.nextCall(2);
+  assert.match(users(next.request.messages).at(-1)!, /^\[whatsapp · SM9f2c\] second$/);
+  next.answer(respond(call("send_whatsapp", { text: "Got that too." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
 });
 
 test("a long conversation sends the model only its latest messages that fit", async () => {
