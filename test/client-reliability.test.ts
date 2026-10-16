@@ -118,7 +118,61 @@ test("a tool call waits out the simulator's latency, then the POST budget, and a
   } finally { cloud.close(); }
 });
 
-test("on a cloud that does not resume, no bytes for the idle window means the stream is dead, and the run already in is kept", { timeout: 10_000 }, async () => {
+test("a tool call the cloud failed, which the agent started and never awaited, is that run's error and the session plays on", { timeout: 10_000 }, async () => {
+  // An intercept that hands off with `void tool.run(...)` and answers at once: the cloud's
+  // simulator_failed for that call used to crash the CLI as an unhandled rejection.
+  const unhandled: unknown[] = [];
+  let settled!: () => void;
+  const gate = new Promise<void>((done) => { settled = done; });
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); settled(); };
+  process.on("unhandledRejection", onUnhandled);
+  const logs: string[] = [];
+  const received: string[] = [];
+  const say = (conversationId: string, messageId: string): Command => ({ type: "message", conversationId, messageId, channel: { reactions: false, status: false }, incoming: { text: "HUMAN" } });
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+    if (url.endsWith("/tool-calls")) return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: false, error: "simulator_failed" }));
+    if (url.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(say("sms:a", "m1")));
+      // The rest of the session comes once the failed call has been dealt with, one way or the other.
+      void gate.then(() => {
+        res.write(frame(run("r1")));
+        res.write(frame(say("sms:b", "m2")));
+        res.write(frame(run("r2", 2)));
+        res.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [], dashboard: "d" } }));
+      });
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  const seen: string[] = [];
+  try {
+    await runInCloud({
+      cloud: cloud.url, name: "test", files: [],
+      log: (line) => { logs.push(line); if (/simulator_failed/.test(line)) settled(); },
+      onRun: (r) => seen.push(r.runId),
+      tools: [{ name: "handoff", description: "hand off", input: z.object({}), run: async () => null }],
+      build: ({ tools }: { tools: Tool[] }) => ({
+        channels: () => [], reacted: () => {},
+        receive: (conversationId) => {
+          received.push(conversationId);
+          if (conversationId === "sms:a") void tools[0]!.run({}, { conversationId, person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal });
+          return null;
+        },
+      }),
+    });
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    cloud.close();
+  }
+  assert.deepEqual(unhandled, [], "a call the cloud failed is never an unhandled rejection");
+  assert.deepEqual(received, ["sms:a", "sms:b"], "the next run still plays");
+  assert.deepEqual(seen, ["r1", "r2"]);
+  assert.match(logs.join("\n"), /sms:a: the cloud failed the tool call handoff \(simulator_failed\)/);
+});
+
+test("on a cloud that does not resume, no bytes for the idle window means the stream is dead, and the run already in is kept",{ timeout: 10_000 }, async () => {
   let gets = 0;
   const cloud = await listen(({ url }, res) => {
     if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "http://dash/s" }));
