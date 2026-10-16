@@ -204,6 +204,8 @@
   .grid2 label { display: grid; gap: 4px; font-size: 12px; color: var(--quiet); }
   .check { display: flex; gap: 6px; align-items: center; font-size: 13px; }
   details summary { cursor: pointer; font-size: 12px; color: var(--quiet); margin-bottom: 8px; }
+  details.sec > summary { margin: 0; color: var(--ink); }
+  details.sec:not([open]) { gap: 0; }
   .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; width: fit-content; }
   .seg button { border: 0; background: transparent; color: var(--ink); padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
   .seg button + button { border-left: 1px solid var(--line); }
@@ -272,8 +274,8 @@
         </div>
         <div class="pill" id="quietPill" hidden></div>
       </div>
-      <div class="sec" id="clockSec" hidden>
-        <div class="label">Move the clock <span class="hint">reminders and held nudges come due as it moves</span></div>
+      <details class="sec" id="clockSec" hidden>
+        <summary class="label">Move the clock <span class="hint">reminders and held nudges come due as it moves</span></summary>
         <div class="row2">
           <button type="button" class="ghost" data-advance="900000">+15 min</button>
           <button type="button" class="ghost" data-advance="3600000">+1 hour</button>
@@ -281,7 +283,7 @@
           <button type="button" class="ghost" id="toQuietEnd" title="Jump to when their quiet hours end">To end of quiet hours</button>
         </div>
         <div class="row2"><input type="datetime-local" id="clockTo" aria-label="Move the clock to (your time)"><button type="button" class="ghost" id="clockGo">Go to this time</button><span class="hint">your time</span></div>
-      </div>
+      </details>
       <div class="sec">
         <div class="label">Waiting to go</div>
         <ul class="items" id="waiting"></ul>
