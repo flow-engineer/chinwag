@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
-import { createAgent, sqlite, tool, type Outbound } from "../src/index.ts";
+import { createAgent, sqlite, Store, tool, type Outbound } from "../src/index.ts";
 import { SMS, call, gate, multi, respond, scriptedModel, users } from "./helpers.ts";
 
 const CHANNELS = { sms: { info: SMS, phone: true } };
@@ -96,4 +96,20 @@ test("receive() keeps a one-channel conversation across a restart too", async ()
 test("a database that survives restarts must be resumed before the first message", async () => {
   const h = multi({ channels: CHANNELS, database: sqlite(file()) });
   await assert.rejects(h.message("sms", "+15550100100", "hi"), /call await agent.resume\(\)/);
+});
+
+test("phone keys stored before E.164 are upgraded, so the number's next channel joins them; two already apart stay apart", async () => {
+  const database = sqlite(file());
+  const store = new Store(database, "default");
+  await store.migrate();
+  await store.createConversation("p_wa", "phone:15550100100");
+  await store.createConversation("p_both_wa", "phone:15550100200");
+  await store.createConversation("p_both_sms", "phone:+15550100200");
+  // As if the upgrade had not run yet on this database.
+  await database.run("DELETE FROM parley_migrations WHERE version = 4");
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, database });
+  await h.agent.resume();
+  const a = await h.message("sms", "+15550100100", "hi");
+  assert.equal(a!.conversationId, "p_wa");
+  assert.deepEqual((await store.allConversations()).map((c) => c.personKey).sort(), ["phone:+15550100100", "phone:+15550100200", "phone:15550100200"]);
 });

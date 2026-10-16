@@ -386,15 +386,19 @@ export class Agent {
       [personKey, verifiedBy] = [await this.testPersonKey(testPerson, adapter), "test person"];
     } else {
       const owner = await this.options.resolve?.({ channel, address });
-      [personKey, verifiedBy] = owner ? [`key:${owner}`, "resolver"] : adapter.phone ? [`phone:${normalizePhone(address)}`, "phone"] : [`${channel}:${address}`, "channel"];
+      const phone = adapter.phone ? normalizePhone(address) : "";
+      [personKey, verifiedBy] = owner ? [`key:${owner}`, "resolver"] : phone ? [`phone:${phone}`, "phone"] : [`${channel}:${address}`, "channel"];
     }
-    const existing = await this.store.conversationByKey(personKey);
-    const id = existing?.id ?? `p_${randomUUID().slice(0, 12)}`;
-    if (!existing) {
-      await this.store.createConversation(id, personKey);
-      const row = await this.store.conversation(id);
-      if (row) this.rows.set(id, row);
+    let row = await this.store.conversationByKey(personKey);
+    if (!row) {
+      // Two first messages from one person at once (on two channels) both get here; one insert
+      // wins, and both carry on with the conversation that is there now.
+      await this.store.createConversation(`p_${randomUUID().slice(0, 12)}`, personKey);
+      row = await this.store.conversationByKey(personKey);
+      if (!row) throw new Error(`chinwag: could not make a conversation for ${personKey}`);
+      if (!this.conversations.has(row.id)) this.rows.set(row.id, row);
     }
+    const id = row.id;
     await this.store.addIdentity(id, channel, address, verifiedBy);
     return { channel, address, conversationId: id, verifiedBy, lastMessageAt: null, via: "provider" };
   }
@@ -633,10 +637,14 @@ interface Arrival {
 
 const viaKey = (channel: string, address: string) => `${channel}\u0000${address}`;
 
-/** A phone number as one string however it was typed: digits, with a leading + kept. */
-function normalizePhone(address: string): string {
-  const digits = address.replace(/[^\d+]/g, "");
-  return digits.startsWith("+") ? `+${digits.slice(1).replace(/\+/g, "")}` : digits;
+/**
+ * A phone number as one string however the channel gave it, in E.164: formatting dropped, a 00
+ * prefix read as +, and digits with no + taken as international (WhatsApp gives "15550100100" for
+ * "+1 555 010 0100"). "" when there are no digits (not a phone number).
+ */
+export function normalizePhone(address: string): string {
+  const digits = address.trim().replace(/^00/, "").replace(/\D/g, "");
+  return digits ? `+${digits}` : "";
 }
 
 export function createAgent(options: AgentOptions): Agent {

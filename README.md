@@ -173,7 +173,7 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 ```
 
 - **Each platform's rules are built in:** WhatsApp buttons, lists, replies, reactions and its 24-hour window; SMS as plain text in segments; your app's own fields. Features your provider lacks are never offered to the model.
-- **One person, one conversation.** The same number on SMS and WhatsApp is one person. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
+- **One person, one conversation.** The same number on SMS and WhatsApp is one person, however each provider writes it (`+1 555 010 0100`, `15550100100`: both are `+15550100100`), also when their first messages on both arrive at once. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
 - **The agent gets one send tool per channel** (`send_sms`, `send_whatsapp`, `send_app`) and answers each message where it came in. `instructions` guide the agent on that channel only.
 
 ## Reminders and nudges

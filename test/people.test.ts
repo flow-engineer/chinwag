@@ -1,23 +1,32 @@
-// covers: src/agent.ts src/conversation.ts src/talk.ts
+// covers: src/agent.ts src/conversation.ts src/talk.ts src/store.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
-import { tool } from "../src/index.ts";
+import { sqlite, Store, tool } from "../src/index.ts";
 import { SMS, WEB_APP, WHATSAPP, call, last, multi, respond, users } from "./helpers.ts";
 
 const PHONES = { sms: { info: SMS, phone: true }, whatsapp: { info: WHATSAPP, phone: true } };
 
-test("the same phone number on two channels is one person, in one conversation", async () => {
+test("the same phone number on two channels is one person, in one conversation, however each channel writes it", async () => {
   const h = multi({ channels: PHONES });
   const a = await h.message("sms", "+1 (555) 010-0100", "hi");
   (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Hi!" })));
   await h.agent.conversation(a!.conversationId)!.whenIdle();
-  const b = await h.message("whatsapp", "+15550100100", "it's me on WhatsApp");
+  // WhatsApp gives the number as bare international digits.
+  const b = await h.message("whatsapp", "15550100100", "it's me on WhatsApp");
   assert.equal(b!.conversationId, a!.conversationId);
   const second = await h.nextCall(1);
   assert.deepEqual(users(second.request.messages), ["[sms · m1] hi", "[whatsapp · m2] it's me on WhatsApp"], "one history across both channels");
   second.answer(respond(call("send_whatsapp", { text: "Got you here too." })));
   await h.agent.conversation(a!.conversationId)!.whenIdle();
+});
+
+test("first messages from one number on two channels at once make one conversation", async () => {
+  const database = sqlite();
+  const h = multi({ channels: PHONES, database });
+  const [a, b] = await Promise.all([h.message("sms", "+15550007777", "hi"), h.message("whatsapp", "15550007777", "hi")]);
+  assert.equal(a!.conversationId, b!.conversationId);
+  assert.deepEqual((await new Store(database, "default").allConversations()).map((c) => c.personKey), ["phone:+15550007777"]);
 });
 
 test("different numbers, and a web visitor with no resolver, are never joined", async () => {
