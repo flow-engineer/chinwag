@@ -286,4 +286,6 @@ gets ids, timing, model calls and tool names but no messages, so nothing to show
 code: `createAgent({ ..., traces: { url, key, content: true, version: "v3" } })`. Traces are sent in the
 background after each turn and a failed send is dropped (logged once), so a dashboard outage never
 touches a chat; call `await agent.flushTraces()` before the process exits. Tests run under
-`node --test` never send from the environment.
+`node --test` never send from the environment. Under `chinwag test` the traces say they are a test's
+(`chinwag.run_kind` is "test", else "production", and each turn names the test session as
+`chinwag.test.session`), so the dashboard keeps them apart from real conversations.

@@ -10,6 +10,12 @@
 // Content (what the person and the agent wrote, tool inputs and results) is sent only with
 // `content: true` (CHINWAG_TRACES_CONTENT=1); without it the spans hold ids, names, timing and counts,
 // and the endpoint has no messages to show or grade.
+//
+// Under `chinwag test`, which plays the agent in this process, every trace says so: the CLI sets
+// CHINWAG_RUN_KIND=test before it loads the agent, and CHINWAG_TEST_SESSION once the session opens.
+// The resource's `chinwag.run_kind` is then "test" (else "production") and each turn's root span
+// names the session (`chinwag.test.session`), so the endpoint keeps test traces apart from real
+// conversations and links them to their test run.
 
 import { randomBytes } from "node:crypto";
 import type { EventSink, ChinwagEvent } from "./events.ts";
@@ -107,7 +113,8 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
   const warned = new Set<string>();
   let sending: Promise<void> | null = null;
 
-  const resource: Attr[] = [attr("service.name", agent.service), attr("telemetry.sdk.name", "chinwag")];
+  const testRun = process.env.CHINWAG_RUN_KIND === "test";
+  const resource: Attr[] = [attr("service.name", agent.service), attr("telemetry.sdk.name", "chinwag"), attr("chinwag.run_kind", testRun ? "test" : "production")];
   if (options.version) resource.push(attr("service.version", options.version));
 
   function warnOnce(kind: string, message: string) {
@@ -145,6 +152,8 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
     const attributes = [attr("gen_ai.operation.name", "invoke_agent"), attr("gen_ai.agent.name", agent.service), ...ids(conversationId)];
     const channel = kindOf(turn.inbound.at(-1)?.channel ?? turn.replyChannel);
     if (channel) attributes.push(attr("chinwag.channel", channel));
+    const session = testRun ? process.env.CHINWAG_TEST_SESSION : undefined;
+    if (session) attributes.push(attr("chinwag.test.session", session));
     if (turn.inbound.length) {
       attributes.push(attr("chinwag.messages", turn.inbound.length));
       if (turn.inbound[0].messageId) attributes.push(attr("chinwag.message_id", turn.inbound[0].messageId));
