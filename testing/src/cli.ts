@@ -147,7 +147,9 @@ if (command === "new") {
   1. cd ${name} && npm install
   2. Add one model key: cp .env.example .env; the file says where to make one
   3. npm start, then open the link it prints
-  4. Tell your coding agent what to build: its skills are in .claude/skills/`);
+  4. Tell your coding agent what to build: its skills are in .claude/skills/
+  5. Tests: put your test cloud's CI key in .env as CHINWAG_CLOUD_KEY (make one at
+     https://flow.engineer/observe: your agent, Developers), then npm test -- --synthetic`);
   process.exit(0);
 }
 

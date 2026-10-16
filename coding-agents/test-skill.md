@@ -108,6 +108,11 @@ written in scenarios: the dashboard shows it for the whole run (average, p95, mi
 - Write `judge` items as facts a reader can check from the transcript, not taste ("asks Sam to
   confirm before placing the order", not "is helpful").
 - Cover the unhappy paths the tool files list (busy, down, unknown item) as their own scenarios.
+- STOP: on SMS the simulated carrier blocks every message after STOP, as carriers do. A STOP in
+  `opening` that lands while the agent is still answering leaves it no message out, and the run
+  fails "A message from the agent". To test STOP mid-conversation, make it part of the person's
+  `goal` ("once the order is confirmed, reply with exactly STOP"), and check with `judge` that
+  nothing but the carrier's confirmation came after it.
 - When a real conversation went wrong, turn it into a scenario: its world is what was true then,
   its opening is what the person sent.
 
@@ -167,7 +172,11 @@ Work in this loop, and never finish on a partial run:
    - the agent: it said or did the wrong thing; fix its prompt, tools or code;
    - the test: a check asks for the wrong thing, or the scenario cannot reach its goal; fix the YAML;
    - the simulator: a tool output that could not happen, or a person who left the scenario; fix
-     `tests/tools/*.yaml` or the scenario's `world` and `person`.
+     `tests/tools/*.yaml` or the scenario's `world` and `person`;
+   - the judge: its reason contradicts the transcript `chinwag show` printed (the agent did say it).
+     Rerun with `--runs 3 --only <scenario>` before changing anything; if it keeps happening, write
+     the item as a fact about a message in the transcript, and say so in your report. Never change
+     the agent for a check it passed.
 4. `npx chinwag test --synthetic --failed`, then `--runs 3 --only <scenario>` on what you fixed, so
    a pass is not luck.
 5. The whole suite once more.
@@ -219,4 +228,4 @@ To implement one:
    are no `tests/tools/*.yaml`, no `world` for tools and no `outcome`, `calls` or `never` checks
    (the cloud sees no tool calls); write what must be true as `judge` items. Run `npx chinwag test --agent-url <url>`.
 
-`examples/http-agent-python` and `examples/http-agent-go` are the café's agent done this way.
+`examples/http-agent-python` and `examples/http-agent-go` are the café's agent done this way. They are in the repository, not in the npm package: https://github.com/flow-engineer/chinwag/tree/main/examples/http-agent-python and https://github.com/flow-engineer/chinwag/tree/main/examples/http-agent-go.
