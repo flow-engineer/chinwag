@@ -347,42 +347,6 @@ test("WhatsApp shows a declared template as WhatsApp would, and one not declared
   }
 });
 
-test("the playground's action buttons run on the server for the person played, behind its token, and their results reach the trace, polled too", async () => {
-  const h = agentOn(sqlite());
-  await h.agent.resume();
-  const token = "t".repeat(40);
-  const ran: string[] = [];
-  const actions = [
-    { label: "Their order ships", run: async ({ person, channel }: { person: { phone: string }; channel: string }) => (ran.push(`ships for ${person.phone} on ${channel}`), "sent") },
-    { label: "Price drops", run: () => { throw new Error("skipped: quiet hours"); } },
-  ];
-  const server = createServer(simulators({ actions }).handler(h.agent, { token, base: "/play" }));
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/play`;
-  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
-  const where = `channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`;
-  const press = (index: number, auth = headers, person = SAM.phone) => fetch(`${url}/api/actions`, { method: "POST", headers: auth, body: JSON.stringify({ index, person, channel: "whatsapp" }) });
-  try {
-    assert.deepEqual((await (await fetch(`${url}/api/platforms`, { headers })).json()).actions, ["Their order ships", "Price drops"]);
-    assert.equal((await press(0, { authorization: "Bearer wrong", "content-type": "application/json" })).status, 401);
-    assert.deepEqual(ran, [], "nothing runs without the token");
-
-    const { seq } = await (await fetch(`${url}/api/transcript?${where}`, { headers })).json();
-    assert.deepEqual(await (await press(0)).json(), { ok: true, result: "sent" });
-    assert.deepEqual(await (await press(1)).json(), { ok: false, error: "skipped: quiet hours" });
-    assert.equal((await press(2)).status, 400);
-    assert.equal((await press(0, headers, "+15550109999")).status, 403, "only test people");
-    assert.deepEqual(ran, [`ships for ${SAM.phone} on whatsapp`]);
-    const polled = (await (await fetch(`${url}/api/poll?${where}&after=${seq}`, { headers })).json()) as { events: Array<Record<string, unknown>> };
-    assert.deepEqual(polled.events.map(({ type, label, ok, result, error }) => ({ type, label, ok, result, error })), [
-      { type: "action", label: `Their order ships (${SAM.name})`, ok: true, result: "sent", error: undefined },
-      { type: "action", label: `Price drops (${SAM.name})`, ok: false, result: undefined, error: "skipped: quiet hours" },
-    ]);
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-});
-
 test("a turn's model error is printed on the terminal and reaches the playground's trace with its text", async () => {
   const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");

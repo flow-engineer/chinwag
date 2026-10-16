@@ -282,19 +282,7 @@ The Person tab also moves the agent's clock when you give it one (`const clock =
 `simulators({ clock })` and `createAgent({ now: clock.now })`), lists what is scheduled or held for
 the person, sets their time zone and quiet hours, and sends nudges with every field the API takes.
 
-To demo what your backend does (an order ships, a price drops) without a page of your own, give the
-playground `actions`: each is a button in its Person tab ("Their account") that runs your function on
-the server for the person being played (`run({ person, channel })`), usually one that calls your
-backend or `agent.nudge`. Label them about that person ("Their order ships"), never one named person. What it returns ("sent", "skipped: quiet
-hours") shows in the trace with its label; a throw shows as a failure. Actions exist only in the
-playground, behind its token, never on the agent's channels:
-
-```ts
-const play = simulators({
-  title: "My agent",
-  actions: [{ label: "Their order is ready", run: async ({ person }) => (await notifyOrderReady(person.phone)).status }],
-});
-```
+To demo what your backend does (an order ships), send the nudge it would send from the Person tab.
 
 On a deployed agent, mount it in your own server with a token of at least 32 characters, from a
 secret: `const playground = play.handler(agent, { token: process.env.PLAYGROUND_TOKEN!, base: "/playground" })`,

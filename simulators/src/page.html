@@ -291,10 +291,6 @@
         <div class="label">Waiting to go</div>
         <ul class="items" id="waiting"></ul>
       </div>
-      <div class="sec" id="actionsSec" hidden>
-        <div class="label">Their account</div>
-        <div class="row2" id="actions"></div>
-      </div>
       <div class="sec" id="nudgeSec" hidden>
         <div class="label">Send a nudge <span class="hint">as your backend would, through the API</span></div>
         <div class="seg" role="radiogroup" aria-label="Kind of nudge">
@@ -874,8 +870,8 @@
 
   // A Backend button's run, on every open page: what it returned, or why it failed.
   function actionDone(d) {
-    if (d.ok) logRow(d.at, "action", "inline", d.label + (d.result ? ` → ${d.result}` : ""));
-    else logRow(d.at, "action failed", "bad", `${d.label}: ${d.error}`);
+    if (d.ok) logRow(d.at, "playground", "inline", d.label + (d.result ? ` → ${d.result}` : ""));
+    else logRow(d.at, "playground failed", "bad", `${d.label}: ${d.error}`);
   }
 
   function logRow(at, tag, cls, text) {
@@ -1205,24 +1201,7 @@
   }
 
   (async () => {
-    let actions = [];
-    ({ platforms, cards, people = [], channels = [], actions = [], templates = [], panel = panel } = await (await fetch(BASE + "/api/platforms")).json());
-    if (PLAY && actions.length && !REPLAY) {
-      // Their account, in the Person tab: each button runs one of the playground's actions on the server, for this person.
-      $("actionsSec").hidden = false;
-      actions.forEach((label, index) => {
-        const btn = document.createElement("button");
-        btn.type = "button"; btn.className = "ghost"; btn.textContent = label;
-        btn.addEventListener("click", async () => {
-          btn.disabled = true;
-          try {
-            const res = await fetch(BASE + "/api/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...where(), index }) });
-            if (!res.ok) logRow(Date.now(), "action failed", "bad", `${label}: ${res.status}`);
-          } finally { btn.disabled = false; refreshPerson(); }
-        });
-        $("actions").appendChild(btn);
-      });
-    }
+    ({ platforms, cards, people = [], channels = [], templates = [], panel = panel } = await (await fetch(BASE + "/api/platforms")).json());
     if (PLAY) {
       if (!channels.length) return empty("This agent has no channels. Declare them in <code>createAgent({ channels: [...] })</code> (whatsapp(), sms(), customUI()) to test it here.");
       if (!people.length) return empty("This agent has no test people. Declare who may be played here in <code>createAgent({ testPeople: [{ name, phone }] })</code>.");
