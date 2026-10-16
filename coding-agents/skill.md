@@ -77,8 +77,8 @@ export function buildAgent(options: { model?: Model; events?: EventSink[]; tools
 
 Other `createAgent` options: `files` replaces `dir` on hosts with no file system (the folder's
 text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `context(conversationId)` adds who the person is and the time to
-every turn (cheaper than a lookup tool); `intercept(conversationId, text)` answers a message
-without the model (return the reply, `""` for silence, or `null` to let the agent answer);
+every turn (cheaper than a lookup tool); `intercept(conversationId, text, message)` answers a
+message without the model (return the reply, `""` for silence, or `null` to let the agent answer);
 `deadlineMs` (default 60,000) is the longest a reply waits for a tool before it moves to the
 background (set a tool's own `deadlineMs` for a known-slow one); `partialAfterMs` (default 5,000)
 is how long a finished tool's result waits for the others of its response; `shareUpdates` turns live status lines on web and app UIs off, or replaces their
@@ -165,6 +165,10 @@ Built in, so don't build them as tools: scheduled messages (`schedule_message`, 
 (`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
 `whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
 no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
+`intercept` sees them first, with `message.keyword` `"stop"`, `"start"` or `"help"` (else `null`):
+an agent with its own opt-out flag sets it there
+(`if (message.keyword === "stop") optedOut.add(conversationId)`). Chinwag keeps or lifts the STOP
+whatever the hook returns or throws; a reply it returns goes instead of Chinwag's, never both.
 SMS takes only STOP by default; the words carriers or regulators expect differ by country, so
 check the market's rules (`keywords: US_CARRIER_KEYWORDS` adds STOPALL, UNSUBSCRIBE, CANCEL, END
 and QUIT, as some US carrier rules expect; `keywords: { stop: [...] }` sets your own).

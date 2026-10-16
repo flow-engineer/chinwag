@@ -40,10 +40,12 @@ export interface AgentOptions {
   /** Added to the system prompt at the start of every turn: who this person is, the time. */
   context?: (conversationId: string) => Promise<string> | string;
   /**
-   * Answer some messages without the model (STOP, HELP): return the reply, "" to send nothing, or
-   * null to let the agent reply.
+   * Answer some messages without the model: return the reply, "" to send nothing, or null to let
+   * the agent reply. It sees a channel's STOP, START and HELP first, with `message.keyword` set
+   * (null for other messages), to keep its own state; Chinwag still keeps or lifts the STOP
+   * whatever it returns or throws, and sends its own reply unless this returns one.
    */
-  intercept?: (conversationId: string, text: string) => string | null;
+  intercept?: (conversationId: string, text: string, message: { keyword: Keyword | null }) => string | null;
   /**
    * Put every skill's full text in the prompt instead of loading skills on demand. Saves a model
    * round trip per skill; worth it when the skills are few and short.
@@ -387,13 +389,14 @@ export class Agent {
     const text = typeof input.message === "string" ? input.message : input.message.text;
     // Answered with no model call, and nothing else stored: the id alone is kept, so a retry is not answered again.
     const once = async () => input.messageId === undefined || (await this.store.inbound(conversationId, input.channel, input.messageId));
-    const answer = this.keyword(conversation, adapter.keywords, input.message, input.channel, input.messageId);
+    const kind = keywordIn(adapter.keywords, input.message);
+    const fixed = this.intercepted(conversationId, text, kind);
+    const answer = kind && this.keyword(conversation, adapter.keywords!, kind, text, fixed, input.channel, input.messageId);
     if (answer) {
       await answer.stored;
-      if (answer.reply && (answer.kind !== "help" || (await once()))) await deliver({ type: "message", text: answer.reply });
+      if (answer.reply && (kind !== "help" || (await once()))) await deliver({ type: "message", text: answer.reply });
       return null;
     }
-    const fixed = this.options.intercept?.(conversationId, text) ?? null;
     if (fixed !== null) {
       if (fixed && (await once())) await deliver({ type: "message", text: fixed });
       return null;
@@ -402,18 +405,28 @@ export class Agent {
   }
 
   /**
-   * A STOP, START or HELP keyword on a channel that has them, answered with no model call: what
-   * to send back (if anything), once it is stored. Null for any other message, and for HELP when
-   * the channel has no reply for it (the agent answers).
+   * The agent's `intercept`, told whether the message is a keyword. A keyword is handled the same
+   * whatever the hook does, so its error there is logged, not thrown.
    */
-  private keyword(conversation: Conversation, keywords: Keywords | undefined, message: string | Incoming, channel: string, messageId?: string): { kind: "stop" | "start" | "help"; reply?: string; stored: Promise<void> } | null {
-    if (typeof message !== "string" && (message.attachments?.length || message.choice)) return null;
-    const text = typeof message === "string" ? message : message.text;
-    const kind = keywordOf(keywords, text);
-    if (!kind) return null;
-    const reply = keywords!.replies?.[kind];
-    if (kind === "help") return reply ? { kind, reply, stored: Promise.resolve() } : null;
-    return { kind, reply, stored: conversation.keyword(kind, text, channel, messageId) };
+  private intercepted(conversationId: string, text: string, keyword: Keyword | null): string | null {
+    if (!keyword) return this.options.intercept?.(conversationId, text, { keyword }) ?? null;
+    try {
+      return this.options.intercept?.(conversationId, text, { keyword }) ?? null;
+    } catch (error) {
+      console.warn(`chinwag: intercept threw on a ${keyword.toUpperCase()} keyword; Chinwag handled it as usual:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * A STOP, START or HELP keyword, answered with no model call: what to send back (the hook's own
+   * reply, else the channel's, if any), once it is stored. Null for HELP with neither: the hook's
+   * answer, or the agent, takes it like any message.
+   */
+  private keyword(conversation: Conversation, keywords: Keywords, kind: Keyword, text: string, own: string | null, channel: string, messageId?: string): { reply?: string; stored: Promise<void> } | null {
+    const reply = own || keywords.replies?.[kind];
+    if (kind === "help") return reply ? { reply, stored: Promise.resolve() } : null;
+    return { reply, stored: conversation.keyword(kind, text, channel, messageId) };
   }
 
   /** The identity a message comes from, made (and linked to its person's conversation) the first time it writes. */
@@ -487,23 +500,25 @@ export class Agent {
    */
   receive(conversationId: string, message: string | Incoming, deliver: Deliver, options: ReceiveOptions = {}): string | null {
     const text = typeof message === "string" ? message : message.text;
-    const fixed = this.options.intercept?.(conversationId, text) ?? null;
-    if (fixed !== null) {
+    const name = options.channelName ?? "chat";
+    const defined = this.channelsByName.get(name);
+    const kind = keywordIn(defined?.keywords, message);
+    const fixed = this.intercepted(conversationId, text, kind);
+    if (fixed !== null && !kind) {
       if (fixed) void deliver({ type: "message", text: fixed });
       return null;
     }
     this.mustBeResumed();
-    const name = options.channelName ?? "chat";
-    const defined = this.channelsByName.get(name);
     const isNew = !this.conversations.has(conversationId) && !this.rows.has(conversationId);
     const conversation = this.open(conversationId, `${name}:${conversationId}`);
     if (isNew) conversation.persist(() => this.store.addIdentity(conversationId, name, conversationId, "channel"));
     conversation.link({ name, info: defined?.info ?? options.channel ?? NO_EXTRAS, params: defined?.params, instructions: defined?.instructions, address: conversationId, deliver, lastMessageAt: null });
-    const answer = this.keyword(conversation, defined?.keywords, message, name);
+    const answer = kind && this.keyword(conversation, defined!.keywords!, kind, text, fixed, name);
     if (answer) {
       if (answer.reply) void answer.stored.then(() => deliver({ type: "message", text: answer.reply! }));
       return null;
     }
+    if (fixed !== null) return null;
     return conversation.receive(message, { channel: name, messageId: options.messageId });
   }
 
@@ -736,6 +751,14 @@ interface Arrival {
 }
 
 const viaKey = (channel: string, address: string) => `${channel}\u0000${address}`;
+
+type Keyword = "stop" | "start" | "help";
+
+/** Which keyword a message is on a channel with them: text alone, never a file or a tap. */
+function keywordIn(keywords: Keywords | undefined, message: string | Incoming): Keyword | null {
+  if (typeof message !== "string" && (message.attachments?.length || message.choice)) return null;
+  return keywordOf(keywords, typeof message === "string" ? message : message.text);
+}
 
 /**
  * A phone number as one string however the channel gave it, in E.164: formatting dropped, a 00
