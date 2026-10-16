@@ -710,7 +710,7 @@ const summaryOf = (id: string, runs: Command[]) => ({ type: "finished", summary:
 
 /** A cloud that loses its first session: the receipt of that session's message answers session_gone.
  * The second open plays run 2 and finishes, loses that session too, or is refused for the spend cap. */
-function losingCloud(options: { reopen: boolean; second: "finish" | "gone" | "refused" }) {
+function losingCloud(options: { reopen: boolean; second: "finish" | "gone" | "refused"; firstRuns?: number }) {
   const opens: Array<Record<string, unknown>> = [];
   return listen(({ url, body }, res) => {
     const reply = (status: number, value: unknown) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
@@ -723,7 +723,7 @@ function losingCloud(options: { reopen: boolean; second: "finish" | "gone" | "re
     if (url.endsWith("/stream")) {
       res.writeHead(200, { "content-type": "text/event-stream" });
       if (url.includes("/s1/")) {
-        res.write(frame(run("r1", 1)));
+        if (options.firstRuns !== 0) res.write(frame(run("r1", 1)));
         res.write(frame(message("m1")));
       } else if (options.second === "gone") {
         res.write(frame(run("r2", 2)));
@@ -753,6 +753,20 @@ test("a session the cloud lost is opened again once, for only the runs with no r
     assert.equal(cloud.opens[0]?.only, undefined);
     assert.deepEqual(cloud.opens[1]?.only, [{ scenario: "hello", channel: "sms", run: 2 }]);
     assert.match(logs.join("\n"), /The cloud lost session s1 \(.*session_gone.*\)\. Opening a new session to play the 1 run with no result, at the cloud's cost again: hello on sms #2/);
+  } finally { cloud.close(); }
+});
+
+test("a session lost before any run finished is opened again without only, so the cloud need not have its files stored", { timeout: 10_000 }, async () => {
+  const cloud = await losingCloud({ reopen: true, second: "finish", firstRuns: 0 });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [hello], runs: 2, log: () => {},
+      build: () => ({ channels: () => [], receive: () => "m", reacted: () => {} }),
+    });
+    assert.equal(cloud.opens.length, 2);
+    assert.equal(cloud.opens[1]?.only, undefined);
+    assert.equal(cloud.opens[1]?.reopen, true);
+    assert.deepEqual(summary.lost, { sessionId: "s1", dashboard: "http://dash/s1" });
   } finally { cloud.close(); }
 });
 

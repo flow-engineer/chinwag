@@ -58,7 +58,8 @@ export interface OpenSession {
   resume?: boolean;
   /** The client opens one new session for the unfinished runs when this cloud says session_gone. */
   reopen?: boolean;
-  /** Play only these runs, numbered as given: a re-open after session_gone. Sent only to a cloud whose Opened said reopen. */
+  /** Play only these runs, numbered as given: a re-open after session_gone. Sent only to a cloud whose Opened said reopen,
+   * and only when some run finished: the cloud checks it against the suite's files it already stores. */
   only?: RunKey[];
 }
 

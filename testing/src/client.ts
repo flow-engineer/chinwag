@@ -194,7 +194,9 @@ export async function runInCloud(options: ConnectOptions): Promise<CloudSummary>
     log(`The cloud lost session ${error.sessionId} (${error.message}). Opening a new session to play the ${unfinished.length} run${unfinished.length === 1 ? "" : "s"} with no result, at the cloud's cost again: ${which}`);
     let second: SessionSummary;
     try {
-      second = await playSession(options, unfinished);
+      // With nothing finished, the whole suite plays again without `only`: the cloud takes `only` just
+      // for files it already stored, and the first session may have been lost before its uploads.
+      second = await playSession(options, error.runs.length ? unfinished : undefined);
     } catch (again) {
       // Never a third session: a second loss stops with what both sessions finished.
       if (again instanceof SessionStopped) throw new SessionStopped(again.message, [...error.runs, ...again.runs], again.dashboard);
