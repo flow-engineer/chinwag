@@ -390,7 +390,11 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
 
   function serve(handle: Handler, port: number): Promise<Listening> {
     const server = createServer(handle);
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      // A port another process holds rejects, saying so, instead of crashing on an unhandled 'error' event.
+      server.once("error", (error: NodeJS.ErrnoException) =>
+        reject(error.code === "EADDRINUSE" ? new Error(`Port ${port} is already in use (another playground?): stop it, or listen on another port.`, { cause: error }) : error),
+      );
       server.listen(port, "127.0.0.1", () =>
         resolve({
           // The bound port, so port 0 (any free port) works too.

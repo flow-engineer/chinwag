@@ -190,6 +190,17 @@ test("a file sent from a simulator reaches the agent with its bytes, the message
   }
 });
 
+test("a playground on a port already in use rejects with a message saying so, instead of crashing the process", async () => {
+  const h = agentOn(sqlite());
+  const taken = await simulators().listen(h.agent, 0);
+  try {
+    const port = Number(new URL(taken.url).port);
+    await assert.rejects(simulators().listen(h.agent, port), { message: `Port ${port} is already in use (another playground?): stop it, or listen on another port.` });
+  } finally {
+    await taken.close();
+  }
+});
+
 test("the playground shows the person's conversation from the agent's store, also after a restart", async () => {
   const path = join(mkdtempSync(join(tmpdir(), "chinwag-play-")), "chinwag.db");
   const first = agentOn(sqlite(path));
