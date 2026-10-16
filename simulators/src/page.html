@@ -762,6 +762,8 @@
     else if (e.type === "turn.end") { text = `turn done in ${e.ms} ms`; }
     else if (e.type === "tool.start") { text = `${e.tool} started`; }
     else if (e.type === "message.undelivered") { tag = "not delivered"; cls = "bad"; text = e.reason; }
+    // In the thread too, so it shows with Debug off; handle() shows each numbered event once.
+    else if (e.type === "model.error") { tag = "model error"; cls = "bad"; text = e.error; sysnote(`Model error: ${e.error}`, true); }
     logRow(e.at, tag, cls, text);
   }
 

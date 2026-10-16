@@ -14,13 +14,13 @@
 // every send to it (replies, scheduled messages, nudges) goes back the same way.
 
 import { randomUUID } from "node:crypto";
-import { declaredTemplate, fillTemplate, summarize, type Channel, type ChannelSummary } from "./channels.ts";
+import { declaredTemplate, fillTemplate, keywordOf, summarize, type Channel, type ChannelSummary, type Keywords } from "./channels.ts";
 import { Conversation, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type TranscriptEntry } from "./conversation.ts";
 import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
-import { addBusinessSchedule, claimDue } from "./schedules.ts";
+import { businessSchedule, claimDue } from "./schedules.ts";
 import { loadInstructions, loadSkills, readAgentFolder, skillTool, type AgentFiles } from "./skills.ts";
-import { Store, type ConversationRow, type IdentityRow, type StoreApi, type Via } from "./store.ts";
+import { Store, type ConversationRow, type IdentityRow, type NudgeRow, type StoreApi, type Via } from "./store.ts";
 import { toSpec, type Tool } from "./tools.ts";
 import { traces, tracesFromEnv, type Traces, type TracesOptions } from "./traces.ts";
 import type { ChannelInfo, Deliver, Incoming, Model, Outbound, Template, TemplateDefinition, Transcribe } from "./types.ts";
@@ -65,6 +65,13 @@ export interface AgentOptions {
   /** Quiet time after a message before the reply starts, to catch quick bursts. Default 300 ms. */
   debounceMs?: number;
   maxSteps?: number;
+  /**
+   * How much of a long conversation each model call carries. The latest messages are kept, older
+   * ones are left out (the agent is told so). `maxTokens` is the whole call's budget, roughly: default 60% of the model's
+   * `contextTokens` when it gives one, else 50,000. A tool result is cut to `toolResultChars`
+   * characters (default 12,000).
+   */
+  history?: { maxTokens?: number; toolResultChars?: number };
   events?: EventSink[];
   /** This agent's id in the database (several agents can share one). Default "default". */
   id?: string;
@@ -83,10 +90,23 @@ export interface AgentOptions {
    * none. Identities with the same key are one person.
    */
   resolve?: (identity: { channel: string; address: string }) => Promise<string | null> | string | null;
+  /**
+   * The calling code ("+91", "+44", "+1") for phone numbers that come without one. Set it when
+   * your SMS provider gives national numbers ("098765 43210"): on every phone channel but
+   * WhatsApp (whose numbers are always full), a number with no "+" or "00" is then read as this
+   * country's, its trunk 0 dropped (Italy's +39 keeps it), so it joins the same number on
+   * WhatsApp. Without it, bare digits are taken as international.
+   */
+  defaultCountryCode?: string;
   /** The business's time zone (IANA), for scheduled messages when a person's is not known. */
   timeZone?: string;
   /** How often due scheduled messages are looked for. Default 5,000 ms; 0 turns the timer off. */
   scheduleCheckMs?: number;
+  /**
+   * How long a provider's message id is kept, so a webhook retried within it is taken once.
+   * Older ones are deleted, hourly, by one runner, on the scheduled messages' timer. Default 7.
+   */
+  keepMessageIdsDays?: number;
   /** The clock (tests move it). */
   now?: () => number;
   /**
@@ -103,7 +123,7 @@ export interface AgentOptions {
   templates?: TemplateDefinition[];
   /**
    * Send every turn to a traces endpoint as a trace. Default: from the environment, on when
-   * CHINWAG_TRACES_KEY is set (with CHINWAG_TRACES_URL, and CHINWAG_TRACES_CONTENT=1 for content),
+   * CHINWAG_TRACES_KEY is set (address CHINWAG_TRACES_URL, else https://flow.engineer/observe; CHINWAG_TRACES_CONTENT=1 for content),
    * never under `node --test`.
    */
   traces?: TracesOptions;
@@ -146,18 +166,27 @@ export interface NudgeInput {
   template?: Template;
   /** Send it later, at this time (ms since the epoch), as a scheduled message. */
   at?: number;
-  /** The same key twice sends once; the second call gets the first's result. */
+  /** The same key twice sends once, also when both calls come at once: the second gets the first's result. */
   idempotencyKey?: string;
 }
 
 export interface NudgeResult {
   id: string;
-  /** sent, silent (the agent chose not to), dropped (a no-contact rule), refused, failed, or scheduled. */
-  status: string;
+  /**
+   * sent; silent (the agent chose not to); dropped (a no-contact rule, or their STOP); refused
+   * (outside_window, unknown_person); failed (it could not be sent, or the model failed: `reason`
+   * says why, and the person was sent nothing about it); or scheduled.
+   */
+  status: NudgeStatus;
   reason?: string;
 }
 
+export type NudgeStatus = "sent" | "silent" | "dropped" | "refused" | "failed" | "scheduled";
+
 const NO_EXTRAS: ChannelInfo = { reactions: false, status: false };
+const HOUR_MS = 3_600_000;
+/** Provider ids deleted per statement, so each one holds its locks briefly. */
+const PRUNE_BATCH = 1_000;
 
 export class Agent {
   private readonly conversations = new Map<string, Conversation>();
@@ -169,12 +198,17 @@ export class Agent {
   private readonly rows = new Map<string, ConversationRow>();
   private resumed = false;
   private readonly arriving = new Map<string, Promise<unknown>>();
-  private readonly nudgeWaiters = new Map<string, (result: NudgeResult) => void>();
+  /** Callers waiting for a queued nudge to settle: its first call, and any with the same key. */
+  private readonly nudgeWaiters = new Map<string, Array<(result: NudgeResult) => void>>();
   private readonly now: () => number;
   private readonly channelsByName: Map<string, Channel>;
   /** Where each identity (channel, address) last wrote from; sends go back the same way. */
   private readonly via = new Map<string, Via>();
   private playgroundSink: PlaygroundSink | null = null;
+  /** Before this, this runner does not ask for the pruning claim again (it, or another runner, had it). */
+  private pruneAfter = 0;
+  /** `defaultCountryCode`'s digits. */
+  private readonly countryCode: string | undefined;
   private readonly traces: Traces | null;
 
   constructor(options: AgentOptions) {
@@ -182,6 +216,8 @@ export class Agent {
     this.channelsByName = new Map((options.channels ?? []).map((c) => [c.name, c]));
     if (this.channelsByName.size !== (options.channels ?? []).length) throw new Error("chinwag: two channels have the same name");
     this.now = options.now ?? Date.now;
+    if (options.defaultCountryCode !== undefined && !/^\+?[1-9]\d{0,2}$/.test(options.defaultCountryCode.trim())) throw new Error(`chinwag: defaultCountryCode is a calling code such as "+91", not "${options.defaultCountryCode}"`);
+    this.countryCode = options.defaultCountryCode?.trim().replace(/^\+/, "");
     const tracing = options.traces ?? tracesFromEnv();
     this.traces = tracing ? traces(tracing, { service: options.id ?? "chinwag", kindOf: (name) => this.channelsByName.get(name)?.kind }) : null;
     const sinks = [...(options.events ?? []), ...(this.traces ? [this.traces.sink] : [])];
@@ -205,6 +241,8 @@ export class Agent {
       partialAfterMs: options.partialAfterMs ?? 5_000,
       debounceMs: options.debounceMs ?? 300,
       maxSteps: options.maxSteps ?? 8,
+      historyTokens: options.history?.maxTokens ?? (options.model.contextTokens ? Math.floor(options.model.contextTokens * 0.6) : 50_000),
+      toolResultChars: options.history?.toolResultChars ?? 12_000,
       maxRestarts: Number.POSITIVE_INFINITY,
       talk: {
         shareUpdates: options.shareUpdates !== false,
@@ -238,7 +276,8 @@ export class Agent {
 
   /**
    * A message from a person on a channel set up in `channels`. Returns the conversation and the id
-   * the agent knows the message by, or null when `intercept` answered it.
+   * the agent knows the message by, or null when `intercept` or a keyword answered it. Give the
+   * provider's own `messageId`: the same one again (a webhook retried) is not taken twice.
    */
   async message(input: { channel: string; from: string; message: string | Incoming; messageId?: string }): Promise<{ conversationId: string; messageId: string } | null> {
     return this.take(this.channelOf(input.channel), { ...input, via: "provider" });
@@ -334,18 +373,47 @@ export class Agent {
     await this.settings.ready;
     const identity = await this.conversationFor(adapter, input.channel, input.from, input.person);
     const conversationId = identity.conversationId;
+    if (input.messageId !== undefined && (await this.store.inboundTaken(conversationId, input.channel, input.messageId))) {
+      // The provider sent this message before (a webhook retried): it was taken then. Its id is
+      // written with what the message stores (its inbox row, a STOP), so a crash keeps neither.
+      this.settings.emit(conversationId, "message.duplicate", { messageId: input.messageId, channel: input.channel });
+      return { conversationId, messageId: input.messageId };
+    }
     if (identity.via !== input.via) await this.store.setIdentityVia(input.channel, input.from, input.via);
     this.via.set(viaKey(input.channel, input.from), input.via);
     const conversation = this.open(conversationId);
     const deliver = this.deliverer(adapter, input.from, conversationId);
     conversation.link({ name: input.channel, info: adapter.info, params: adapter.params, instructions: adapter.instructions, address: input.from, deliver, lastMessageAt: null });
     const text = typeof input.message === "string" ? input.message : input.message.text;
+    // Answered with no model call, and nothing else stored: the id alone is kept, so a retry is not answered again.
+    const once = async () => input.messageId === undefined || (await this.store.inbound(conversationId, input.channel, input.messageId));
+    const answer = this.keyword(conversation, adapter.keywords, input.message, input.channel, input.messageId);
+    if (answer) {
+      await answer.stored;
+      if (answer.reply && (answer.kind !== "help" || (await once()))) await deliver({ type: "message", text: answer.reply });
+      return null;
+    }
     const fixed = this.options.intercept?.(conversationId, text) ?? null;
     if (fixed !== null) {
-      if (fixed) await deliver({ type: "message", text: fixed });
+      if (fixed && (await once())) await deliver({ type: "message", text: fixed });
       return null;
     }
     return { conversationId, messageId: conversation.receive(input.message, { channel: input.channel, messageId: input.messageId }) };
+  }
+
+  /**
+   * A STOP, START or HELP keyword on a channel that has them, answered with no model call: what
+   * to send back (if anything), once it is stored. Null for any other message, and for HELP when
+   * the channel has no reply for it (the agent answers).
+   */
+  private keyword(conversation: Conversation, keywords: Keywords | undefined, message: string | Incoming, channel: string, messageId?: string): { kind: "stop" | "start" | "help"; reply?: string; stored: Promise<void> } | null {
+    if (typeof message !== "string" && (message.attachments?.length || message.choice)) return null;
+    const text = typeof message === "string" ? message : message.text;
+    const kind = keywordOf(keywords, text);
+    if (!kind) return null;
+    const reply = keywords!.replies?.[kind];
+    if (kind === "help") return reply ? { kind, reply, stored: Promise.resolve() } : null;
+    return { kind, reply, stored: conversation.keyword(kind, text, channel, messageId) };
   }
 
   /** The identity a message comes from, made (and linked to its person's conversation) the first time it writes. */
@@ -359,15 +427,19 @@ export class Agent {
       [personKey, verifiedBy] = [await this.testPersonKey(testPerson, adapter), "test person"];
     } else {
       const owner = await this.options.resolve?.({ channel, address });
-      [personKey, verifiedBy] = owner ? [`key:${owner}`, "resolver"] : adapter.phone ? [`phone:${normalizePhone(address)}`, "phone"] : [`${channel}:${address}`, "channel"];
+      const phone = adapter.phone ? normalizePhone(address, adapter.kind === "whatsapp" ? undefined : this.countryCode) : "";
+      [personKey, verifiedBy] = owner ? [`key:${owner}`, "resolver"] : phone ? [`phone:${phone}`, "phone"] : [`${channel}:${address}`, "channel"];
     }
-    const existing = await this.store.conversationByKey(personKey);
-    const id = existing?.id ?? `p_${randomUUID().slice(0, 12)}`;
-    if (!existing) {
-      await this.store.createConversation(id, personKey);
-      const row = await this.store.conversation(id);
-      if (row) this.rows.set(id, row);
+    let row = await this.store.conversationByKey(personKey);
+    if (!row) {
+      // Two first messages from one person at once (on two channels) both get here; one insert
+      // wins, and both carry on with the conversation that is there now.
+      await this.store.createConversation(`p_${randomUUID().slice(0, 12)}`, personKey);
+      row = await this.store.conversationByKey(personKey);
+      if (!row) throw new Error(`chinwag: could not make a conversation for ${personKey}`);
+      if (!this.conversations.has(row.id)) this.rows.set(row.id, row);
     }
+    const id = row.id;
     await this.store.addIdentity(id, channel, address, verifiedBy);
     return { channel, address, conversationId: id, verifiedBy, lastMessageAt: null, via: "provider" };
   }
@@ -427,17 +499,38 @@ export class Agent {
     const conversation = this.open(conversationId, `${name}:${conversationId}`);
     if (isNew) conversation.persist(() => this.store.addIdentity(conversationId, name, conversationId, "channel"));
     conversation.link({ name, info: defined?.info ?? options.channel ?? NO_EXTRAS, params: defined?.params, instructions: defined?.instructions, address: conversationId, deliver, lastMessageAt: null });
+    const answer = this.keyword(conversation, defined?.keywords, message, name);
+    if (answer) {
+      if (answer.reply) void answer.stored.then(() => deliver({ type: "message", text: answer.reply! }));
+      return null;
+    }
     return conversation.receive(message, { channel: name, messageId: options.messageId });
   }
 
-  /** The person reacted to one of the agent's messages; the agent learns it at its next turn. */
+  /**
+   * The person reacted to one of the agent's messages; the agent learns it at its next turn. The
+   * conversation is loaded from the store when it is not in memory (after a restart).
+   */
   reacted(conversationId: string, emoji: string, toText: string): void {
-    this.conversations.get(conversationId)?.reacted(emoji, toText);
+    this.withConversation(conversationId, (c) => c.reacted(emoji, toText));
   }
 
-  /** The channel reports that a message did not reach the person; the agent hears about it. */
+  /** The channel reports that a message did not reach the person; the agent hears about it, also after a restart. */
   undelivered(conversationId: string, text: string, reason: string): void {
-    this.conversations.get(conversationId)?.undelivered(text, reason);
+    this.withConversation(conversationId, (c) => c.undelivered(text, reason));
+  }
+
+  /** Acts on a conversation now when it is in memory, else once it is loaded from the store; never on one the store does not hold. */
+  private withConversation(conversationId: string, act: (conversation: Conversation) => void): void {
+    const resident = this.conversations.get(conversationId);
+    if (resident) return act(resident);
+    void (async () => {
+      await this.settings.ready;
+      const row = this.rows.get(conversationId) ?? (await this.store.conversation(conversationId));
+      if (!row) return;
+      this.rows.set(conversationId, row);
+      act(this.open(conversationId));
+    })().catch((error) => console.warn(`chinwag: conversation ${conversationId} could not be loaded for a report:`, error));
   }
 
   conversation(conversationId: string): Conversation | undefined {
@@ -458,43 +551,95 @@ export class Agent {
     if (declared) fillTemplate(declared, input.template!);
     if (input.idempotencyKey) {
       const earlier = await this.store.nudgeByKey(input.idempotencyKey);
-      if (earlier) return this.result(earlier.id, earlier.status, earlier.reason);
+      if (earlier) return this.outcome(earlier);
     }
     const identity = await this.store.identity(input.to.channel, input.to.address);
     if (!identity) return { id: "", status: "refused", reason: "unknown_person" };
     const id = `n_${randomUUID().slice(0, 8)}`;
     const conversationId = identity.conversationId;
     const record = { id, conversationId, channel: input.to.channel, idempotencyKey: input.idempotencyKey ?? null, reason: null };
+    const stop = input.at === undefined ? await this.stopOf(conversationId) : null;
+    // Written once per key: a call that loses the insert to one with the same key gets that one's result.
+    const add = async (row: NudgeRow, schedule?: Parameters<StoreApi["addNudge"]>[1]): Promise<NudgeResult | number> => {
+      const inbox = await this.store.addNudge(row, schedule);
+      if (inbox !== null) return inbox;
+      return this.outcome((await this.store.nudgeByKey(input.idempotencyKey!))!);
+    };
+    const settledAs = async (row: NudgeRow): Promise<NudgeResult> => {
+      const added = await add(row);
+      return typeof added === "number" ? this.result(row.id, row.status, row.reason) : added;
+    };
+    if (stop) {
+      const reason = `no-contact rule ${stop.id}: ${stop.rule}`;
+      return settledAs({ ...record, body: input.template ? { template: input.template } : { text: input.text, prompt: input.prompt }, status: "dropped", reason });
+    }
     if (input.at !== undefined) {
       if (input.template) throw new Error("chinwag: a template nudge cannot be scheduled yet");
       const zone = (await this.store.conversation(conversationId))?.timeZone ?? this.options.timeZone ?? "UTC";
-      await addBusinessSchedule(this.store, conversationId, input.to.channel, input.at, zone, { text: input.text, prompt: input.prompt });
-      await this.store.addNudge({ ...record, body: { text: input.text, prompt: input.prompt, at: input.at }, status: "scheduled" });
-      return { id, status: "scheduled" };
+      const schedule = businessSchedule(conversationId, input.to.channel, input.at, zone, { text: input.text, prompt: input.prompt });
+      const added = await add({ ...record, body: { text: input.text, prompt: input.prompt, at: input.at }, status: "scheduled" }, schedule);
+      return typeof added === "number" ? { id, status: "scheduled" } : added;
     }
     const body = input.template ? { template: input.template } : input.text !== undefined ? { text: input.text } : { prompt: input.prompt };
     if (!input.template && windowClosed({ info: this.infoOf(input.to.channel, conversationId), lastMessageAt: identity.lastMessageAt }, this.now())) {
-      await this.store.addNudge({ ...record, body, status: "refused", reason: "outside_window" });
-      return { id, status: "refused", reason: "outside_window" };
+      return settledAs({ ...record, body, status: "refused", reason: "outside_window" });
     }
-    const settled = new Promise<NudgeResult>((resolve) => this.nudgeWaiters.set(id, resolve));
-    const inbox = await this.store.addNudge({ ...record, body, status: "queued" });
-    this.wake(conversationId, inbox);
+    const settled = this.waitFor(id);
+    const added = await add({ ...record, body, status: "queued" });
+    if (typeof added !== "number") {
+      this.nudgeWaiters.delete(id);
+      return added;
+    }
+    this.wake(conversationId, added);
     return settled;
   }
 
-  /** Looks for due scheduled messages once and hands each to its conversation. Returns how many. */
+  /** A nudge already recorded, as its caller sees it: settled, or (still queued) once it settles. */
+  private async outcome(row: NudgeRow): Promise<NudgeResult> {
+    if (row.status !== "queued") return this.result(row.id, row.status, row.reason);
+    const settled = this.waitFor(row.id);
+    // It may have settled between the read and the wait.
+    const now = await this.store.nudge(row.id);
+    if (now && now.status !== "queued") this.release(row.id, this.result(row.id, now.status, now.reason));
+    return settled;
+  }
+
+  private waitFor(id: string): Promise<NudgeResult> {
+    return new Promise((resolve) => this.nudgeWaiters.set(id, [...(this.nudgeWaiters.get(id) ?? []), resolve]));
+  }
+
+  private release(id: string, result: NudgeResult): void {
+    for (const resolve of this.nudgeWaiters.get(id) ?? []) resolve(result);
+    this.nudgeWaiters.delete(id);
+  }
+
+  /**
+   * Looks for due scheduled messages once and hands each to its conversation. Returns how many.
+   * Once an hour, one runner also deletes provider message ids older than `keepMessageIdsDays`.
+   */
   async runDue(): Promise<number> {
     await this.settings.ready;
     if (this.store.durable && !this.resumed) return 0;
     const now = this.now();
     const queued = await claimDue(this.store, now, async (s) => {
+      const stop = await this.stopOf(s.conversationId);
+      if (stop) return `no-contact rule ${stop.id}: ${stop.rule}`;
       const identity = (await this.store.identities(s.conversationId)).find((i) => i.channel === s.channel);
       if (!identity) return `no way to reach them on ${s.channel}`;
       return windowClosed({ info: this.infoOf(s.channel, s.conversationId), lastMessageAt: identity.lastMessageAt }, now) ? "outside_window" : null;
     });
     for (const q of queued) this.wake(q.conversationId, q.inbox);
+    await this.pruneMessageIds(now).catch((error) => console.warn("chinwag: pruning message ids:", error));
     return queued.length;
+  }
+
+  /** Deletes provider message ids past their keep, in batches, when this runner claims it (at most hourly). */
+  private async pruneMessageIds(now: number): Promise<void> {
+    if (now < this.pruneAfter) return;
+    this.pruneAfter = now + HOUR_MS;
+    if (!(await this.store.claimUpkeep("prune_message_ids", now, now + HOUR_MS))) return;
+    const before = now - (this.options.keepMessageIdsDays ?? 7) * 24 * HOUR_MS;
+    while ((await this.store.pruneInbound(before, PRUNE_BATCH)) === PRUNE_BATCH);
   }
 
   /** The agent's channels without their sends: what the simulators and the test cloud play. */
@@ -562,13 +707,17 @@ export class Agent {
     if (target.run) await this.store.settleRun(target.run, status, reason);
     if (target.nudge) {
       await this.store.settleNudge(target.nudge, status, reason);
-      this.nudgeWaiters.get(target.nudge)?.(this.result(target.nudge, status, reason));
-      this.nudgeWaiters.delete(target.nudge);
+      this.release(target.nudge, this.result(target.nudge, status, reason));
     }
   }
 
+  /** Their STOP, if they texted one. */
+  private async stopOf(conversationId: string) {
+    return (await this.store.noContact(conversationId, this.now())).find((r) => r.hard) ?? null;
+  }
+
   private result(id: string, status: string, reason?: string | null): NudgeResult {
-    return reason ? { id, status, reason } : { id, status };
+    return reason ? { id, status: status as NudgeStatus, reason } : { id, status: status as NudgeStatus };
   }
 
   private mustBeResumed(): void {
@@ -588,10 +737,18 @@ interface Arrival {
 
 const viaKey = (channel: string, address: string) => `${channel}\u0000${address}`;
 
-/** A phone number as one string however it was typed: digits, with a leading + kept. */
-function normalizePhone(address: string): string {
-  const digits = address.replace(/[^\d+]/g, "");
-  return digits.startsWith("+") ? `+${digits.slice(1).replace(/\+/g, "")}` : digits;
+/**
+ * A phone number as one string however the channel gave it, in E.164: formatting dropped, a 00
+ * prefix read as +, and digits with no + taken as international (WhatsApp gives "15550100100" for
+ * "+1 555 010 0100"), or, given a `countryCode`, as that country's national number. "" when there
+ * are no digits (not a phone number).
+ */
+export function normalizePhone(address: string, countryCode?: string): string {
+  const trimmed = address.trim();
+  const digits = trimmed.replace(/^00/, "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (!countryCode || trimmed.startsWith("+") || trimmed.startsWith("00")) return `+${digits}`;
+  return `+${countryCode}${countryCode === "39" ? digits : digits.replace(/^0/, "")}`;
 }
 
 export function createAgent(options: AgentOptions): Agent {

@@ -25,7 +25,7 @@ const provider = { sendMessage: notConnected, react: notConnected, typing: notCo
 export function buildAgent(options: BuildOptions = {}) {
   return createAgent({
     ...(options.host ?? { dir: fileURLToPath(new URL("../agent", import.meta.url)) }),
-    model: options.model ?? openAICompatible({ model: process.env.CAFE_MODEL ?? "anthropic/claude-haiku-5.5" }),
+    model: options.model ?? openAICompatible({ model: process.env.CAFE_MODEL }),
     tools: options.tools ?? cafeTools,
     context: () => `Now: ${new Date().toLocaleString("en-US", { timeZone: "America/New_York" })} (New York)`,
     events: options.events ?? [],

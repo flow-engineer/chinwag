@@ -33,17 +33,18 @@ const TIMEOUT_MS = 10_000;
 /** The cap per content attribute. */
 const MAX_TEXT = 32 * 1024;
 
+/** Where traces go when a key is set and no address is, and the test cloud `chinwag test` uses when none is named. */
+export const OBSERVE_URL = "https://flow.engineer/observe";
+
 /**
- * The traces options from the environment: on when CHINWAG_TRACES_KEY is set (with CHINWAG_TRACES_URL,
- * required), except under `node --test` (NODE_TEST_CONTEXT), so an agent's own tests never send
- * their turns.
+ * The traces options from the environment: on when CHINWAG_TRACES_KEY is set, except under
+ * `node --test` (NODE_TEST_CONTEXT), so an agent's own tests never send their turns. The address
+ * is CHINWAG_TRACES_URL, else {@link OBSERVE_URL}.
  */
 export function tracesFromEnv(env: NodeJS.ProcessEnv = process.env): TracesOptions | undefined {
-  const key = env.CHINWAG_TRACES_KEY ?? "";
+  const key = env.CHINWAG_TRACES_KEY?.trim() ?? "";
   if (!key || env.NODE_TEST_CONTEXT) return undefined;
-  const url = env.CHINWAG_TRACES_URL ?? "";
-  if (!url) throw new Error("chinwag: CHINWAG_TRACES_KEY is set but CHINWAG_TRACES_URL is not: set it to your traces endpoint's URL");
-  return { key, url, content: env.CHINWAG_TRACES_CONTENT === "1" };
+  return { key, url: env.CHINWAG_TRACES_URL?.trim() || OBSERVE_URL, content: env.CHINWAG_TRACES_CONTENT === "1" };
 }
 
 /** The endpoint's channel names: Chinwag's custom UIs are web or app chats. */

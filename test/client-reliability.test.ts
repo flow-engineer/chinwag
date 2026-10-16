@@ -108,7 +108,7 @@ test("a tool call waits out the simulator's latency, then the POST budget, and a
         channels: () => [], reacted: () => {},
         receive: () => {
           const lookup = tools[0];
-          if (lookup) void Promise.resolve(lookup.run({}, { conversationId: "c", person: "p", channel: "sms" })).then(() => {}, (error: unknown) => { timed = error; });
+          if (lookup) void Promise.resolve(lookup.run({}, { conversationId: "c", person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal })).then(() => {}, (error: unknown) => { timed = error; });
           return "m";
         },
       }),

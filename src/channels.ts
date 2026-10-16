@@ -26,7 +26,58 @@ export interface Channel {
   params?: Record<string, z.ZodType>;
   /** Your own guidance for the agent on this channel, added to its prompt while the person uses it. */
   instructions?: string;
+  /** Opt-out keywords this channel honours (SMS and WhatsApp have them by default). */
+  keywords?: Keywords;
   send(address: string, outbound: Outbound): Promise<void> | void;
+}
+
+/**
+ * Keywords a person texts on their own (the whole message, in any case, with only spaces,
+ * punctuation or emoji around it: "Stop." is one, "stop by tomorrow" is not), answered with no
+ * model call. `stop` records a hard no-contact rule: nothing the
+ * business starts (nudges, scheduled messages, their own reminders) goes to them on any channel
+ * until they text a `start` word. `help` sends `replies.help`; without one the agent answers it.
+ * A reply left out sends nothing (the provider may send its own).
+ */
+export interface Keywords {
+  stop: string[];
+  start: string[];
+  help: string[];
+  replies?: { stop?: string; start?: string; help?: string };
+}
+
+/**
+ * SMS's default: STOP to opt out, START to resume, HELP or INFO for help. Which words carriers or
+ * regulators expect differs by country; check your market's rules and pass more when they ask.
+ */
+export const SMS_KEYWORDS: Keywords = { stop: ["STOP"], start: ["START"], help: ["HELP", "INFO"] };
+
+/**
+ * The fuller list some US carrier rules expect on SMS, opt in:
+ * `sms(provider, { keywords: US_CARRIER_KEYWORDS })`, or `{ ...US_CARRIER_KEYWORDS, replies }`.
+ */
+export const US_CARRIER_KEYWORDS: Keywords = {
+  stop: ["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"],
+  start: ["START", "UNSTOP"],
+  help: ["HELP", "INFO"],
+};
+
+/** WhatsApp has no carrier keywords; a business honours a plain STOP all the same. */
+export const WHATSAPP_KEYWORDS: Keywords = { stop: ["STOP", "UNSUBSCRIBE"], start: ["START"], help: [] };
+
+/** Which keyword a message is, if it is one: the whole message, with only spaces, punctuation or emoji around it. */
+export function keywordOf(keywords: Keywords | undefined, text: string): "stop" | "start" | "help" | null {
+  if (!keywords) return null;
+  const bare = (s: string) => s.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/\s+/g, " ").toUpperCase();
+  const word = bare(text);
+  if (!word) return null;
+  for (const kind of ["stop", "start", "help"] as const) if (keywords[kind].some((k) => bare(k) === word)) return kind;
+  return null;
+}
+
+/** A channel factory's `keywords` option: false for none, or changes to the defaults. */
+function keywordsFrom(defaults: Keywords, option: false | Partial<Keywords> | undefined): Keywords | undefined {
+  return option === false ? undefined : { ...defaults, ...option };
 }
 
 /** A channel without its send: what the simulators and the test cloud need to play it. */
@@ -100,7 +151,7 @@ export const SMS: ChannelInfo = { reactions: false, status: false, formatting: "
 
 export type WhatsAppFeature = "buttons" | "lists" | "links" | "images" | "replies" | "reactions" | "typing" | "readReceipts" | "templates";
 
-export function whatsapp(provider: WhatsAppProvider, options: { name?: string; disable?: WhatsAppFeature[]; instructions?: string } = {}): Channel {
+export function whatsapp(provider: WhatsAppProvider, options: { name?: string; disable?: WhatsAppFeature[]; instructions?: string; keywords?: false | Partial<Keywords> } = {}): Channel {
   const off = new Set(options.disable ?? []);
   const has = (feature: WhatsAppFeature, available: boolean) => available && !off.has(feature);
   const f = provider.features ?? {};
@@ -119,6 +170,7 @@ export function whatsapp(provider: WhatsAppProvider, options: { name?: string; d
     kind: "whatsapp",
     info,
     instructions: options.instructions,
+    keywords: keywordsFrom(WHATSAPP_KEYWORDS, options.keywords),
     phone: true,
     send: (to, outbound) => {
       switch (outbound.type) {
@@ -142,12 +194,13 @@ export function whatsapp(provider: WhatsAppProvider, options: { name?: string; d
   };
 }
 
-export function sms(provider: SmsProvider, options: { name?: string; instructions?: string } = {}): Channel {
+export function sms(provider: SmsProvider, options: { name?: string; instructions?: string; keywords?: false | Partial<Keywords> } = {}): Channel {
   return {
     name: options.name ?? "sms",
     kind: "sms",
     info: SMS,
     instructions: options.instructions,
+    keywords: keywordsFrom(SMS_KEYWORDS, options.keywords),
     phone: true,
     send: (to, outbound) => {
       if (outbound.type === "message") return provider.sendMessage(to, { text: outbound.text });

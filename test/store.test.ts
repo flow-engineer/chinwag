@@ -5,11 +5,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
-import { createAgent, sqlite, tool, type Outbound } from "../src/index.ts";
-import { SMS, call, gate, multi, respond, scriptedModel, users } from "./helpers.ts";
+import { createAgent, sqlite, SMS_KEYWORDS, Store, tool, type Database, type Outbound } from "../src/index.ts";
+import { SMS, WHATSAPP, call, gate, last, multi, respond, scriptedModel, users } from "./helpers.ts";
 
 const CHANNELS = { sms: { info: SMS, phone: true } };
 const file = () => join(mkdtempSync(join(tmpdir(), "chinwag-db-")), "chinwag.db");
+
+/** A database that dies at the first write to `table`: that write and every statement after it fail, as when the process is killed there. */
+function diesAt(table: string, db: Database): Database {
+  let dead = false;
+  const guard = (sql: string) => {
+    if (dead || sql.startsWith(`INSERT INTO ${table} `)) {
+      dead = true;
+      throw new Error("the process died");
+    }
+  };
+  const on = (inner: Omit<Database, "transaction">): Omit<Database, "transaction"> => ({
+    durable: inner.durable,
+    dialect: inner.dialect,
+    query: async (sql, params) => (guard(sql), inner.query(sql, params)),
+    run: async (sql, params) => (guard(sql), inner.run(sql, params)),
+  });
+  return { ...on(db), transaction: (work) => db.transaction((tx) => work(on(tx))) };
+}
 
 test("an agent started again on the same database carries on the conversation", async () => {
   const path = file();
@@ -96,4 +114,157 @@ test("receive() keeps a one-channel conversation across a restart too", async ()
 test("a database that survives restarts must be resumed before the first message", async () => {
   const h = multi({ channels: CHANNELS, database: sqlite(file()) });
   await assert.rejects(h.message("sms", "+15550100100", "hi"), /call await agent.resume\(\)/);
+});
+
+test("phone keys stored before E.164 are upgraded, so the number's next channel joins them; two already apart (in any two forms) stay apart", async () => {
+  const database = sqlite(file());
+  const store = new Store(database, "default");
+  await store.migrate();
+  await store.createConversation("p_wa", "phone:15550100100");
+  await store.createConversation("p_both_wa", "phone:15550100200");
+  await store.createConversation("p_both_sms", "phone:+15550100200");
+  await store.createConversation("p_old_wa", "phone:15550100300");
+  await store.createConversation("p_old_00", "phone:0015550100300");
+  // As if the upgrade had not run yet on this database.
+  await database.run("DELETE FROM parley_migrations WHERE version = 4");
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, database });
+  await h.agent.resume();
+  const a = await h.message("sms", "+15550100100", "hi");
+  assert.equal(a!.conversationId, "p_wa");
+  assert.deepEqual((await store.allConversations()).map((c) => c.personKey).sort(), ["phone:+15550100100", "phone:+15550100200", "phone:0015550100300", "phone:15550100200", "phone:15550100300"]);
+});
+
+test("a tool gets its call id and a signal, and an idempotency key that is the same when its turn runs again after a restart", async () => {
+  const path = file();
+  const seen: Array<{ callId: string; idempotencyKey: string; signal: AbortSignal }> = [];
+  const never = gate<string>();
+  let answer: Promise<string> = never.promise;
+  const book = tool({ name: "book", description: "", input: z.object({ slot: z.string() }), deadlineMs: 60_000, run: (_input, context) => (seen.push(context), answer) });
+  const before = multi({ channels: CHANNELS, database: sqlite(path), tools: [book] });
+  await before.agent.resume();
+  const a = await before.message("sms", "+15550100100", "book Friday 10am");
+  const booking = call("book", { slot: "fri-10" });
+  (await before.nextCall(0)).answer(respond(call("send_sms", { text: "Booking it." }), booking));
+  while (!seen.length) await new Promise((resolve) => setImmediate(resolve));
+  await before.agent.conversation(a!.conversationId)!.stored(); // the process dies while the booking runs
+
+  answer = Promise.resolve("booked");
+  const after = multi({ channels: CHANNELS, database: sqlite(path), dir: before.dir, tools: [book] });
+  await after.agent.resume();
+  const again = await after.nextCall(0);
+  assert.match(last(again.request.messages).content, /Cut off by a restart/);
+  again.answer(respond(call("book", { slot: "fri-10" })));
+  (await after.nextCall(1)).answer(respond(call("send_sms", { text: "Booked for Friday at 10." })));
+  await after.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].callId, booking.id);
+  assert.notEqual(seen[1].callId, seen[0].callId);
+  assert.equal(seen[1].idempotencyKey, seen[0].idempotencyKey, "the backend can tell it is the same booking");
+
+  await before.agent.forgetPerson(a!.conversationId);
+  assert.equal(seen[0].signal.aborted, true, "a forgotten person's tools are told to stop");
+});
+
+test("with the provider's own message ids, the transcript keeps the person's side, and replies and reactions work after a restart", async () => {
+  const path = file();
+  const channels = { whatsapp: { info: WHATSAPP, phone: true } };
+  const before = multi({ channels, database: sqlite(path) });
+  await before.agent.resume();
+  const a = await before.agent.message({ channel: "whatsapp", from: "15550100100", message: "is the 10am free?", messageId: "wamid.HBgL1" });
+  (await before.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Let me look." })));
+  await before.agent.conversation(a!.conversationId)!.whenIdle();
+
+  const after = multi({ channels, database: sqlite(path), dir: before.dir });
+  await after.agent.resume();
+  await after.agent.message({ channel: "whatsapp", from: "15550100100", message: "?", messageId: "wamid.HBgL2" });
+  (await after.nextCall(0)).answer(respond(call("react", { message_id: "wamid.HBgL1", emoji: "👍" }), call("send_whatsapp", { text: "Yes, it's free.", reply_to: "wamid.HBgL1" })));
+  await after.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.deepEqual(after.out.map((o) => o.outbound).filter((o) => o.type === "reaction" || o.type === "message"), [
+    { type: "reaction", emoji: "👍", messageId: "wamid.HBgL1" },
+    { type: "message", text: "Yes, it's free.", replyTo: "wamid.HBgL1" },
+  ]);
+  const transcript = await after.agent.transcript(a!.conversationId);
+  assert.deepEqual(transcript.filter((l) => l.kind === "in").map((l) => l.kind === "in" && [l.id, l.text]), [["wamid.HBgL1", "is the 10am free?"], ["wamid.HBgL2", "?"]]);
+});
+
+test("a delivery failure or a reaction reported after a restart reaches the agent", async () => {
+  const path = file();
+  const before = multi({ channels: CHANNELS, database: sqlite(path) });
+  await before.agent.resume();
+  const a = await before.message("sms", "+15550100100", "hi");
+  (await before.nextCall(0)).answer(respond(call("send_sms", { text: "Hi Sam!" })));
+  await before.agent.conversation(a!.conversationId)!.whenIdle();
+
+  const after = multi({ channels: CHANNELS, database: sqlite(path), dir: before.dir });
+  await after.agent.resume();
+  assert.equal(after.agent.conversation(a!.conversationId), undefined, "not in memory");
+  after.agent.reacted(a!.conversationId, "👍", "Hi Sam!");
+  after.agent.undelivered(a!.conversationId, "Hi Sam!", "carrier rejected it");
+  const told = await after.nextCall(0);
+  assert.deepEqual(users(told.request.messages).slice(-2), ['[They reacted 👍 to your message: "Hi Sam!"]', '[Not delivered] "Hi Sam!": carrier rejected it']);
+  told.answer(respond());
+  await after.agent.conversation(a!.conversationId)!.whenIdle();
+});
+
+test("a provider's message id is kept with what its message stored, so a crash between them loses neither and the retry is taken", async () => {
+  const channels = { sms: { info: SMS, phone: true, kind: "sms" as const, keywords: SMS_KEYWORDS } };
+  for (const [table, text] of [["inbox", "book me in for 10"], ["no_contact", "STOP"]] as const) {
+    const path = file();
+    const before = multi({ channels, database: diesAt(table, sqlite(path)) });
+    await before.agent.resume();
+    const sent = { channel: "sms", from: "+15550100100", message: text, messageId: "SM1" };
+    const a = await before.agent.message(sent);
+    if (a) await before.agent.conversation(a.conversationId)!.stored();
+
+    const after = multi({ channels, database: sqlite(path), dir: before.dir });
+    await after.agent.resume();
+    await after.agent.message(sent);
+    assert.ok(!after.events.some((e) => e.type === "message.duplicate"), `the retry is taken (crash at ${table})`);
+    if (table === "inbox") {
+      const turn = await after.nextCall(0);
+      assert.equal(users(turn.request.messages).at(-1), "[SM1] book me in for 10");
+      turn.answer(respond(call("send_sms", { text: "Booked." })));
+      await after.agent.conversation(a!.conversationId)!.whenIdle();
+    } else {
+      assert.equal((await after.agent.nudge({ to: { channel: "sms", address: "+15550100100" }, text: "Sale today!" })).status, "dropped", "their STOP is kept");
+    }
+  }
+});
+
+test("provider message ids are deleted once older than 7 days, in batches, by one of two runners, at most hourly", async () => {
+  const path = file();
+  let deletes = [0, 0];
+  const counted = (i: number): Database => {
+    const db = sqlite(path);
+    return { ...db, run: (sql, params) => (sql.startsWith("DELETE FROM inbound") && deletes[i]++, db.run(sql, params)) };
+  };
+  const start = Date.now();
+  const clock = { now: start };
+  const runners: Array<ReturnType<typeof multi>> = [];
+  for (const i of [0, 1]) {
+    runners.push(multi({ channels: CHANNELS, database: counted(i), now: () => clock.now }));
+    await runners[i].agent.resume();
+  }
+  const db = sqlite(path);
+  const ids = async () => (await db.query("SELECT message_id FROM inbound")).map((r) => String(r.message_id));
+  await db.run(
+    `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2001)
+     INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) SELECT 'default', 'p_1', 'sms', 'old' || i, ? FROM n`,
+    [start],
+  );
+  await db.run("INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) VALUES ('default', 'p_1', 'sms', 'recent', ?)", [start + 6 * 86_400_000]);
+  const pass = async (at: number) => {
+    clock.now = start + at;
+    deletes = [0, 0];
+    await Promise.all(runners.map((r) => r.agent.runDue()));
+    return [...deletes].sort();
+  };
+  const minutes = (m: number) => m * 60_000;
+
+  assert.deepEqual(await pass(7 * 86_400_000 - minutes(30)), [0, 1], "one runner looks");
+  assert.equal((await ids()).length, 2002, "nothing is 7 days old yet");
+  assert.deepEqual(await pass(7 * 86_400_000 + minutes(10)), [0, 0], "the next look is an hour after the last");
+  assert.equal((await ids()).length, 2002);
+  assert.deepEqual(await pass(7 * 86_400_000 + minutes(30)), [0, 3], "one runner deletes them, 1,000 at a time");
+  assert.deepEqual(await ids(), ["recent"]);
 });

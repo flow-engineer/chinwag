@@ -6,7 +6,8 @@
 // same path as a provider's webhook, so a test person is a real person to the agent (identity,
 // lookups, history, schedules); the simulator is just a different phone. One person is one
 // conversation on every channel, and what is shown is that conversation's history in the agent's
-// store, so it survives restarts. On a deployed agent it needs a token (`handler`).
+// store, so it survives restarts. On a deployed agent it needs a token (`handler`). Without one it
+// answers only a loopback Host, and its API only its own page (never another site's).
 //
 //   GET  /?person=<phone>&channel=<name>      the playground; /person shows every channel side by side
 //   POST /api/messages    {channel, person, text, replyTo?, choice?}  → {messageId, at}
@@ -554,6 +555,8 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
 
   const playgroundEvents: EventSink = (event) => {
     const person = people.get(event.conversationId);
+    // A failed turn (a wrong or expired model key, say) on the terminal too, also for no known person.
+    if (event.type === "model.error") console.error(`chinwag: model error${person ? ` (${person.name})` : ""}: ${String(event.error)}`);
     if (!person || !playing) return;
     for (const c of playing.channels()) show(threadKey(c.name, person), event);
   };
@@ -605,6 +608,10 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
   async function handle(agent: PlaygroundAgent, req: IncomingMessage, res: ServerResponse, base: string, gate: Gate | null): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
     const path = inside(url, base);
+    // Without a token, a page on another site (or a DNS name rebound to 127.0.0.1) must not run
+    // turns on the developer's key: only a loopback Host, and the API only from the playground's own page.
+    if (!gate && !loopback(req.headers.host)) return forbid(res, "This playground answers only on localhost or 127.0.0.1.");
+    if (path.startsWith("/api/") && crossSite(req)) return forbid(res, "This playground's API answers only its own page.");
     if (gate && !gate.allows(req, res, url, base)) return;
 
     if (req.method === "GET" && path === "/") return html(res, page(playPage, base));
@@ -771,6 +778,31 @@ function tokenGate(token: string | undefined): Gate {
 function refuse(res: ServerResponse, status: 401 | 429): void {
   const text = status === 429 ? "Too many wrong tokens from this address. Try again later." : "This playground needs its token: open it with ?token=<token>, or send Authorization: Bearer <token>.";
   res.writeHead(status, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }).end(text);
+}
+
+/** A Host that names this machine: localhost (or a name under it), 127.x.x.x or [::1], any port. */
+function loopback(host: string | undefined): boolean {
+  const name = (host ?? "").toLowerCase().replace(/:\d+$/, "");
+  return name === "localhost" || name.endsWith(".localhost") || name === "[::1]" || /^127(\.\d{1,3}){3}$/.test(name);
+}
+
+/** A browser call from another origin: Sec-Fetch-Site says so, or (older browsers) an Origin unlike the Host. */
+function crossSite(req: IncomingMessage): boolean {
+  const site = req.headers["sec-fetch-site"];
+  if (site !== undefined) return site !== "same-origin" && site !== "none";
+  const origin = req.headers.origin;
+  if (origin === undefined) return false;
+  const forwarded = req.headers["x-forwarded-host"];
+  const host = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0].trim() || req.headers.host;
+  try {
+    return new URL(origin).host !== host;
+  } catch {
+    return true;
+  }
+}
+
+function forbid(res: ServerResponse, text: string): void {
+  res.writeHead(403, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }).end(text);
 }
 
 /** The path inside the simulators, whatever they are mounted under. */

@@ -63,6 +63,27 @@ const MIGRATIONS: Array<(t: Types) => string> = [
      PRIMARY KEY (agent_id, id));`,
   // Where an identity's latest message came from: the channel's provider, or the playground.
   () => `ALTER TABLE identities ADD COLUMN via TEXT NOT NULL DEFAULT 'provider'`,
+  // A rule from a keyword (STOP): a hard stop, checked without the model, lifted only by START.
+  () => `ALTER TABLE no_contact ADD COLUMN hard INTEGER NOT NULL DEFAULT 0`,
+  // Phone keys are E.164 now: "phone:15550100100" (as WhatsApp gives it) and "phone:0015550100100"
+  // become "phone:+15550100100", so the same number on SMS joins them. Where a number already has
+  // two conversations (under any two of those forms), all are left as they are: merging two
+  // histories is the owner's call. Each look-up is by equality, so it uses the person_key index.
+  () => `UPDATE conversations SET person_key = 'phone:+' || substr(person_key, CASE WHEN person_key LIKE 'phone:00%' THEN 9 ELSE 7 END)
+     WHERE person_key LIKE 'phone:%' AND person_key NOT LIKE 'phone:+%'
+       AND NOT EXISTS (SELECT 1 FROM conversations other WHERE other.agent_id = conversations.agent_id
+         AND other.person_key = 'phone:+' || substr(conversations.person_key, CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 9 ELSE 7 END))
+       AND NOT EXISTS (SELECT 1 FROM conversations other WHERE other.agent_id = conversations.agent_id
+         AND other.person_key = CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 'phone:' || substr(conversations.person_key, 9) ELSE 'phone:00' || substr(conversations.person_key, 7) END)`,
+  // A provider's message ids, so a webhook's retry is taken once (per conversation: some providers
+  // number messages per chat); and each conversation's turn count, for tools' idempotency keys.
+  (t) => `CREATE TABLE inbound (
+     agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, channel TEXT NOT NULL, message_id TEXT NOT NULL, at ${t.int} NOT NULL,
+     PRIMARY KEY (agent_id, conversation_id, channel, message_id));
+   ALTER TABLE conversations ADD COLUMN turns INTEGER NOT NULL DEFAULT 0`,
+  // Provider ids are deleted once old; upkeep jobs (that pruning) are claimed, so one runner does each.
+  (t) => `CREATE INDEX inbound_at ON inbound (agent_id, at);
+   CREATE TABLE upkeep (agent_id TEXT NOT NULL, job TEXT NOT NULL, next_at ${t.int} NOT NULL, PRIMARY KEY (agent_id, job))`,
 ];
 
 export interface ConversationRow {
@@ -72,6 +93,8 @@ export interface ConversationRow {
   turnOpen: boolean;
   messageCount: number;
   recentChannels: string[];
+  /** Turns begun so far; a turn run again after a restart keeps its number. */
+  turns: number;
 }
 
 export interface IdentityRow {
@@ -112,6 +135,8 @@ export interface ScheduleRow {
   createdAt: number;
 }
 
+export type NewSchedule = Omit<ScheduleRow, "version" | "runCount" | "status" | "createdAt">;
+
 export interface NudgeRow {
   id: string;
   conversationId: string;
@@ -126,6 +151,8 @@ export interface NoContactRow {
   id: string;
   rule: string;
   until: number | null;
+  /** They texted STOP: nothing the business starts goes to them, with no model call, until START. */
+  hard: boolean;
 }
 
 const json = (value: unknown) => JSON.stringify(value);
@@ -229,17 +256,18 @@ export class Store {
     const scope = [this.agentId, conversationId];
     await this.db.transaction(async (tx) => {
       await tx.run("DELETE FROM schedule_runs WHERE agent_id = ? AND schedule_id IN (SELECT id FROM schedules WHERE agent_id = ? AND conversation_id = ?)", [this.agentId, ...scope]);
-      for (const table of ["schedules", "nudges", "no_contact", "background_tools", "inbox", "messages", "identities"]) {
+      for (const table of ["schedules", "nudges", "no_contact", "background_tools", "inbox", "messages", "inbound", "identities"]) {
         await tx.run(`DELETE FROM ${table} WHERE agent_id = ? AND conversation_id = ?`, scope);
       }
       await tx.run("DELETE FROM conversations WHERE agent_id = ? AND id = ?", scope);
     });
   }
 
-  async updateConversation(id: string, fields: { turnOpen?: boolean; messageCount?: number; recentChannels?: string[]; timeZone?: string }): Promise<void> {
+  async updateConversation(id: string, fields: { turnOpen?: boolean; turns?: number; messageCount?: number; recentChannels?: string[]; timeZone?: string }): Promise<void> {
     const sets: string[] = [];
     const params: unknown[] = [];
     if (fields.turnOpen !== undefined) sets.push("turn_open = ?"), params.push(fields.turnOpen ? 1 : 0);
+    if (fields.turns !== undefined) sets.push("turns = ?"), params.push(fields.turns);
     if (fields.messageCount !== undefined) sets.push("message_count = ?"), params.push(fields.messageCount);
     if (fields.recentChannels !== undefined) sets.push("recent_channels = ?"), params.push(json(fields.recentChannels));
     if (fields.timeZone !== undefined) sets.push("time_zone = ?"), params.push(fields.timeZone);
@@ -267,6 +295,51 @@ export class Store {
         await tx.run("INSERT INTO messages (agent_id, conversation_id, seq, entry, at) VALUES (?, ?, ?, ?, ?)", [this.agentId, conversationId, seq + i, json(entry), Date.now()]);
       }
       for (const id of doneInbox) await tx.run("UPDATE inbox SET done = 1 WHERE agent_id = ? AND id = ?", [this.agentId, id]);
+    });
+  }
+
+  /** A provider's message id already taken in this conversation on this channel (a webhook sent again). */
+  async inboundTaken(conversationId: string, channel: string, messageId: string): Promise<boolean> {
+    return (await this.db.query("SELECT 1 FROM inbound WHERE agent_id = ? AND conversation_id = ? AND channel = ? AND message_id = ?", [this.agentId, conversationId, channel, messageId])).length > 0;
+  }
+
+  /**
+   * Records a provider's message id for a message that stores nothing else (answered with no
+   * model call); false when it was already taken.
+   */
+  async inbound(conversationId: string, channel: string, messageId: string, db: Omit<Database, "transaction"> = this.db): Promise<boolean> {
+    return (await db.run("INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, conversationId, channel, messageId, Date.now()])) > 0;
+  }
+
+  /**
+   * A person's message into the inbox, with the provider's id for it in the same transaction, so
+   * a crash never keeps the id without the message (its retry would be refused). Returns the inbox
+   * row's id, or null when the id was already taken: nothing is written then.
+   */
+  async addMessage(conversationId: string, payload: Record<string, unknown>, inbound?: { channel: string; messageId: string }): Promise<number | null> {
+    return this.db.transaction(async (tx) => {
+      if (inbound && !(await this.inbound(conversationId, inbound.channel, inbound.messageId, tx))) return null;
+      return this.addInbox(conversationId, "message", payload, tx);
+    });
+  }
+
+  /** Deletes up to `limit` provider message ids recorded before `before`; returns how many it deleted. */
+  async pruneInbound(before: number, limit: number): Promise<number> {
+    return this.db.run(
+      `DELETE FROM inbound WHERE agent_id = ? AND (conversation_id, channel, message_id) IN
+         (SELECT conversation_id, channel, message_id FROM inbound WHERE agent_id = ? AND at < ? LIMIT ?)`,
+      [this.agentId, this.agentId, before, limit],
+    );
+  }
+
+  /**
+   * Claims an upkeep job that is due at `now` until `nextAt`, only if no other runner claimed it
+   * first (as a schedule's run is claimed): true for the one runner that does it.
+   */
+  async claimUpkeep(job: string, now: number, nextAt: number): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      await tx.run("INSERT INTO upkeep (agent_id, job, next_at) VALUES (?, ?, 0) ON CONFLICT DO NOTHING", [this.agentId, job]);
+      return (await tx.run("UPDATE upkeep SET next_at = ? WHERE agent_id = ? AND job = ? AND next_at <= ?", [nextAt, this.agentId, job, now])) > 0;
     });
   }
 
@@ -314,8 +387,8 @@ export class Store {
 
   // Scheduled messages.
 
-  async addSchedule(s: Omit<ScheduleRow, "version" | "runCount" | "status" | "createdAt">): Promise<void> {
-    await this.db.run(
+  async addSchedule(s: NewSchedule, db: Omit<Database, "transaction"> = this.db): Promise<void> {
+    await db.run(
       `INSERT INTO schedules (agent_id, id, conversation_id, channel, instruction, fixed_text, mode, rule, time_zone, next_run_at, max_runs, ends_on, status, origin, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
       [this.agentId, s.id, s.conversationId, s.channel, s.instruction, s.fixedText ? 1 : 0, s.mode, json(s.rule), s.timeZone, s.nextRunAt, s.maxRuns, s.endsOn, s.origin, Date.now()],
@@ -380,13 +453,19 @@ export class Store {
     return row ? nudgeOf(row) : null;
   }
 
-  /** Records a nudge and, unless it is already settled (refused), its inbox row, together. */
-  async addNudge(n: NudgeRow): Promise<number> {
+  /**
+   * Records a nudge with its inbox row (when queued) or its schedule (when it has a time), together.
+   * Returns the inbox row's id (0 for none), or null when its idempotency key was already taken:
+   * nothing is written then.
+   */
+  async addNudge(n: NudgeRow, schedule?: NewSchedule): Promise<number | null> {
     return this.db.transaction(async (tx) => {
-      await tx.run(
-        "INSERT INTO nudges (agent_id, id, conversation_id, channel, body, status, reason, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      const added = await tx.run(
+        "INSERT INTO nudges (agent_id, id, conversation_id, channel, body, status, reason, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         [this.agentId, n.id, n.conversationId, n.channel, json(n.body), n.status, n.reason, n.idempotencyKey, Date.now()],
       );
+      if (!added) return null;
+      if (schedule) await this.addSchedule(schedule, tx);
       return n.status === "queued" ? this.addInbox(n.conversationId, "nudge", { nudge: n.id, channel: n.channel, ...n.body }, tx) : 0;
     });
   }
@@ -401,14 +480,31 @@ export class Store {
     await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, created_at) VALUES (?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, Date.now()]);
   }
 
+  /** Removes one of the agent's rules; a STOP is not one of them (only START lifts it). */
   async removeNoContact(conversationId: string, id: string): Promise<boolean> {
-    return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND id = ?", [this.agentId, conversationId, id])) > 0;
+    return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND id = ? AND hard = 0", [this.agentId, conversationId, id])) > 0;
+  }
+
+  /**
+   * They texted STOP (`stop` is its rule, kept unless one is already in force) or START (null:
+   * their STOP is lifted), with the provider's id for the message in the same transaction. False
+   * when the id was already taken: nothing is changed then.
+   */
+  async setStop(conversationId: string, stop: { id: string; rule: string } | null, inbound?: { channel: string; messageId: string }): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      if (inbound && !(await this.inbound(conversationId, inbound.channel, inbound.messageId, tx))) return false;
+      if (!stop) await tx.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId]);
+      else if (!(await tx.query("SELECT 1 FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId])).length) {
+        await tx.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, hard, created_at) VALUES (?, ?, ?, ?, NULL, 1, ?)", [this.agentId, stop.id, conversationId, stop.rule, Date.now()]);
+      }
+      return true;
+    });
   }
 
   /** The rules still in force at `now` (a rule with an `until` in the past has ended). */
   async noContact(conversationId: string, now: number): Promise<NoContactRow[]> {
-    const rows = await this.db.query("SELECT id, rule, until FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND (until IS NULL OR until > ?) ORDER BY created_at", [this.agentId, conversationId, now]);
-    return rows.map((r) => ({ id: String(r.id), rule: String(r.rule), until: num(r.until) }));
+    const rows = await this.db.query("SELECT id, rule, until, hard FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND (until IS NULL OR until > ?) ORDER BY created_at", [this.agentId, conversationId, now]);
+    return rows.map((r) => ({ id: String(r.id), rule: String(r.rule), until: num(r.until), hard: Number(r.hard) === 1 }));
   }
 }
 
@@ -420,6 +516,7 @@ function conversationOf(r: Row): ConversationRow {
     turnOpen: Number(r.turn_open) === 1,
     messageCount: Number(r.message_count),
     recentChannels: parse<string[]>(r.recent_channels, []),
+    turns: Number(r.turns ?? 0),
   };
 }
 

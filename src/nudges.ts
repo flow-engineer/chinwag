@@ -1,15 +1,16 @@
 // Nudges are messages the business starts: sent as written (text), written by the agent (prompt),
 // or a template the owner already set up with the channel. What a person asked not to be messaged
-// about is the agent's judgement, kept as rules it adds and removes, not a hard stop: a nudge the
-// rules cover is not sent. The rules cover only what the business starts, never what the person
-// asks for themselves.
+// about is the agent's judgement, kept as rules it adds and removes: a message the business starts
+// that the rules cover is not sent. The rules cover only what the business starts, never what the
+// person asks for themselves. A channel's STOP keyword is different: a hard rule, written without
+// the model, that stops everything the business starts until they text START (channels.ts).
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { NoContactRow, StoreApi } from "./store.ts";
 import { endOfLocalDay, formatLocal } from "./time.ts";
 import { tool, toSpec, type Tool } from "./tools.ts";
-import type { Model } from "./types.ts";
+import type { Model, ModelResponse } from "./types.ts";
 
 export interface NoContactScope {
   store: StoreApi;
@@ -41,7 +42,11 @@ export function noContactTools(scope: NoContactScope): Tool[] {
       name: "remove_no_contact",
       description: "Remove one of their no-contact rules, by id, when they want those messages again.",
       input: z.object({ id: z.string() }),
-      run: async ({ id }) => ({ removed: await scope.store.removeNoContact(scope.conversationId, id) }),
+      run: async ({ id }) => {
+        const rule = (await scope.store.noContact(scope.conversationId, scope.now())).find((r) => r.id === id);
+        if (rule?.hard) return { error: "That is their STOP: it ends only when they text START." };
+        return { removed: await scope.store.removeNoContact(scope.conversationId, id) };
+      },
     }),
   ];
 }
@@ -63,8 +68,11 @@ const decision = tool({
   run: () => "",
 });
 
-/** A fixed-text nudge to a person with rules: one small model call says whether a rule covers it. */
-export async function coveredBy(model: Model, rules: NoContactRow[], text: string): Promise<NoContactRow | null> {
+/**
+ * A fixed-text message the business starts, to a person with rules: one small model call says
+ * whether a rule covers it. Rejects when the model does; the caller sends nothing then.
+ */
+export async function coveredBy(model: Model, rules: NoContactRow[], text: string): Promise<{ rule: NoContactRow | null; usage?: ModelResponse["usage"]; model?: string }> {
   const response = await model.complete({
     system: "A business wants to send this message to a person. The person asked not to be messaged about some things. Decide whether any of their rules covers this message; call decide once.",
     messages: [{ role: "user", content: `Rules:\n${rules.map((r) => `- [${r.id}] ${r.rule}`).join("\n")}\n\nMessage:\n${text}` }],
@@ -78,6 +86,7 @@ export async function coveredBy(model: Model, rules: NoContactRow[], text: strin
   } catch {
     // An unreadable answer sends nothing: a rule the person set is safer kept than broken.
   }
-  if (parsed.send === true) return null;
-  return rules.find((r) => r.id === parsed.rule) ?? rules[0];
+  const said = { usage: response.usage, model: response.model };
+  if (parsed.send === true) return { rule: null, ...said };
+  return { rule: rules.find((r) => r.id === parsed.rule) ?? rules[0], ...said };
 }

@@ -117,7 +117,7 @@ test("the scheduling tool refuses what would go wrong, with a reason the agent c
   let zone: string | null = null;
   const scope = { store, conversationId: "c1", channel: () => "sms", now: () => NOON_NY, personZone: () => zone, setPersonZone: async (z: string) => void (zone = z) };
   const [schedule] = scheduleTools(scope);
-  const run = (input: Record<string, unknown>) => Promise.resolve(schedule.run(schedule.input.parse(input), { conversationId: "c1", person: "p", channel: "sms" })) as Promise<Record<string, any>>;
+  const run = (input: Record<string, unknown>) => Promise.resolve(schedule.run(schedule.input.parse(input), { conversationId: "c1", person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal })) as Promise<Record<string, any>>;
   const daily = { message: "check in", repeat: "daily", time: "09:00" };
 
   assert.match((await run(daily)).error, /^timezone_needed/, "no zone known: ask their city");

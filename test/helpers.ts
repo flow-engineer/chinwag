@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAgent, tool, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
-import type { ChannelInfo, ChannelKind, ChatMessage, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
+import type { ChannelInfo, ChannelKind, ChatMessage, Keywords, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
 
 /**
  * A model the test drives: each call waits for the test to answer it. The step Chinwag adds after a
@@ -10,7 +10,7 @@ import type { ChannelInfo, ChannelKind, ChatMessage, Model, ModelRequest, ModelR
  * unless `followUps: "manual"`: then it is a call like any other.
  */
 export function scriptedModel(options: { followUps?: "auto" | "manual" } = {}) {
-  const calls: Array<{ request: ModelRequest; answer(r: ModelResponse): void }> = [];
+  const calls: Array<{ request: ModelRequest; answer(r: ModelResponse): void; fail(error: Error): void }> = [];
   const followUps: ModelRequest[] = [];
   const waiters: Array<() => void> = [];
   const model: Model = {
@@ -21,7 +21,7 @@ export function scriptedModel(options: { followUps?: "auto" | "manual" } = {}) {
       }
       return new Promise((resolve, reject) => {
         request.signal.addEventListener("abort", () => reject(new Error("aborted")));
-        calls.push({ request, answer: resolve });
+        calls.push({ request, answer: resolve, fail: reject });
         waiters.splice(0).forEach((w) => w());
       });
     },
@@ -97,7 +97,7 @@ export const WEB_APP: ChannelInfo = { reactions: true, status: true, formatting:
 /** An agent with real channels (by name), for one person across several of them. */
 export function multi(options: {
   /** Each channel is custom unless it names its kind. */
-  channels: Record<string, { info: ChannelInfo; phone?: boolean; kind?: ChannelKind }>;
+  channels: Record<string, { info: ChannelInfo; phone?: boolean; kind?: ChannelKind; keywords?: Keywords }>;
   tools?: ReturnType<typeof tool>[];
   database?: Database;
   resolve?: (identity: { channel: string; address: string }) => string | null;
@@ -106,6 +106,8 @@ export function multi(options: {
   dir?: string;
   testPeople?: TestPerson[];
   templates?: TemplateDefinition[];
+  history?: { maxTokens?: number; toolResultChars?: number };
+  defaultCountryCode?: string;
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
@@ -132,6 +134,8 @@ export function multi(options: {
     timeZone: options.timeZone,
     testPeople: options.testPeople,
     templates: options.templates,
+    history: options.history,
+    defaultCountryCode: options.defaultCountryCode,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>
