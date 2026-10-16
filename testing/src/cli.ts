@@ -193,6 +193,8 @@ if (agentUrl) {
     console.error(`No src/agent.ts in ${dir}. Run chinwag test from your agent's folder, where src/agent.ts exports buildAgent({ model, events, tools }) and tools, or pass --agent-url to test an agent on another framework by its HTTP endpoint.`);
     process.exit(1);
   }
+  // Chinwag runs the agent here, so its traces are marked as a test's (src/traces.ts).
+  process.env.CHINWAG_RUN_KIND = "test";
   const module = await import(pathToFileURL(join(dir, "src/agent.ts")).href);
   if (typeof module.buildAgent !== "function" || !Array.isArray(module.tools)) {
     console.error("src/agent.ts must export buildAgent({ model, events, tools }) and tools, or pass --agent-url to test an agent by its HTTP endpoint.");
@@ -265,7 +267,7 @@ try {
     runs: perScenario,
     openHeaders,
     onRun: (run) => { seen.push(run); printRun(run); },
-    onDashboard: (url, id) => { dashboard = url; sessionId = id; },
+    onDashboard: (url, id) => { dashboard = url; sessionId = id; process.env.CHINWAG_TEST_SESSION = id; },
   });
 } catch (error) {
   if (error instanceof SessionStopped) {

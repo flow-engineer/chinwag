@@ -217,7 +217,7 @@ await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt
   const log: EventSink = (event) => console.log(event.type, event.conversationId);
   createAgent({ /* ... */ events: [log] });
   ```
-- Traces: with `CHINWAG_TRACES_KEY` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces`, where the URL is `CHINWAG_TRACES_URL`, else https://flow.engineer/observe (the trace key is made there). `CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only.
+- Traces: with `CHINWAG_TRACES_KEY` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces`, where the URL is `CHINWAG_TRACES_URL`, else https://flow.engineer/observe (the trace key is made there). `CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only. Under `chinwag test` every trace is marked as a test's (`chinwag.run_kind` "test" and the session as `chinwag.test.session`; otherwise `chinwag.run_kind` is "production"), so the dashboard can keep tests apart from real conversations.
 
 ## Testing
 
