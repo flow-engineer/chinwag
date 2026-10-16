@@ -1,9 +1,9 @@
-// covers: src/conversation.ts src/talk.ts
+// covers: src/conversation.ts src/talk.ts src/agent.ts src/store.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
 import { tool } from "../src/index.ts";
-import { WEB, WHATSAPP, call, harness, last, respond, say, users } from "./helpers.ts";
+import { SMS, WEB, WHATSAPP, call, harness, last, multi, respond, say, users } from "./helpers.ts";
 
 test("the person's messages carry ids the agent can react to", async () => {
   const h = harness();
@@ -98,4 +98,19 @@ test("a reaction from the person is noted for the next turn without starting one
   assert.deepEqual(users(second.request.messages).slice(-2), ['[They reacted ❤️ to your message: "Anytime!"]', "[m2] one more thing"]);
   second.answer(respond(say("Sure, go ahead.")));
   await h.agent.conversation("w4")!.whenIdle();
+});
+
+test("a message the provider sends again (a webhook retried) is taken once", async () => {
+  const h = multi({ channels: { sms: { info: SMS, phone: true } } });
+  const first = { channel: "sms", from: "+15550100100", message: "first", messageId: "SM9f2c" };
+  const [a, b] = await Promise.all([h.agent.message(first), h.agent.message(first)]);
+  assert.deepEqual(a, b);
+  const turn = await h.nextCall(0);
+  assert.deepEqual(users(turn.request.messages), ["[SM9f2c] first"]);
+  turn.answer(respond(call("send_sms", { text: "Got it." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  await h.agent.message(first);
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.equal(h.calls.length, 1, "no turn for the repeat");
+  assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2);
 });

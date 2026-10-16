@@ -34,7 +34,7 @@
 //   few are shown, and their bytes are never stored: after a restart they are named, not shown.
 
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
@@ -190,6 +190,10 @@ export class Conversation {
   private readonly messageIds = new Map<string, string>();
   private readonly knownInbox = new Set<number>();
   private messageCount = 0;
+  /** Turns begun, kept in the store: tools' idempotency keys carry the turn's number. */
+  private turns = 0;
+  /** Aborted when the conversation closes: tools' signal. */
+  private readonly lifetime = new AbortController();
   private recentChannels: string[] = [];
   private timeZone: string | null = null;
   private running = false;
@@ -231,6 +235,7 @@ export class Conversation {
     this.settings = settings;
     if (existing) {
       this.messageCount = existing.messageCount;
+      this.turns = existing.turns;
       this.recentChannels = existing.recentChannels;
       this.timeZone = existing.timeZone;
     }
@@ -276,6 +281,11 @@ export class Conversation {
   receive(input: string | Incoming, options: { channel: string; messageId?: string }): string {
     const incoming: Incoming = typeof input === "string" ? { text: input } : input;
     const channel = options.channel;
+    if (options.messageId !== undefined && this.messageIds.has(options.messageId)) {
+      // The channel gave this message before (a retry): it is taken once.
+      this.settings.emit(this.id, "message.duplicate", { messageId: options.messageId, channel });
+      return options.messageId;
+    }
     const id = options.messageId ?? `m${++this.messageCount}`;
     this.messageIds.set(id, channel);
     void this.typing(true, channel);
@@ -477,6 +487,7 @@ export class Conversation {
     this.direct = [];
     this.stepAbort?.abort();
     this.wakeTools?.();
+    this.lifetime.abort();
   }
 
   /** Runs `work` after every earlier write to the store, in order. */
@@ -670,10 +681,13 @@ export class Conversation {
       this.absorb();
       return;
     }
+    // A turn cut off by a restart keeps its number, so a tool called again in it gets the same key.
+    if (!this.resumeTurn) this.turns++;
+    const turns = this.turns;
     this.resumeTurn = false;
     this.theirMessages = false;
     this.settings.emit(this.id, "turn.start", {});
-    this.persist(() => store.updateConversation(this.id, { turnOpen: true }));
+    this.persist(() => store.updateConversation(this.id, { turnOpen: true, turns }));
     this.absorb();
     // A turn the person started (as against a background result, a scheduled message or a nudge).
     const theirs = this.unanswered.size > 0;
@@ -1090,7 +1104,8 @@ export class Conversation {
     }
 
     this.settings.emit(this.id, "tool.start", { callId: call.id, tool: call.name, input: parsed.data });
-    const context = { conversationId: this.id, person: this.personKey, channel: this.currentChannel() };
+    const key = createHash("sha256").update(`${this.id}\u0000${this.turns}\u0000${call.name}\u0000${input}`).digest("hex").slice(0, 32);
+    const context = { conversationId: this.id, person: this.personKey, channel: this.currentChannel(), callId: call.id, idempotencyKey: key, signal: this.lifetime.signal };
     const r: Running = {
       call,
       input,

@@ -72,6 +72,11 @@ const MIGRATIONS: Array<(t: Types) => string> = [
      WHERE person_key LIKE 'phone:%' AND person_key NOT LIKE 'phone:+%'
        AND NOT EXISTS (SELECT 1 FROM conversations other WHERE other.agent_id = conversations.agent_id
          AND other.person_key = 'phone:+' || substr(conversations.person_key, CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 9 ELSE 7 END))`,
+  // A provider's message ids, so a webhook's retry is taken once; and each conversation's turn count, for tools' idempotency keys.
+  (t) => `CREATE TABLE inbound (
+     agent_id TEXT NOT NULL, channel TEXT NOT NULL, message_id TEXT NOT NULL, conversation_id TEXT NOT NULL, at ${t.int} NOT NULL,
+     PRIMARY KEY (agent_id, channel, message_id));
+   ALTER TABLE conversations ADD COLUMN turns INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export interface ConversationRow {
@@ -81,6 +86,8 @@ export interface ConversationRow {
   turnOpen: boolean;
   messageCount: number;
   recentChannels: string[];
+  /** Turns begun so far; a turn run again after a restart keeps its number. */
+  turns: number;
 }
 
 export interface IdentityRow {
@@ -120,6 +127,8 @@ export interface ScheduleRow {
   origin: "person" | "api";
   createdAt: number;
 }
+
+export type NewSchedule = Omit<ScheduleRow, "version" | "runCount" | "status" | "createdAt">;
 
 export interface NudgeRow {
   id: string;
@@ -240,17 +249,18 @@ export class Store {
     const scope = [this.agentId, conversationId];
     await this.db.transaction(async (tx) => {
       await tx.run("DELETE FROM schedule_runs WHERE agent_id = ? AND schedule_id IN (SELECT id FROM schedules WHERE agent_id = ? AND conversation_id = ?)", [this.agentId, ...scope]);
-      for (const table of ["schedules", "nudges", "no_contact", "background_tools", "inbox", "messages", "identities"]) {
+      for (const table of ["schedules", "nudges", "no_contact", "background_tools", "inbox", "messages", "inbound", "identities"]) {
         await tx.run(`DELETE FROM ${table} WHERE agent_id = ? AND conversation_id = ?`, scope);
       }
       await tx.run("DELETE FROM conversations WHERE agent_id = ? AND id = ?", scope);
     });
   }
 
-  async updateConversation(id: string, fields: { turnOpen?: boolean; messageCount?: number; recentChannels?: string[]; timeZone?: string }): Promise<void> {
+  async updateConversation(id: string, fields: { turnOpen?: boolean; turns?: number; messageCount?: number; recentChannels?: string[]; timeZone?: string }): Promise<void> {
     const sets: string[] = [];
     const params: unknown[] = [];
     if (fields.turnOpen !== undefined) sets.push("turn_open = ?"), params.push(fields.turnOpen ? 1 : 0);
+    if (fields.turns !== undefined) sets.push("turns = ?"), params.push(fields.turns);
     if (fields.messageCount !== undefined) sets.push("message_count = ?"), params.push(fields.messageCount);
     if (fields.recentChannels !== undefined) sets.push("recent_channels = ?"), params.push(json(fields.recentChannels));
     if (fields.timeZone !== undefined) sets.push("time_zone = ?"), params.push(fields.timeZone);
@@ -279,6 +289,14 @@ export class Store {
       }
       for (const id of doneInbox) await tx.run("UPDATE inbox SET done = 1 WHERE agent_id = ? AND id = ?", [this.agentId, id]);
     });
+  }
+
+  /**
+   * Records a message id a channel's provider gave; false when it was already taken (a webhook
+   * sent again), so the message is not taken twice.
+   */
+  async inbound(conversationId: string, channel: string, messageId: string): Promise<boolean> {
+    return (await this.db.run("INSERT INTO inbound (agent_id, channel, message_id, conversation_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, channel, messageId, conversationId, Date.now()])) > 0;
   }
 
   // The inbox.
@@ -325,8 +343,8 @@ export class Store {
 
   // Scheduled messages.
 
-  async addSchedule(s: Omit<ScheduleRow, "version" | "runCount" | "status" | "createdAt">): Promise<void> {
-    await this.db.run(
+  async addSchedule(s: NewSchedule, db: Omit<Database, "transaction"> = this.db): Promise<void> {
+    await db.run(
       `INSERT INTO schedules (agent_id, id, conversation_id, channel, instruction, fixed_text, mode, rule, time_zone, next_run_at, max_runs, ends_on, status, origin, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
       [this.agentId, s.id, s.conversationId, s.channel, s.instruction, s.fixedText ? 1 : 0, s.mode, json(s.rule), s.timeZone, s.nextRunAt, s.maxRuns, s.endsOn, s.origin, Date.now()],
@@ -391,13 +409,19 @@ export class Store {
     return row ? nudgeOf(row) : null;
   }
 
-  /** Records a nudge and, unless it is already settled (refused), its inbox row, together. */
-  async addNudge(n: NudgeRow): Promise<number> {
+  /**
+   * Records a nudge with its inbox row (when queued) or its schedule (when it has a time), together.
+   * Returns the inbox row's id (0 for none), or null when its idempotency key was already taken:
+   * nothing is written then.
+   */
+  async addNudge(n: NudgeRow, schedule?: NewSchedule): Promise<number | null> {
     return this.db.transaction(async (tx) => {
-      await tx.run(
-        "INSERT INTO nudges (agent_id, id, conversation_id, channel, body, status, reason, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      const added = await tx.run(
+        "INSERT INTO nudges (agent_id, id, conversation_id, channel, body, status, reason, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         [this.agentId, n.id, n.conversationId, n.channel, json(n.body), n.status, n.reason, n.idempotencyKey, Date.now()],
       );
+      if (!added) return null;
+      if (schedule) await this.addSchedule(schedule, tx);
       return n.status === "queued" ? this.addInbox(n.conversationId, "nudge", { nudge: n.id, channel: n.channel, ...n.body }, tx) : 0;
     });
   }
@@ -437,6 +461,7 @@ function conversationOf(r: Row): ConversationRow {
     turnOpen: Number(r.turn_open) === 1,
     messageCount: Number(r.message_count),
     recentChannels: parse<string[]>(r.recent_channels, []),
+    turns: Number(r.turns ?? 0),
   };
 }
 

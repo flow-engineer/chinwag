@@ -18,9 +18,9 @@ import { declaredTemplate, fillTemplate, keywordOf, summarize, type Channel, typ
 import { Conversation, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type TranscriptEntry } from "./conversation.ts";
 import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
-import { addBusinessSchedule, claimDue } from "./schedules.ts";
+import { businessSchedule, claimDue } from "./schedules.ts";
 import { loadInstructions, loadSkills, readAgentFolder, skillTool, type AgentFiles } from "./skills.ts";
-import { Store, type ConversationRow, type IdentityRow, type StoreApi, type Via } from "./store.ts";
+import { Store, type ConversationRow, type IdentityRow, type NudgeRow, type StoreApi, type Via } from "./store.ts";
 import { toSpec, type Tool } from "./tools.ts";
 import { traces, tracesFromEnv, type Traces, type TracesOptions } from "./traces.ts";
 import type { ChannelInfo, Deliver, Incoming, Model, Outbound, Template, TemplateDefinition, Transcribe } from "./types.ts";
@@ -146,7 +146,7 @@ export interface NudgeInput {
   template?: Template;
   /** Send it later, at this time (ms since the epoch), as a scheduled message. */
   at?: number;
-  /** The same key twice sends once; the second call gets the first's result. */
+  /** The same key twice sends once, also when both calls come at once: the second gets the first's result. */
   idempotencyKey?: string;
 }
 
@@ -175,7 +175,8 @@ export class Agent {
   private readonly rows = new Map<string, ConversationRow>();
   private resumed = false;
   private readonly arriving = new Map<string, Promise<unknown>>();
-  private readonly nudgeWaiters = new Map<string, (result: NudgeResult) => void>();
+  /** Callers waiting for a queued nudge to settle: its first call, and any with the same key. */
+  private readonly nudgeWaiters = new Map<string, Array<(result: NudgeResult) => void>>();
   private readonly now: () => number;
   private readonly channelsByName: Map<string, Channel>;
   /** Where each identity (channel, address) last wrote from; sends go back the same way. */
@@ -244,7 +245,8 @@ export class Agent {
 
   /**
    * A message from a person on a channel set up in `channels`. Returns the conversation and the id
-   * the agent knows the message by, or null when `intercept` answered it.
+   * the agent knows the message by, or null when `intercept` or a keyword answered it. Give the
+   * provider's own `messageId`: the same one again (a webhook retried) is not taken twice.
    */
   async message(input: { channel: string; from: string; message: string | Incoming; messageId?: string }): Promise<{ conversationId: string; messageId: string } | null> {
     return this.take(this.channelOf(input.channel), { ...input, via: "provider" });
@@ -340,6 +342,11 @@ export class Agent {
     await this.settings.ready;
     const identity = await this.conversationFor(adapter, input.channel, input.from, input.person);
     const conversationId = identity.conversationId;
+    if (input.messageId !== undefined && !(await this.store.inbound(conversationId, input.channel, input.messageId))) {
+      // The provider sent this message before (a webhook retried): it was taken then.
+      this.settings.emit(conversationId, "message.duplicate", { messageId: input.messageId, channel: input.channel });
+      return { conversationId, messageId: input.messageId };
+    }
     if (identity.via !== input.via) await this.store.setIdentityVia(input.channel, input.from, input.via);
     this.via.set(viaKey(input.channel, input.from), input.via);
     const conversation = this.open(conversationId);
@@ -494,7 +501,7 @@ export class Agent {
     if (declared) fillTemplate(declared, input.template!);
     if (input.idempotencyKey) {
       const earlier = await this.store.nudgeByKey(input.idempotencyKey);
-      if (earlier) return this.result(earlier.id, earlier.status, earlier.reason);
+      if (earlier) return this.outcome(earlier);
     }
     const identity = await this.store.identity(input.to.channel, input.to.address);
     if (!identity) return { id: "", status: "refused", reason: "unknown_person" };
@@ -502,27 +509,58 @@ export class Agent {
     const conversationId = identity.conversationId;
     const record = { id, conversationId, channel: input.to.channel, idempotencyKey: input.idempotencyKey ?? null, reason: null };
     const stop = input.at === undefined ? await this.stopOf(conversationId) : null;
+    // Written once per key: a call that loses the insert to one with the same key gets that one's result.
+    const add = async (row: NudgeRow, schedule?: Parameters<StoreApi["addNudge"]>[1]): Promise<NudgeResult | number> => {
+      const inbox = await this.store.addNudge(row, schedule);
+      if (inbox !== null) return inbox;
+      return this.outcome((await this.store.nudgeByKey(input.idempotencyKey!))!);
+    };
+    const settledAs = async (row: NudgeRow): Promise<NudgeResult> => {
+      const added = await add(row);
+      return typeof added === "number" ? this.result(row.id, row.status, row.reason) : added;
+    };
     if (stop) {
       const reason = `no-contact rule ${stop.id}: ${stop.rule}`;
-      await this.store.addNudge({ ...record, body: input.template ? { template: input.template } : { text: input.text, prompt: input.prompt }, status: "dropped", reason });
-      return { id, status: "dropped", reason };
+      return settledAs({ ...record, body: input.template ? { template: input.template } : { text: input.text, prompt: input.prompt }, status: "dropped", reason });
     }
     if (input.at !== undefined) {
       if (input.template) throw new Error("chinwag: a template nudge cannot be scheduled yet");
       const zone = (await this.store.conversation(conversationId))?.timeZone ?? this.options.timeZone ?? "UTC";
-      await addBusinessSchedule(this.store, conversationId, input.to.channel, input.at, zone, { text: input.text, prompt: input.prompt });
-      await this.store.addNudge({ ...record, body: { text: input.text, prompt: input.prompt, at: input.at }, status: "scheduled" });
-      return { id, status: "scheduled" };
+      const schedule = businessSchedule(conversationId, input.to.channel, input.at, zone, { text: input.text, prompt: input.prompt });
+      const added = await add({ ...record, body: { text: input.text, prompt: input.prompt, at: input.at }, status: "scheduled" }, schedule);
+      return typeof added === "number" ? { id, status: "scheduled" } : added;
     }
     const body = input.template ? { template: input.template } : input.text !== undefined ? { text: input.text } : { prompt: input.prompt };
     if (!input.template && windowClosed({ info: this.infoOf(input.to.channel, conversationId), lastMessageAt: identity.lastMessageAt }, this.now())) {
-      await this.store.addNudge({ ...record, body, status: "refused", reason: "outside_window" });
-      return { id, status: "refused", reason: "outside_window" };
+      return settledAs({ ...record, body, status: "refused", reason: "outside_window" });
     }
-    const settled = new Promise<NudgeResult>((resolve) => this.nudgeWaiters.set(id, resolve));
-    const inbox = await this.store.addNudge({ ...record, body, status: "queued" });
-    this.wake(conversationId, inbox);
+    const settled = this.waitFor(id);
+    const added = await add({ ...record, body, status: "queued" });
+    if (typeof added !== "number") {
+      this.nudgeWaiters.delete(id);
+      return added;
+    }
+    this.wake(conversationId, added);
     return settled;
+  }
+
+  /** A nudge already recorded, as its caller sees it: settled, or (still queued) once it settles. */
+  private async outcome(row: NudgeRow): Promise<NudgeResult> {
+    if (row.status !== "queued") return this.result(row.id, row.status, row.reason);
+    const settled = this.waitFor(row.id);
+    // It may have settled between the read and the wait.
+    const now = await this.store.nudge(row.id);
+    if (now && now.status !== "queued") this.release(row.id, this.result(row.id, now.status, now.reason));
+    return settled;
+  }
+
+  private waitFor(id: string): Promise<NudgeResult> {
+    return new Promise((resolve) => this.nudgeWaiters.set(id, [...(this.nudgeWaiters.get(id) ?? []), resolve]));
+  }
+
+  private release(id: string, result: NudgeResult): void {
+    for (const resolve of this.nudgeWaiters.get(id) ?? []) resolve(result);
+    this.nudgeWaiters.delete(id);
   }
 
   /** Looks for due scheduled messages once and hands each to its conversation. Returns how many. */
@@ -606,8 +644,7 @@ export class Agent {
     if (target.run) await this.store.settleRun(target.run, status, reason);
     if (target.nudge) {
       await this.store.settleNudge(target.nudge, status, reason);
-      this.nudgeWaiters.get(target.nudge)?.(this.result(target.nudge, status, reason));
-      this.nudgeWaiters.delete(target.nudge);
+      this.release(target.nudge, this.result(target.nudge, status, reason));
     }
   }
 

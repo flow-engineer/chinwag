@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
 import { createAgent, sqlite, Store, tool, type Outbound } from "../src/index.ts";
-import { SMS, call, gate, multi, respond, scriptedModel, users } from "./helpers.ts";
+import { SMS, call, gate, last, multi, respond, scriptedModel, users } from "./helpers.ts";
 
 const CHANNELS = { sms: { info: SMS, phone: true } };
 const file = () => join(mkdtempSync(join(tmpdir(), "chinwag-db-")), "chinwag.db");
@@ -112,4 +112,35 @@ test("phone keys stored before E.164 are upgraded, so the number's next channel 
   const a = await h.message("sms", "+15550100100", "hi");
   assert.equal(a!.conversationId, "p_wa");
   assert.deepEqual((await store.allConversations()).map((c) => c.personKey).sort(), ["phone:+15550100100", "phone:+15550100200", "phone:15550100200"]);
+});
+
+test("a tool gets its call id and a signal, and an idempotency key that is the same when its turn runs again after a restart", async () => {
+  const path = file();
+  const seen: Array<{ callId: string; idempotencyKey: string; signal: AbortSignal }> = [];
+  const never = gate<string>();
+  let answer: Promise<string> = never.promise;
+  const book = tool({ name: "book", description: "", input: z.object({ slot: z.string() }), deadlineMs: 60_000, run: (_input, context) => (seen.push(context), answer) });
+  const before = multi({ channels: CHANNELS, database: sqlite(path), tools: [book] });
+  await before.agent.resume();
+  const a = await before.message("sms", "+15550100100", "book Friday 10am");
+  const booking = call("book", { slot: "fri-10" });
+  (await before.nextCall(0)).answer(respond(call("send_sms", { text: "Booking it." }), booking));
+  while (!seen.length) await new Promise((resolve) => setImmediate(resolve));
+  await before.agent.conversation(a!.conversationId)!.stored(); // the process dies while the booking runs
+
+  answer = Promise.resolve("booked");
+  const after = multi({ channels: CHANNELS, database: sqlite(path), dir: before.dir, tools: [book] });
+  await after.agent.resume();
+  const again = await after.nextCall(0);
+  assert.match(last(again.request.messages).content, /Cut off by a restart/);
+  again.answer(respond(call("book", { slot: "fri-10" })));
+  (await after.nextCall(1)).answer(respond(call("send_sms", { text: "Booked for Friday at 10." })));
+  await after.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].callId, booking.id);
+  assert.notEqual(seen[1].callId, seen[0].callId);
+  assert.equal(seen[1].idempotencyKey, seen[0].idempotencyKey, "the backend can tell it is the same booking");
+
+  await before.agent.forgetPerson(a!.conversationId);
+  assert.equal(seen[0].signal.aborted, true, "a forgotten person's tools are told to stop");
 });

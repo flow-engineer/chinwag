@@ -245,3 +245,18 @@ test("a model error in a nudge texts the person nothing, and the nudge settles a
   await h.conversation.whenIdle();
   assert.equal(h.texts("sms").at(-1), "Sorry, something went wrong on my side. Could you send that again?");
 });
+
+test("two calls with one idempotency key at once send once, and both get its result; a scheduled one is written once", async () => {
+  const h = await withSam();
+  const nudge = { to: h.to, text: "Reminder", idempotencyKey: "order-1" };
+  const [a, b] = await Promise.all([h.agent.nudge(nudge), h.agent.nudge(nudge)]);
+  assert.deepEqual(a, b);
+  assert.equal(a.status, "sent");
+  assert.deepEqual(h.texts("sms"), ["Hi!", "Reminder"]);
+
+  const later = { to: h.to, text: "Your session starts soon.", at: h.clock.now + 120_000, idempotencyKey: "session-1" };
+  const [c, d] = await Promise.all([h.agent.nudge(later), h.agent.nudge(later)]);
+  assert.deepEqual(c, d);
+  h.clock.now += 120_000;
+  assert.equal(await h.agent.runDue(), 1, "one schedule, so it goes out once");
+});
