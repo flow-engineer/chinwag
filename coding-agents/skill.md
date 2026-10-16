@@ -87,7 +87,7 @@ guidance with a string.
 Models are reached through any OpenAI-compatible API. `openAICompatible()` with no key reads the
 first of `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` that has a
 value, and uses that provider's default model (`MODEL` overrides it). With none it stops at once and
-names them. Pass `apiKey` and `baseURL` for anywhere else.
+names them. Pass `apiKey` and `baseURL` for anywhere else (`baseURL` alone for a local server that needs no key).
 
 Which model: recommend Claude Haiku 5.5 (`anthropic/claude-haiku-5.5`, the default above) or OpenAI
 GPT-6.1 Sol (`openai/gpt-6.1-sol`, about 3x the cost, the most exact). If the owner asks for Luna

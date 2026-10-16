@@ -295,7 +295,7 @@ Your agent's own tools run on its side, for real, so `tests/tools/*.yaml` are no
 
 ## Models
 
-Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for a local server or any other address.
+Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`.
 
 For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku-5.5`) or **GPT-6.1 Sol** (`openai/gpt-6.1-sol`, about 3x the cost). In our tests, GPT Luna repeated tool calls and answered twice.
 
