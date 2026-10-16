@@ -56,7 +56,9 @@ export interface AgentOptions {
    * ("chat" from receive() without a `channelName`). It sees a channel's STOP, START and HELP
    * first, with `message.keyword` set (null for other messages), to keep its own state; Chinwag
    * still keeps or lifts the STOP whatever it returns or throws, and sends its own reply unless
-   * this returns one.
+   * this returns one. The message and the reply are kept in the history (the agent reads them at
+   * its next turn) and the transcript, and are `message.in` and `message.out` events marked
+   * `answered: true`.
    */
   intercept?: (conversationId: string, text: string, message: { keyword: Keyword | null; channel: string }) => string | null;
   /**
@@ -509,21 +511,15 @@ export class Agent {
     const deliver = this.deliverer(adapter, input.from, conversationId);
     conversation.link({ name: input.channel, info: adapter.info, params: adapter.params, instructions: adapter.instructions, address: input.from, deliver, lastMessageAt: null });
     const text = typeof input.message === "string" ? input.message : input.message.text;
-    // Answered with no model call, and nothing else stored: the id alone is kept, so a retry is not answered again.
-    const once = async () => input.messageId === undefined || (await this.store.inbound(conversationId, input.channel, input.messageId));
     const kind = keywordIn(adapter.keywords, input.message);
     const fixed = this.intercepted(conversationId, text, { keyword: kind, channel: input.channel });
-    const answer = kind && this.keyword(conversation, adapter.keywords!, kind, text, fixed, input.channel, input.messageId);
-    if (answer) {
-      await answer.stored;
-      if (answer.reply && (kind !== "help" || (await once()))) await deliver({ type: "message", text: answer.reply });
-      return null;
-    }
-    if (fixed !== null) {
-      if (fixed && (await once())) await deliver({ type: "message", text: fixed });
-      return null;
-    }
-    return { conversationId, messageId: conversation.receive(input.message, { channel: input.channel, messageId: input.messageId }) };
+    const answer = kind ? this.keyword(conversation, adapter.keywords!, kind, text, fixed, input.channel, input.messageId) : null;
+    const reply = answer ? answer.reply : fixed;
+    if (reply === null) return { conversationId, messageId: conversation.receive(input.message, { channel: input.channel, messageId: input.messageId }) };
+    // Answered with no model call: kept with its reply and its id, and sent once that is stored, so a retry is not answered again.
+    const answered = conversation.answered(input.message, { channel: input.channel, messageId: input.messageId, claimed: answer?.stored, note: answer?.note }, reply);
+    if (answered && (await answered.taken)) await answered.send();
+    return null;
   }
 
   /**
@@ -542,13 +538,14 @@ export class Agent {
 
   /**
    * A STOP, START or HELP keyword, answered with no model call: what to send back (the hook's own
-   * reply, else the channel's, if any), once it is stored. Null for HELP with neither: the hook's
-   * answer, or the agent, takes it like any message.
+   * reply, else the channel's, else "" for nothing), and for STOP and START the line the agent
+   * learns it by and their write, which holds the message's id. Null for HELP with no reply: the
+   * hook's answer, or the agent, takes it like any message.
    */
-  private keyword(conversation: Conversation, keywords: Keywords, kind: Keyword, text: string, own: string | null, channel: string, messageId?: string): { reply?: string; stored: Promise<void> } | null {
-    const reply = own || keywords.replies?.[kind];
-    if (kind === "help") return reply ? { reply, stored: Promise.resolve() } : null;
-    return { reply, stored: conversation.keyword(kind, text, channel, messageId) };
+  private keyword(conversation: Conversation, keywords: Keywords, kind: Keyword, text: string, own: string | null, channel: string, messageId?: string): { reply: string; note?: string; stored?: Promise<boolean> } | null {
+    const reply = own || keywords.replies?.[kind] || "";
+    if (kind === "help") return reply ? { reply } : null;
+    return { reply, ...conversation.keyword(kind, text, channel, messageId) };
   }
 
   /** The identity a message comes from, made (and linked to its person's conversation) the first time it writes. */
@@ -615,7 +612,7 @@ export class Agent {
 
   /**
    * A message from a person; replies go to `deliver`, the channel it came in on. Returns the id
-   * the agent knows the message by, or null when `intercept` answered it. The conversation is
+   * the agent knows the message by, or null when `intercept` or a keyword answered it. The conversation is
    * this id alone: use message() and `channels` for one person across several channels. When
    * `channelName` is one of the agent's channels, its definition (what it shows, its params) is
    * used and replies go to `deliver`: that is how the simulators play an agent's own channels.
@@ -626,22 +623,19 @@ export class Agent {
     const defined = this.channelsByName.get(name);
     const kind = keywordIn(defined?.keywords, message);
     const fixed = this.intercepted(conversationId, text, { keyword: kind, channel: name });
-    if (fixed !== null && !kind) {
-      if (fixed) void deliver({ type: "message", text: fixed });
-      return null;
-    }
     this.mustBeResumed();
     const isNew = !this.conversations.has(conversationId) && !this.rows.has(conversationId);
     const conversation = this.open(conversationId, `${name}:${conversationId}`);
     if (isNew) conversation.persist(() => this.store.addIdentity(conversationId, name, conversationId, "channel"));
     conversation.link({ name, info: defined?.info ?? options.channel ?? NO_EXTRAS, params: defined?.params, instructions: defined?.instructions, address: conversationId, deliver, lastMessageAt: null });
-    const answer = kind && this.keyword(conversation, defined!.keywords!, kind, text, fixed, name);
-    if (answer) {
-      if (answer.reply) void answer.stored.then(() => deliver({ type: "message", text: answer.reply! }));
-      return null;
-    }
-    if (fixed !== null) return null;
-    return conversation.receive(message, { channel: name, messageId: options.messageId });
+    const answer = kind ? this.keyword(conversation, defined!.keywords!, kind, text, fixed, name) : null;
+    const reply = answer ? answer.reply : fixed;
+    if (reply === null) return conversation.receive(message, { channel: name, messageId: options.messageId });
+    const answered = conversation.answered(message, { channel: name, messageId: options.messageId, claimed: answer?.stored, note: answer?.note }, reply);
+    // A STOP's or START's reply goes once it is kept; any other starts now, while receive() runs, so
+    // a caller that waits on what it delivers sees it.
+    if (answered) void (answer?.stored ? answer.stored.then((taken) => (taken ? answered.send() : undefined)) : answered.send());
+    return null;
   }
 
   /**

@@ -149,6 +149,10 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
     const turn = open.get(conversationId);
     if (!turn) return;
     open.delete(conversationId);
+    record(conversationId, turn, failed, at);
+  }
+
+  function record(conversationId: string, turn: Turn, failed: boolean, at: number) {
     const attributes = [attr("gen_ai.operation.name", "invoke_agent"), attr("gen_ai.agent.name", agent.service), ...ids(conversationId)];
     const channel = kindOf(turn.inbound.at(-1)?.channel ?? turn.replyChannel);
     if (channel) attributes.push(attr("chinwag.channel", channel));
@@ -163,12 +167,11 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
     enqueue([root, ...turn.spans]);
   }
 
-  /** A message sent outside any turn (one the business wrote, sent as is): a trace of its own. */
+  /** A message sent outside any turn (one the business wrote, or a rule's answer, sent as is): a trace of its own. */
   function alone(conversationId: string, at: number, channel: string, text: unknown) {
     const turn: Turn = { traceId: hex(16), rootId: hex(8), start: at, inbound: [], spans: [], tools: new Map(), replyChannel: channel };
-    open.set(conversationId, turn);
     turn.spans.push(reply(turn, at, channel, text));
-    finish(conversationId, false, at);
+    record(conversationId, turn, false, at);
   }
 
   function reply(turn: Turn, at: number, channel: string, text: unknown): Span {
@@ -224,6 +227,8 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
         // A voice note's text is its transcript (and any caption).
         const text = [e.transcript, e.text].filter(Boolean).join(" ");
         const m: Inbound = { at: e.at, text, channel: String(e.channel ?? ""), messageId: e.ownId ? String(e.messageId) : undefined };
+        // Answered with no model call (intercept, a keyword): a trace of its own, never part of a turn.
+        if (e.answered) return record(id, { traceId: hex(16), rootId: hex(8), start: e.at, inbound: [m], spans: [], tools: new Map() }, false, e.at);
         (turn ?? waitingFor(id)).inbound.push(m);
         return;
       }
@@ -234,7 +239,7 @@ export function traces(options: TracesOptions, agent: { service: string; kindOf(
       case "model.error":
         return finish(id, true, e.at);
       case "message.out":
-        if (!turn) return alone(id, e.at, String(e.channel), e.text);
+        if (!turn || e.answered) return alone(id, e.at, String(e.channel), e.text);
         turn.spans.push(reply(turn, e.at, String(e.channel), e.text));
         return;
       case "model.call": {

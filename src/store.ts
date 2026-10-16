@@ -327,11 +327,8 @@ export class Store {
     return (await this.db.query("SELECT 1 FROM inbound WHERE agent_id = ? AND conversation_id = ? AND channel = ? AND message_id = ?", [this.agentId, conversationId, channel, messageId])).length > 0;
   }
 
-  /**
-   * Records a provider's message id for a message that stores nothing else (answered with no
-   * model call); false when it was already taken.
-   */
-  async inbound(conversationId: string, channel: string, messageId: string, db: Omit<Database, "transaction"> = this.db): Promise<boolean> {
+  /** Records a provider's message id, in the transaction of what its message stores; false when it was already taken. */
+  private async inbound(conversationId: string, channel: string, messageId: string, db: Omit<Database, "transaction"> = this.db): Promise<boolean> {
     return (await db.run("INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, conversationId, channel, messageId, Date.now()])) > 0;
   }
 

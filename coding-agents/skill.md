@@ -80,7 +80,9 @@ text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `profile({
 the person, offered as the built-in tool `get_user_profile` and run only when the agent calls it (put
 lookups here, not in `context`); `context(conversationId)` adds small facts to the system prompt at
 every turn, before every reply, so it must not call APIs; Chinwag already tells the agent the time; `intercept(conversationId, text, message)` answers a
-message without the model (return the reply, `""` for silence, or `null` to let the agent answer);
+message without the model (return the reply, `""` for silence, or `null` to let the agent answer;
+the message and the reply are kept in the history, so the next turn knows, and in the transcript,
+and are `message.in`/`message.out` events marked `answered: true`);
 `deadlineMs` (default 60,000) is the longest a reply waits for a tool before it moves to the
 background (set a tool's own `deadlineMs` for a known-slow one); `partialAfterMs` (default 5,000)
 is how long a finished tool's result waits for the others of its response; `shareUpdates` turns live status lines on web and app UIs off, or replaces their
