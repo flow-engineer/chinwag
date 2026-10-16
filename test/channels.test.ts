@@ -1,7 +1,7 @@
 // covers: src/conversation.ts src/talk.ts src/channels.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { SMS_KEYWORDS, keywordOf } from "../src/channels.ts";
+import { SMS_KEYWORDS, US_CARRIER_KEYWORDS, keywordOf, sms } from "../src/channels.ts";
 import { SMS, WHATSAPP, call, harness, respond, say, users } from "./helpers.ts";
 
 test("a channel without reactions or status offers only its send tool", async () => {
@@ -40,10 +40,20 @@ test("WhatsApp: read receipts when the agent picks a message up, quotes and taps
 });
 
 test("a keyword is the whole message, in any case, with only spaces, punctuation or emoji around it", () => {
-  for (const [text, kind] of [["STOP", "stop"], [" stop. ", "stop"], ["Stop!! 🙏", "stop"], ["unsubscribe", "stop"], ["Start", "start"], ["help?", "help"]] as const) {
+  for (const [text, kind] of [["STOP", "stop"], [" stop. ", "stop"], ["Stop!! 🙏", "stop"], ["Start", "start"], ["help?", "help"]] as const) {
     assert.equal(keywordOf(SMS_KEYWORDS, text), kind, text);
   }
-  for (const text of ["stop by tomorrow", "please stop", "stop 2", "st op", "STOPPED", "don't stop", "end of the day", "cancel my order", "🛑", ""]) {
+  for (const text of ["stop by tomorrow", "please stop", "stop 2", "st op", "STOPPED", "don't stop", "🛑", ""]) {
     assert.equal(keywordOf(SMS_KEYWORDS, text), null, text);
   }
+});
+
+test("SMS takes only STOP to opt out by default; the fuller US carrier list is opt in", () => {
+  const plain = sms({ sendMessage: async () => {} });
+  for (const text of ["unsubscribe", "cancel", "quit", "end", "stopall"]) assert.equal(keywordOf(plain.keywords, text), null, text);
+  assert.equal(keywordOf(plain.keywords, "STOP"), "stop");
+  const carrier = sms({ sendMessage: async () => {} }, { keywords: US_CARRIER_KEYWORDS });
+  for (const text of ["STOP", "unsubscribe", "Cancel.", "quit", "end", "stopall"]) assert.equal(keywordOf(carrier.keywords, text), "stop", text);
+  assert.equal(keywordOf(carrier.keywords, "unstop"), "start");
+  for (const text of ["cancel my order", "end of the day"]) assert.equal(keywordOf(carrier.keywords, text), null, text);
 });

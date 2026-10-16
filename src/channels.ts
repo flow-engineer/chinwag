@@ -46,9 +46,18 @@ export interface Keywords {
   replies?: { stop?: string; start?: string; help?: string };
 }
 
-/** The words carriers treat as opt-out, opt-in and help on SMS. */
-export const SMS_KEYWORDS: Keywords = {
-  stop: ["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "REVOKE", "OPTOUT"],
+/**
+ * SMS's default: STOP to opt out, START to resume, HELP or INFO for help. Which words carriers or
+ * regulators expect differs by country; check your market's rules and pass more when they ask.
+ */
+export const SMS_KEYWORDS: Keywords = { stop: ["STOP"], start: ["START"], help: ["HELP", "INFO"] };
+
+/**
+ * The fuller list some US carrier rules expect on SMS, opt in:
+ * `sms(provider, { keywords: US_CARRIER_KEYWORDS })`, or `{ ...US_CARRIER_KEYWORDS, replies }`.
+ */
+export const US_CARRIER_KEYWORDS: Keywords = {
+  stop: ["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"],
   start: ["START", "UNSTOP"],
   help: ["HELP", "INFO"],
 };

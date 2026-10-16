@@ -164,6 +164,9 @@ Built in, so don't build them as tools: scheduled messages (`schedule_message`, 
 (`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
 `whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
 no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
+SMS takes only STOP by default; the words carriers or regulators expect differ by country, so
+check the market's rules (`keywords: US_CARRIER_KEYWORDS` adds STOPALL, UNSUBSCRIBE, CANCEL, END
+and QUIT, as some US carrier rules expect; `keywords: { stop: [...] }` sets your own).
 
 Messages the business starts are nudges: `agent.nudge({ to: { channel, address }, text })` sends
 as written; `prompt` instead lets the agent write it (or decide not to); `template` sends a

@@ -6,6 +6,7 @@ export {
   fitMessage,
   sms,
   SMS_KEYWORDS,
+  US_CARRIER_KEYWORDS,
   WHATSAPP_KEYWORDS,
   whatsapp,
   SMS,
