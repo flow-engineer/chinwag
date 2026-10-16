@@ -1,4 +1,4 @@
-// covers: testing/src/cli.ts testing/src/suite.ts testing/src/client.ts
+// covers: testing/src/cli.ts testing/src/suite.ts testing/src/client.ts testing/src/report.ts testing/src/show.ts
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -37,8 +37,8 @@ function agentDir(more: Record<string, string> = {}): string {
   return dir;
 }
 
-/** A cloud that opens session `sessionId`, sends `frames` on the stream, then ends it or holds it open; `opens` has each open's body. */
-function cloud(hold: boolean, frames: unknown[] = [run], sessionId = "s") {
+/** A cloud that opens session `sessionId` (its open's answer with `answer` added), sends `frames` on the stream, then ends it or holds it open; `opens` has each open's body. */
+function cloud(hold: boolean, frames: unknown[] = [run], sessionId = "s", answer: Record<string, unknown> = {}) {
   let release: (() => void) | undefined;
   const opened = new Promise<void>((done) => { release = done; });
   const opens: Array<{ files: Array<{ path: string }>; runs: number }> = [];
@@ -48,7 +48,7 @@ function cloud(hold: boolean, frames: unknown[] = [run], sessionId = "s") {
       req.on("data", (chunk) => { body += chunk; });
       req.on("end", () => {
         opens.push(JSON.parse(body));
-        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId, token: "t", missing: [], dashboard: `http://dash/${sessionId}` }));
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId, token: "t", missing: [], dashboard: `http://dash/${sessionId}`, ...answer }));
       });
       return;
     }
@@ -104,15 +104,23 @@ test("a stream that dies prints the runs already in, keeps them with the rest as
 
 /** Runs the CLI with these arguments, without the developer's cloud settings, and gives its exit code and output. */
 async function cliOutput(args: string[], dir: string, node: string[] = []): Promise<{ code: number | null; out: string }> {
-  const env: NodeJS.ProcessEnv = { ...process.env, OPENROUTER_API_KEY: "test-key" };
-  delete env.CHINWAG_CLOUD;
-  delete env.CHINWAG_CLOUD_KEY;
-  const child = spawn(process.execPath, [...node, cli, ...args], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
-  let out = "";
-  child.stdout.on("data", (chunk) => { out += chunk; });
-  child.stderr.on("data", (chunk) => { out += chunk; });
-  const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+  const { code, out } = await cliStreams(args, dir, {}, node);
   return { code, out };
+}
+
+/** The same, with `env` added, and stdout and stderr also apart. */
+async function cliStreams(args: string[], dir: string, env: NodeJS.ProcessEnv = {}, node: string[] = []) {
+  const full: NodeJS.ProcessEnv = { ...process.env, OPENROUTER_API_KEY: "test-key" };
+  delete full.CHINWAG_CLOUD;
+  delete full.CHINWAG_CLOUD_KEY;
+  const child = spawn(process.execPath, [...node, cli, ...args], { cwd: dir, env: { ...full, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { out += chunk; stdout += chunk; });
+  child.stderr.on("data", (chunk) => { out += chunk; stderr += chunk; });
+  const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+  return { code, out, stdout, stderr };
 }
 
 test("the command line: --version, each command's own --help, and a plain line for a wrong flag", { timeout: 15_000 }, async () => {
@@ -150,8 +158,9 @@ test("what is wrong on this machine is said before the cloud is called, an addre
   });
   const good = agentDir();
   assert.match((await cliOutput(["test", "--cloud", closed, "--agent-url", "http://127.0.0.1:9/chinwag"], good)).out, /^Could not reach your agent at http:\/\/127\.0\.0\.1:9\/chinwag: ECONNREFUSED\. Start it first/m);
+  // A cloud that does not answer is a connection failure (2), not a failed run.
   const named = await cliOutput(["test", "--cloud", closed], good);
-  assert.equal(named.code, 1);
+  assert.equal(named.code, 2);
   assert.match(named.out, /^Could not reach http:\/\/127\.0\.0\.1:9: ECONNREFUSED\.$/m);
   // No cloud named: the hosted one, which needs a key before anything is sent.
   assert.match((await cliOutput(["test"], good)).out, /^A hosted cloud needs the agent's CI key: set CHINWAG_CLOUD_KEY\. Make a key at https:\/\/flow\.engineer\/observe: your agent, Developers\.$/m);
@@ -188,10 +197,12 @@ test("Ctrl-C prints the same partial report, keeps what finished, and exits 130"
   } finally { child.kill(); local.close(); }
 });
 
-test("a refused open exits 1 and prints only the message", { timeout: 15_000 }, async () => {
+test("the cloud's refusal exits 3: an open refused for the spend cap is not sent again, and a session it ends for the spend cap", { timeout: 15_000 }, async () => {
+  let opens = 0;
   const server = createServer((req, res) => {
     req.resume();
-    res.writeHead(401, { "content-type": "application/json" }).end('{"error":"unauthorized"}');
+    opens++;
+    res.writeHead(429, { "content-type": "application/json", "retry-after": "0" }).end('{"error":{"type":"spend_cap","message":"The daily spend cap is reached."}}');
   });
   const local = await new Promise<{ url: string; close: () => void }>((done) => {
     server.listen(0, "127.0.0.1", () => done({
@@ -200,18 +211,104 @@ test("a refused open exits 1 and prints only the message", { timeout: 15_000 }, 
     }));
   });
   const dir = agentDir();
-  const child = runCli(local.url, dir);
-  let out = "";
-  child.stdout.on("data", (chunk) => { out += chunk; });
-  child.stderr.on("data", (chunk) => { out += chunk; });
   try {
-    const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
-    assert.equal(code, 1);
-    assert.match(out, /unauthorized/);
-    assert.ok(!out.includes("runs finished before"));
+    const refused = await cliStreams(["test", "--cloud", local.url, "--json"], dir);
+    assert.equal(refused.code, 3, refused.out);
+    assert.equal(opens, 1);
+    assert.match(refused.stderr, /spend cap is reached/);
+    assert.ok(!refused.out.includes("runs finished before"));
+    const report = JSON.parse(refused.stdout);
+    assert.deepEqual({ outcome: report.outcome, exitCode: report.exitCode, sessionId: report.sessionId, runs: report.runs }, { outcome: "refused", exitCode: 3, sessionId: null, runs: [] });
+    assert.deepEqual({ ...report.error, message: undefined }, { message: undefined, status: 429, type: "spend_cap", retryAfterSeconds: 0 });
     // No session opened, so the last one's results are left as they were.
     assert.ok(!existsSync(join(dir, ".chinwag")));
-  } finally { child.kill(); local.close(); }
+  } finally { local.close(); }
+
+  const ended = await cloud(false, [run, { type: "failed", error: "spend_cap: the daily spend cap is reached" }]);
+  try {
+    const result = await cliOutput(["test", "--cloud", ended.url], dir);
+    assert.equal(result.code, 3, result.out);
+    assert.match(result.out, /the cloud stopped the session: spend_cap/);
+    assert.equal(lastSession(dir).ended, "stopped");
+  } finally { ended.close(); }
+});
+
+test("with --json, every exit prints one report on stdout and every other line on stderr", { timeout: 20_000 }, async () => {
+  const dir = agentDir({ b: scenarioYaml("bee", "sms") });
+  const runs = [
+    runOf({ runId: "trn_1", scenario: "hello", passed: true, agentUsage: { input: 10, output: 5, costUsd: 0.25 }, testUsage: { input: 1, output: 1, costUsd: 0.5 } }),
+    runOf({ runId: "trn_2", scenario: "bee", turns: 6, checks: [{ kind: "judge", text: "Asks to confirm.", pass: false, reason: "It never asked." }], agentUsage: { input: 1, output: 1, costUsd: 0.25 } }),
+  ];
+  const finished = { type: "finished", summary: { sessionId: "s1", suiteHash: "h", testModel: "m", runs, dashboard: "http://dash/s1" } };
+  const local = await cloud(false, [finished], "s1", { agent: "agt_1" });
+  let result;
+  try {
+    result = await cliStreams(["test", "--cloud", local.url, "--json"], dir);
+  } finally { local.close(); }
+  assert.equal(result.code, 1, result.out);
+  assert.match(result.stderr, /^FAIL {2}bee #1 \(sms\) trn_2: 6 turns/m);
+  assert.match(result.stderr, /^Results: \.chinwag\/last-session\.json/m);
+  assert.equal(result.stdout.trim().split("\n").length, 1);
+  const report = JSON.parse(result.stdout);
+  assert.match(report.suiteHash, /^[0-9a-f]{64}$/);
+  assert.deepEqual({ ...report, suiteHash: undefined }, {
+    version: 1, outcome: "failed", exitCode: 1, sessionId: "s1", agent: "agt_1", dashboard: "http://dash/s1", suiteHash: undefined, error: null,
+    counts: { runs: 2, passed: 1, failed: 1, errored: 0, notPlayed: 0 },
+    costUsd: { agent: 0.5, test: 0.5 },
+    runs: [
+      { runId: "trn_2", scenario: "b", channel: "sms", run: 1, verdict: "failed", error: null, ended: "goal", turns: 6, watch: "http://watch/r1", failedChecks: [{ kind: "judge", text: "Asks to confirm.", reason: "It never asked." }] },
+      { runId: "trn_1", scenario: "hello", channel: "sms", run: 1, verdict: "passed", error: null, ended: "goal", turns: 1, watch: "http://watch/r1", failedChecks: [] },
+    ],
+  });
+  // The results file agrees with the report, and keeps the cloud's agent id for chinwag show.
+  const last = lastSession(dir);
+  assert.equal(last.agent, "agt_1");
+  assert.deepEqual(last.runs.map((r: { runId: string; verdict: string }) => `${r.runId} ${r.verdict}`), ["trn_2 failed", "trn_1 passed"]);
+
+  // Nothing sent, and a cloud that does not answer: still one report each.
+  const invalid = await cliStreams(["test", "--json", "--runs", "abc"], dir);
+  assert.equal(invalid.code, 1);
+  assert.equal(invalid.stderr, '--runs must be a whole number above 0, such as 3 (got "abc").\n');
+  assert.deepEqual([JSON.parse(invalid.stdout).outcome, JSON.parse(invalid.stdout).exitCode], ["invalid", 1]);
+  const unreachable = await cliStreams(["test", "--json", "--cloud", "http://127.0.0.1:9"], dir);
+  assert.equal(unreachable.code, 2);
+  assert.deepEqual([JSON.parse(unreachable.stdout).outcome, JSON.parse(unreachable.stdout).error.message], ["transport", "Could not reach http://127.0.0.1:9: ECONNREFUSED."]);
+});
+
+test("a run the cloud names an error for is errored, whatever it ended as: ERROR on its line, errored in --json and the results, and exit 2 when none failed", { timeout: 20_000 }, async () => {
+  const dir = agentDir({ b: scenarioYaml("bee", "sms") });
+  // The judge failed after the person met their goal: the checks it left say nothing about the agent.
+  const judged = runOf({ runId: "trn_2", scenario: "bee", ended: "goal_met", error: "judge_failed", checks: [{ kind: "judge", text: "Asks to confirm.", pass: false, reason: "not judged" }] });
+  const runs = [runOf({ runId: "trn_1", scenario: "hello", passed: true, ended: "goal_met" }), judged];
+  const finished = (extra: unknown[] = []) => ({ type: "finished", summary: { sessionId: "s1", suiteHash: "h", testModel: "m", runs: [...runs, ...extra], dashboard: "http://dash/s1" } });
+  const local = await cloud(false, [finished()], "s1", { agent: "agt_1" });
+  let result;
+  try {
+    result = await cliStreams(["test", "--cloud", local.url, "--json"], dir);
+  } finally { local.close(); }
+  assert.equal(result.code, 2, result.out);
+  assert.match(result.stderr, /^ERROR {2}bee #1 \(sms\) trn_2: 1 turn, ended: goal_met; error: judge_failed \(the cloud could not play or judge this run, not the agent's fault\);/m);
+  assert.doesNotMatch(result.stderr, /FAIL {2}bee|not judged/);
+  assert.match(result.stderr, /^1 of 2 runs passed\. 1 errored \(the cloud could not play or judge it\)\. .* 0 failed a check\./m);
+  const report = JSON.parse(result.stdout);
+  assert.deepEqual([report.outcome, report.exitCode, report.counts], ["errored", 2, { runs: 2, passed: 1, failed: 0, errored: 1, notPlayed: 0 }]);
+  assert.deepEqual(report.runs.map((r: { runId: string; verdict: string; error: string | null; ended: string }) => `${r.runId} ${r.verdict} ${r.error} ${r.ended}`), ["trn_2 errored judge_failed goal_met", "trn_1 passed null goal_met"]);
+  assert.deepEqual(lastSession(dir).runs.map((r: { runId: string; verdict: string }) => `${r.runId} ${r.verdict}`), ["trn_2 errored", "trn_1 passed"]);
+
+  // An error beats passed too, and without --json the exit is the same.
+  const capped = await cloud(false, [{ type: "finished", summary: { ...finished().summary, runs: [runs[0], { ...judged, passed: true, error: "spend_cap", checks: [] }] } }], "s2");
+  try {
+    const plain = await cliStreams(["test", "--cloud", capped.url], dir);
+    assert.equal(plain.code, 2, plain.out);
+    assert.match(plain.stdout, /^ERROR {2}bee #1 \(sms\) trn_2: .*error: spend_cap/m);
+    assert.match(plain.stdout, /^ {2}sms: 1 of 2 passed$/m);
+  } finally { capped.close(); }
+
+  // A run that failed still makes the session fail (exit 1), beside an errored one.
+  const mixed = await cloud(false, [finished([runOf({ runId: "trn_3", scenario: "hello", run: 2 })])], "s3");
+  try {
+    assert.equal((await cliStreams(["test", "--cloud", mixed.url], dir)).code, 1);
+  } finally { mixed.close(); }
 });
 
 test("an agent that fails to build exits 1 and prints only the message", { timeout: 15_000 }, async () => {
@@ -273,7 +370,7 @@ test("a finished session's results are kept, and --failed runs again only what d
   const first = [
     runOf({ runId: "r1", scenario: "hello", passed: true }),
     runOf({ runId: "r2", scenario: "bee", checks: [
-      { kind: "judge", text: "Asks to confirm.", pass: false, reason: "The agent wrote: SECRET-TRANSCRIPT" },
+      { kind: "judge", text: "Asks to confirm.", pass: false, reason: "It never asked." },
       { kind: "outcome", text: "One order.", pass: true, reason: "ok" },
     ] }),
     runOf({ runId: "r3", scenario: "c", ended: "run_failed" }),
@@ -290,15 +387,14 @@ test("a finished session's results are kept, and --failed runs again only what d
   assert.deepEqual({ ...last, endedAt: undefined, suiteHash: undefined }, {
     sessionId: "s1", dashboard: "http://dash/s1", ended: "finished", only: null, endedAt: undefined, suiteHash: undefined,
     runs: [
-      { scenario: "b", channel: "sms", run: 1, verdict: "failed", failedChecks: [{ kind: "judge", text: "Asks to confirm." }] },
-      { scenario: "c", channel: "sms", run: 1, verdict: "errored", failedChecks: [] },
-      { scenario: "c", channel: "whatsapp", run: 1, verdict: "passed", failedChecks: [] },
-      { scenario: "hello", channel: "sms", run: 1, verdict: "passed", failedChecks: [] },
+      { scenario: "b", channel: "sms", run: 1, runId: "r2", verdict: "failed", failedChecks: [{ kind: "judge", text: "Asks to confirm.", reason: "It never asked." }] },
+      { scenario: "c", channel: "sms", run: 1, runId: "r3", verdict: "errored", failedChecks: [] },
+      { scenario: "c", channel: "whatsapp", run: 1, runId: "r4", verdict: "passed", failedChecks: [] },
+      { scenario: "hello", channel: "sms", run: 1, runId: "r1", verdict: "passed", failedChecks: [] },
     ],
   });
   assert.match(last.suiteHash, /^[0-9a-f]{64}$/);
   assert.ok(!Number.isNaN(Date.parse(last.endedAt)));
-  assert.doesNotMatch(readFileSync(join(dir, ".chinwag", "last-session.json"), "utf8"), /SECRET-TRANSCRIPT/);
 
   const passing = ["b", "c"].flatMap((scenario) => [1, 2].flatMap((n) => (scenario === "c" ? ["sms", "whatsapp"] : ["sms"]).map((channel) =>
     runOf({ runId: `${scenario}${n}${channel}`, scenario: scenario === "b" ? "bee" : scenario, run: n, channel, passed: true }))));
@@ -326,4 +422,113 @@ test("--failed with no last session, or with --only, stops before anything is se
     code: 1,
     out: "--failed picks its scenarios from the last session and does not go with --only: run one or the other.\n",
   });
+});
+
+test("the summary reads the same on every machine: token counts in one format, and whether every run called the agent's model", { timeout: 15_000 }, async () => {
+  const dir = agentDir({ b: scenarioYaml("bee", "sms") });
+  const runs = [
+    runOf({ runId: "r1", scenario: "hello", passed: true, agentModels: ["m"], agentUsage: { input: 194_620, output: 1_200, costUsd: 0 } }),
+    runOf({ runId: "r2", scenario: "bee", passed: true }),
+  ];
+  const local = await cloud(false, [{ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "m", runs, dashboard: "http://dash/s" } }]);
+  try {
+    const result = await cliStreams(["test", "--cloud", local.url], dir, { LC_ALL: "en_IN.UTF-8", LANG: "en_IN.UTF-8" });
+    assert.equal(result.code, 0, result.out);
+    assert.match(result.stdout, /2 of 2 runs passed\. 1 run never called the agent's model\./);
+    assert.match(result.stdout, /\(194,620 in, 1,200 out\)/);
+  } finally { local.close(); }
+});
+
+test("--dotenv is read in place of the folder's .env, and variables already set win", { timeout: 15_000 }, async () => {
+  const dir = agentDir();
+  writeFileSync(join(dir, ".env"), "CHINWAG_CLOUD=http://127.0.0.1:7\n");
+  writeFileSync(join(dir, "ci.env"), "CHINWAG_CLOUD=http://127.0.0.1:9\n");
+  assert.match((await cliOutput(["test"], dir)).out, /^Could not reach http:\/\/127\.0\.0\.1:7: ECONNREFUSED\.$/m);
+  assert.match((await cliOutput(["test", "--dotenv", "ci.env"], dir)).out, /^Could not reach http:\/\/127\.0\.0\.1:9: ECONNREFUSED\.$/m);
+  assert.match((await cliStreams(["test", "--dotenv", "ci.env"], dir, { CHINWAG_CLOUD: "http://127.0.0.1:8" })).out, /^Could not reach http:\/\/127\.0\.0\.1:8: ECONNREFUSED\.$/m);
+  assert.deepEqual(await cliOutput(["test", "--dotenv", "none.env"], dir), { code: 1, out: "--dotenv none.env: no such file.\n" });
+});
+
+/** A run's record as the cloud keeps it: a judge check failed, one tool call between the messages. */
+const record = {
+  runId: "trn_2", sessionId: "s1", agent: "agt_1", scenario: { id: "bee", path: "scenarios/b.yaml", hash: "h" }, run: 1, channel: "whatsapp",
+  startedAt: 1_000, finishedAt: 9_000,
+  transcript: [
+    { kind: "in", id: "m1", text: "a large latte please", at: 1_000 },
+    { kind: "out", id: "a1", text: "Placed! Anything else?", at: 4_000, buttons: [{ title: "No thanks" }, "Yes"] },
+    { kind: "reaction", messageId: "a1", emoji: "👍", at: 5_000, by: "person" },
+  ],
+  toolCalls: [{ tool: "place_order", input: { size: "large" }, ok: true, output: { order: 7 }, latencyMs: 800, changes: ["order 7 placed"], kind: "write", at: 2_000, overheadMs: 3 }],
+  checks: [
+    { kind: "outcome", text: "One order is placed.", pass: true, reason: "Order 7." },
+    { kind: "judge", text: "Asks to confirm before ordering.", pass: false, reason: "It placed the order without asking." },
+  ],
+  summary: { passed: false, ended: "goal_met", turns: 2, watch: "http://watch/trn_2" },
+};
+
+test("chinwag show prints a run's record from the cloud with the CI key: checks with reasons, then messages and tool calls in time order", { timeout: 15_000 }, async () => {
+  const asked: Array<{ path: string; authorization?: string }> = [];
+  const server = createServer((req, res) => {
+    asked.push({ path: req.url!, authorization: req.headers.authorization });
+    if (req.url === "/v1/agents/agt_1/tests/runs/trn_2") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(record));
+    if (req.url === "/v1/agents/agt_1/tests/runs/trn_4") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...record, runId: "trn_4", error: "judge_failed" }));
+    if (req.url === "/v1/agents/agt_1/tests/runs/trn_5") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...record, runId: "trn_5", summary: { ...record.summary, passed: true, error: "simulator_failed" } }));
+    res.writeHead(404, { "content-type": "application/json" }).end('{"error":{"type":"not_found","message":"No such run."}}');
+  });
+  const url = await new Promise<string>((done) => server.listen(0, "127.0.0.1", () => done(`http://127.0.0.1:${(server.address() as AddressInfo).port}`)));
+  const dir = agentDir();
+  mkdirSync(join(dir, ".chinwag"));
+  const runs = [
+    { scenario: "hello", channel: "sms", run: 1, runId: "trn_1", verdict: "passed", failedChecks: [] },
+    { scenario: "b", channel: "whatsapp", run: 1, runId: "trn_2", verdict: "failed", failedChecks: [] },
+    { scenario: "c", channel: "sms", run: 1, runId: "trn_3", verdict: "errored", failedChecks: [] },
+  ];
+  writeFileSync(join(dir, ".chinwag", "last-session.json"), JSON.stringify({ sessionId: "s1", agent: "agt_1", dashboard: "d", suiteHash: "h", endedAt: "t", ended: "finished", only: null, runs }));
+  const key = { CHINWAG_CLOUD_KEY: "oci_test" };
+  try {
+    const shown = await cliStreams(["show", "last", "--cloud", url], dir, key);
+    assert.equal(shown.code, 0, shown.out);
+    assert.match(shown.stderr, /^Showing b #1 \(whatsapp\), failed: trn_2$/m);
+    assert.match(shown.stderr, /also did not pass: chinwag show trn_3/);
+    assert.deepEqual(asked, [{ path: "/v1/agents/agt_1/tests/runs/trn_2", authorization: "Bearer oci_test" }]);
+    assert.equal(shown.stdout, [
+      "FAIL  scenarios/b.yaml",
+      "  channel whatsapp, run 1, trn_2; ended: goal_met, 2 turns",
+      "",
+      "Checks:",
+      "  ✗ judge: Asks to confirm before ordering.",
+      "      It placed the order without asking.",
+      "  ✓ outcome: One order is placed.",
+      "      Order 7.",
+      "",
+      "Conversation:",
+      "   +0.0s person: a large latte please",
+      '   +1.0s tool place_order({"size":"large"}) → {"order":7} [write, simulated, 800 ms]',
+      "           changes: order 7 placed",
+      "   +3.0s agent: Placed! Anything else? [buttons: No thanks | Yes]",
+      "   +4.0s person reacted 👍 to a1",
+      "",
+      "Watch: http://watch/trn_2",
+      "",
+    ].join("\n"));
+
+    const json = await cliStreams(["show", "trn_2", "--json", "--cloud", url], dir, key);
+    assert.equal(json.code, 0);
+    assert.equal(json.stdout, JSON.stringify(record));
+
+    // A run the cloud could not judge reads ERROR, though it ended goal_met, with its code.
+    const errored = await cliStreams(["show", "trn_4", "--cloud", url], dir, key);
+    assert.equal(errored.code, 0, errored.out);
+    assert.deepEqual(errored.stdout.split("\n").slice(0, 3), [
+      "ERROR  scenarios/b.yaml",
+      "  channel whatsapp, run 1, trn_4; ended: goal_met, 2 turns",
+      "  error: judge_failed (the cloud could not play or judge this run; it says nothing about the agent)",
+    ]);
+    const summaryOnly = await cliStreams(["show", "trn_5", "--cloud", url], dir, key);
+    assert.match(summaryOnly.stdout, /^ERROR {2}scenarios\/b\.yaml\n.*\n {2}error: simulator_failed /);
+
+    const missing = await cliStreams(["show", "trn_9", "--cloud", url], dir, key);
+    assert.equal(missing.code, 1);
+    assert.match(missing.stderr, /^The cloud answered 404 not_found: No such run\. No run trn_9 for this agent\.$/m);
+  } finally { server.closeAllConnections(); server.close(); }
 });

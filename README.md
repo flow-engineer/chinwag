@@ -250,29 +250,63 @@ npx chinwag test --cloud https://flow.engineer/observe --synthetic --runs 3 --on
 
 Your agent stays on your machine with its own model and key; the test cloud ([get one](#get-a-test-cloud)) plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation. Before anything is sent it reads every test file as the cloud does, and a mistake stops it with the file and line (`tests/scenarios/latte-correction.yaml:3: person.goal: missing`).
 
-The command exits 0 when every run passed, and 1 when the session finished and a run failed. A refusal from the cloud (a bad CI key, an invalid suite, the spend cap) or a failure before the session opens exits 1 and prints only that message. On a cloud that resumes, a dropped stream is opened again for up to 2 minutes, picking up after the last command. On a cloud that can re-open, a session the cloud lost is opened once more for only the runs with no result (the log names them, since they are played and paid for again), and the report covers both sessions with both dashboard links. If the tunnel, the stream, or the connection fails after the session has opened, it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report, says the cloud keeps playing until it is stopped from the dashboard, and exits 130.
+Exit status:
 
-`--only latte-correction,order-fails` runs only those scenarios (file names without `.yaml`); every tool file still goes. Once the session has opened, every exit (0, 1, 2 or 130) writes `.chinwag/last-session.json` in the agent's folder and prints its path; `chinwag new` git-ignores `.chinwag/`. It holds what each run ended as, never what was said:
+| Exit | Meaning |
+|---|---|
+| 0 | Every run passed. |
+| 1 | A run failed. Or nothing was sent: a wrong flag, a test file that does not parse, no `CHINWAG_CLOUD_KEY`; the message is printed on its own. |
+| 2 | The connection, the tunnel or the stream failed (before or after the session opened), the cloud answered 5xx or no JSON, the cloud ended the session for its own failure, or runs errored (the cloud could not play or judge them) and none failed. |
+| 3 | The cloud refused: the open (a bad or wrong key, 401/403; an invalid request, 400; busy, 429 `rate_limited`; the spend cap, 429 `spend_cap`; 503 `capacity`), or it ended the session for the spend cap or capacity. |
+| 130 | Interrupted (Ctrl-C). |
+
+A busy cloud's refused open (429 other than the spend cap, or 503 `capacity`) with a Retry-After of 60 s or less is sent once more after it, with one line saying so; the spend cap never is. On a cloud that resumes, a dropped stream is opened again for up to 2 minutes, picking up after the last command. On a cloud that can re-open, a session the cloud lost is opened once more for only the runs with no result (the log names them, since they are played and paid for again), and the report covers both sessions with both dashboard links. If the tunnel, the stream, or the connection fails after the session has opened, it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report, says the cloud keeps playing until it is stopped from the dashboard, and exits 130.
+
+Each run's line carries its id (`FAIL  latte-correction #1 (whatsapp) trn_…: 6 turns, …`). `--dotenv <path>` reads the environment from that file instead of the folder's `.env` (variables already set still win; no value is printed), and `--verbose` also prints slow event uploads.
+
+`--json` prints one JSON document on stdout when the command ends, on every exit once its flags are read; every other line goes to stderr:
 
 ```json
 {
-  "sessionId": "…", "dashboard": "https://…", "suiteHash": "…", "endedAt": "2026-10-16T09:12:03.000Z",
-  "ended": "finished",
-  "only": null,
+  "version": 1, "outcome": "failed", "exitCode": 1,
+  "sessionId": "tse_…", "agent": "agt_…", "dashboard": "https://…", "suiteHash": "…",
+  "error": null,
+  "counts": { "runs": 2, "passed": 1, "failed": 1, "errored": 0, "notPlayed": 0 },
+  "costUsd": { "agent": 0.0123, "test": 0.0456 },
   "runs": [
-    { "scenario": "latte-correction", "channel": "whatsapp", "run": 1, "verdict": "failed",
-      "failedChecks": [{ "kind": "judge", "text": "The agent asks Sam to confirm before placing the order." }] }
+    { "runId": "trn_…", "scenario": "latte-correction", "channel": "whatsapp", "run": 1, "verdict": "failed",
+      "error": null, "ended": "goal_met", "turns": 6, "watch": "https://…",
+      "failedChecks": [{ "kind": "judge", "text": "The agent asks Sam to confirm before placing the order.", "reason": "…" }] }
   ]
 }
 ```
 
-`ended` is `finished`, `stopped` (the session broke off or the cloud stopped it) or `interrupted`. `only` is the scenarios the session was limited to, `null` for the whole suite. `verdict` is `passed`, `failed`, `errored` (the cloud could not play or judge the run) or `not_played` (the session ended first).
+`outcome` is `passed` (exit 0), `failed` or `invalid` (1), `errored` or `transport` (2), `refused` (3) or `interrupted` (130). A run's `verdict` is `errored` whenever the cloud names an `error` for it (such as `judge_failed`, `simulator_failed` or `spend_cap`), whatever it `ended` as: the cloud could not play or judge it, so it says nothing about the agent. Its line reads `ERROR` instead of `PASS` or `FAIL`, and the run's `error` is that code (else `null`). `error` is `{ "message", "status", "type", "retryAfterSeconds" }` when the session did not finish (`type` is the cloud's code, such as `spend_cap`; the others are `null` when it did not say).
+
+`--only latte-correction,order-fails` runs only those scenarios (file names without `.yaml`); every tool file still goes. Once the session has opened, every exit (0, 1, 2, 3 or 130) writes `.chinwag/last-session.json` in the agent's folder and prints its path; `chinwag new` git-ignores `.chinwag/`. It holds what each run ended as and the judge's reasons, never the messages (a reason can quote one, which is why the file stays on your machine; the suite is synthetic by `--synthetic`):
+
+```json
+{
+  "sessionId": "…", "agent": "agt_…", "dashboard": "https://…", "suiteHash": "…", "endedAt": "2026-10-16T09:12:03.000Z",
+  "ended": "finished",
+  "only": null,
+  "runs": [
+    { "scenario": "latte-correction", "channel": "whatsapp", "run": 1, "runId": "trn_…", "verdict": "failed",
+      "failedChecks": [{ "kind": "judge", "text": "The agent asks Sam to confirm before placing the order.", "reason": "…" }] }
+  ]
+}
+```
+
+`ended` is `finished`, `stopped` (the session broke off or the cloud stopped it) or `interrupted`. `agent` is the cloud's id for the agent (a hosted cloud names it), which `chinwag show` reads. `only` is the scenarios the session was limited to, `null` for the whole suite. `verdict` is `passed`, `failed`, `errored` (the cloud could not play or judge the run) or `not_played` (the session ended first; its `runId` is `null`).
+
+`chinwag show <run-id>` prints one run's record from the cloud, read with `CHINWAG_CLOUD_KEY`: the verdict, every check with the judge's reason, then the conversation in time order with each tool call the simulator played (its input, output and what it changed). `chinwag show last` picks the first run in `.chinwag/last-session.json` that did not pass (its first run when all passed) and names the others. `--json` prints the record exactly as the cloud answered it. It exits 0 when it printed; 1 for a wrong flag, no key or last session, no such run (404) or one past the 30 days runs are kept (410); 2 when the cloud did not answer or answered 5xx; 3 when it refused the key (401, 403) or is busy (429).
 
 `--failed` runs again only the scenarios that did not pass in that file (failed, errored or not played), on every channel each plays: a scenario's channels are part of its file, so one channel cannot be picked alone. It goes with `--runs`; with `--only` it stops and says to pick one, since the two would each pick the scenarios. With nothing to run again it prints `Nothing failed in the last session (<id>).` and exits 0 (and says when that session ran only some scenarios); with no file it says to run `chinwag test` first and exits 1. The loop, for you or a coding agent:
 
 ```bash
 npx chinwag test --synthetic            # the whole suite
 # fix what failed
+npx chinwag show last                   # why: the judge's reasons, the conversation and the tool calls
 npx chinwag test --synthetic --failed   # only what did not pass; again until it exits 0
 npx chinwag test --synthetic            # the whole suite once more before you finish
 ```

@@ -33,8 +33,25 @@ test("a run is printed once when it finishes, and not again with the summary", (
   assert.equal(passes.length, 1);
 });
 
+test("a run's line names its id, for chinwag show", () => {
+  const lines: string[] = [];
+  runPrinter((line) => lines.push(line))(run({ passed: false, runId: "trn_ABC", turns: 6 }));
+  assert.match(lines[0], /^FAIL {2}s #1 \(sms\) trn_ABC: 6 turns, ended: goal_met;/);
+});
+
 test("a retry is named on the line", () => {
   const lines: string[] = [];
   runPrinter((line) => lines.push(line))(run({ retried: true }));
   assert.match(lines[0], /tried once more/);
+});
+
+test("a run the cloud names an error for prints ERROR with its code, even when it ended goal_met, and not its checks", () => {
+  const lines: string[] = [];
+  const checks = [{ kind: "judge", text: "Asks to confirm.", pass: false, reason: "not judged" }] as RunSummary["checks"];
+  runPrinter((line) => lines.push(line))(run({ passed: false, ended: "goal_met", error: "judge_failed", checks }));
+  assert.match(lines[0], /^ERROR {2}s #1 \(sms\) run_1: 1 turn, ended: goal_met; error: judge_failed \(the cloud could not play or judge this run, not the agent's fault\);/);
+  assert.equal(lines.some((line) => line.includes("not judged")), false);
+  const failed: string[] = [];
+  runPrinter((line) => failed.push(line))(run({ passed: false, ended: "run_failed" }));
+  assert.match(failed[0], /^ERROR .*error: run_failed/);
 });
