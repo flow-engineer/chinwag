@@ -25,19 +25,19 @@ Node 22.18 or later. Your agent is TypeScript that Node runs as it is, with no b
 
 ```bash
 npx chinwag new my-agent && cd my-agent && npm install
-cp .env.example .env        # then put your OpenRouter key in it: OPENROUTER_API_KEY=sk-or-...
+cp .env.example .env        # then put one model key in it; the file says where to make one
 npm start
 ```
 
-`chinwag new <name>` makes `./<name>/` from the café example (lowercase letters, digits and dashes). Open the link `npm start` prints and text Pip, a café ordering assistant: your starting point. Pick a platform at the top (SMS, WhatsApp, iMessage, Telegram, web), and turn on **Debug** to see every tool call and how fast each message was answered. The new folder has the coding-agent skills in `.claude/skills/` and an `AGENTS.md` pointing at them, so you can tell Claude Code, Codex or any coding agent what to build.
+`chinwag new <name>` makes `./<name>/` from the café example (lowercase letters, digits and dashes). Open the link `npm start` prints and text Pip, a café ordering assistant: your starting point. Pick a platform at the top (SMS, WhatsApp, iMessage, Telegram, web), and turn on **Debug** to see every tool call and how fast each message was answered. A model call that fails (a wrong or expired key, say) shows in the chat, in Debug and on the terminal. The café's `src/agent.ts` reads its model id from `CAFE_MODEL` (default: the model for the key you set, see [Models](#models)). The new folder has the coding-agent skills in `.claude/skills/` and an `AGENTS.md` pointing at them, so you can tell Claude Code, Codex or any coding agent what to build.
 
 ### In a folder of your own
 
 ```bash
-npm i chinwag
+npm init -y && npm pkg set type=module && npm i chinwag
 ```
 
-`src/main.ts` (with `"type": "module"` in your `package.json`):
+`src/main.ts`:
 
 ```ts
 import { createAgent, openAICompatible, sms, whatsapp } from "chinwag";
@@ -139,7 +139,7 @@ const play = simulators({ title: "My agent" });
 await play.listen(buildAgent({ events: [play.events] }), 8788);
 ```
 
-The playground plays only the test people you declare (`testPeople: [{ name, phone }]`) on the agent's own channels. A test person is a real person to the agent: the same identity, `resolve` and history as if they wrote from their phone, one conversation on every channel, and "Clear history" to start again. Replies go back where the person last wrote from, the playground or the real channel. `simulators({ actions: [{ label, run }] })` adds a Backend panel: each button runs your function on the server (an order ships, a price drops) and its result shows in the trace, so a demo shows the agent reacting to your backend. On a deployed agent, mount `play.handler(agent, { token })`: it refuses requests without the token (at least 32 characters), swaps `?token=` for a cookie on the playground's path, and limits wrong tries.
+The playground plays only the test people you declare (`testPeople: [{ name, phone }]`) on the agent's own channels. A test person is a real person to the agent: the same identity, `resolve` and history as if they wrote from their phone, one conversation on every channel, and "Clear history" to start again. Replies go back where the person last wrote from, the playground or the real channel. `simulators({ actions: [{ label, run }] })` adds a Backend panel: each button runs your function on the server (an order ships, a price drops) and its result shows in the trace, so a demo shows the agent reacting to your backend. Locally it answers only on localhost, and its API only its own page, so a site you visit cannot send it messages. On a deployed agent, mount `play.handler(agent, { token })`: it refuses requests without the token (at least 32 characters), swaps `?token=` for a cookie on the playground's path, and limits wrong tries.
 
 `AGENTS.md` says what the agent is for and what it may and may not do. Leave messaging out of it: Chinwag adds how to talk on each channel (its send tool, reactions, formatting, acknowledging first). A skill's `SKILL.md` starts with a `name` and `description`; the agent sees every description and loads a skill when it needs it (`inlineSkills: true` puts them all in the prompt instead).
 
@@ -195,8 +195,13 @@ await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt
 - Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). Postgres: `postgres(pool)` over your own node-postgres pool. Any other engine: implement the three-method `Database` interface, or pass a whole `store` of your own.
 - After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun.
 - `agent.status()` says whether anything is running and for how long it has been idle, so your platform can stop idle agents and start them on the next message.
-- Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file.
-- Traces: with `CHINWAG_TRACES_KEY` and `CHINWAG_TRACES_URL` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces` (`CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only).
+- Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file. An `EventSink` is a function that gets each event (`{ type, conversationId, at, ... }`) and must not throw:
+
+  ```ts
+  const log: EventSink = (event) => console.log(event.type, event.conversationId);
+  createAgent({ /* ... */ events: [log] });
+  ```
+- Traces: with `CHINWAG_TRACES_KEY` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces`, where the URL is `CHINWAG_TRACES_URL`, else https://flow.engineer/observe (the trace key is made there). `CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only.
 
 ## Testing
 
@@ -223,20 +228,34 @@ expect:
 `tests/tools/*.yaml` describe how each tool behaves (normal, slow, each error). Run the suite from the agent's folder:
 
 ```bash
-npx chinwag test --cloud <test cloud URL> --runs 3 --only latte-correction
+npx chinwag test --cloud https://flow.engineer/observe --synthetic --runs 3 --only latte-correction
 ```
 
-A hosted test cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic` (your attestation that the test files hold no real customer data). Your agent stays on your machine with its own model and key; the test cloud plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation.
+Your agent stays on your machine with its own model and key; the test cloud ([get one](#get-a-test-cloud)) plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation. Before anything is sent it reads every test file as the cloud does, and a mistake stops it with the file and line (`tests/scenarios/latte-correction.yaml:3: person.goal: missing`).
 
 The command exits 0 when every run passed, and 1 when the session finished and a run failed. A refusal from the cloud (a bad CI key, an invalid suite, the spend cap) or a failure before the session opens exits 1 and prints only that message. If the tunnel, the stream, or the connection fails after the session has opened, it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report, says the cloud keeps playing until it is stopped from the dashboard, and exits 130.
 
+### Get a test cloud
+
+1. Sign in at https://flow.engineer/observe (Google, GitHub or an email link).
+2. Workspace → New agent.
+3. On the agent's Developers page, "Make a CI key". It starts with `oci_` and is shown once.
+4. Put it in the agent's `.env` as `CHINWAG_CLOUD_KEY` (never on the command line).
+5. `npx chinwag test --cloud https://flow.engineer/observe --synthetic` from the agent's folder (`--cloud` is that address by default).
+
+Your agent runs on your machine with your own model key. The cloud's person simulator, tool simulator and judge are free up to $5 a day per workspace, with 2 sessions at once; test data only (`--synthetic`), and records are deleted after 30 days.
+
+`--cloud` (or `CHINWAG_CLOUD`) points at another test cloud. A hosted cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic`, your attestation that the test files hold no real customer data; without the key the command stops and says where to make one.
+
 ### Test an agent you already have
 
-An agent built on any framework is tested through an HTTP endpoint, with no rewrite. From a folder with `tests/scenarios/*.yaml`:
+An agent built on any framework is tested through an HTTP endpoint, with no rewrite. It needs a test cloud like any run (see [Get a test cloud](#get-a-test-cloud)): `CHINWAG_CLOUD_KEY` and `--synthetic` for the hosted one, the default, or `--cloud` for another. From a folder with `tests/scenarios/*.yaml`, with your agent running:
 
 ```bash
-npx chinwag test --agent-url http://localhost:3000/chinwag
+npx chinwag test --agent-url http://localhost:3000/chinwag --cloud https://flow.engineer/observe --synthetic
 ```
+
+Before the session opens, the command sends one `HEAD` request to the URL (never a message), and stops with "Could not reach your agent at <url>" if nothing answers; any HTTP status counts as an answer.
 
 `chinwag test` runs on your machine and POSTs each of the person's messages to that URL from there, so your agent never has to be reachable from the internet (`http://localhost` is fine). The request is JSON, with `authorization: Bearer <CHINWAG_AGENT_TOKEN>` when that variable is set:
 
@@ -255,7 +274,7 @@ Keep the conversation's history by `conversationId`, as you would per phone numb
 { "replies": [{ "type": "message", "text": "We're open 8am to 6pm today.", "buttons": ["Order ahead"] }] }
 ```
 
-A minimal server, with no dependencies (the whole file is [`examples/http-agent/server.mjs`](examples/http-agent/server.mjs)):
+A minimal server, with no dependencies (the whole file is [`examples/http-agent/server.mjs`](https://github.com/flow-engineer/chinwag/blob/main/examples/http-agent/server.mjs), with a test scenario beside it; it also ships in the package, in `node_modules/chinwag/examples/http-agent`):
 
 ```js
 import { createServer } from "node:http";
@@ -290,7 +309,7 @@ The café's agent as an HTTP endpoint, with its two tools and one model through 
 
 ## Models
 
-Any OpenAI-compatible API. `openAICompatible` defaults to OpenRouter and reads `OPENROUTER_API_KEY`; pass `baseURL` and `apiKey` for OpenAI, Gemini, Anthropic or a local server.
+Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`.
 
 For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku-5.5`) or **GPT-6.1 Sol** (`openai/gpt-6.1-sol`, about 3x the cost). In our tests, GPT Luna repeated tool calls and answered twice.
 

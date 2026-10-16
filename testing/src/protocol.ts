@@ -6,7 +6,10 @@
 //   GET  /api/sessions/:id/stream      server-sent Commands     the person's side, cloud → agent
 //   POST /api/sessions/:id/outbound    { conversationId, outbound } → { ok } | 409 { error }
 //   POST /api/sessions/:id/tool-calls  ToolCallRequest → ToolCallResult   held open while the tool is simulated
-//   POST /api/sessions/:id/events      { events: ChinwagEvent[] }
+//   POST /api/sessions/:id/events      { seq, events: ChinwagEvent[] }
+//
+// Every POST after the open sends Idempotency-Key. An older cloud ignores it. When Opened
+// says idempotency, a repeat of a key is the stored answer and the client may send it again.
 //   POST /api/sessions/:id/receipts    Receipt → { ok }
 //   POST /api/sessions/:id/drained     {} → { ok }   flush before the terminal command
 //
@@ -39,6 +42,8 @@ export interface OpenSession {
   runs: number;
   /** Acknowledge each message independently of the serial event uploads. */
   deliveryReceipts?: boolean;
+  /** The client will retry a call when this cloud stores the result under Idempotency-Key. */
+  retries?: boolean;
 }
 
 export interface Receipt {
@@ -57,6 +62,8 @@ export interface Opened {
   /** The tunnel's absolute URL, where every later call goes (a hosted cloud's front door serves
    * only the open). Absent or empty: the open's own address (a local cloud). */
   tunnel?: string;
+  /** This cloud stores each Idempotency-Key with its result. Absent on an older cloud. */
+  idempotency?: boolean;
 }
 
 export interface UploadFile {

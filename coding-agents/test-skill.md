@@ -83,30 +83,37 @@ written in scenarios: the dashboard shows it for the whole run (average, p95, mi
 Tests run in the Chinwag cloud: your agent stays on your machine with its own model and key and
 connects out to the cloud, which plays the person and the tools and judges.
 
-1. Have a test cloud to point at (one running on this machine answers at http://127.0.0.1:8900,
-   the default).
+1. Have a test cloud: the hosted one at https://flow.engineer/observe, the default (see "Get a test
+   cloud" below), or another with `--cloud <url>` or `CHINWAG_CLOUD`.
 2. From the agent's folder (it must export `buildAgent` and `tools` from `src/agent.ts`), which reads
-   the agent's `.env` itself: `npx chinwag test --cloud <url> [--runs 3]` (`npm test` in an agent
-   `chinwag new` made).
-3. It prints PASS or FAIL per run with every failed check and the judge's reason, and a link
+   the agent's `.env` itself: `npx chinwag test --synthetic [--runs 3]` (`npm test -- --synthetic`
+   in an agent `chinwag new` made).
+3. It first reads every test file as the cloud does; a mistake stops it with
+   `tests/scenarios/<file>.yaml:<line>: <field>: <what is wrong>`, one line each, and nothing is sent.
+   Then it prints PASS or FAIL per run with every failed check and the judge's reason, and a link
    to watch each conversation in the simulator. The cloud's dashboard, at its own address, shows
    every session over time and each scenario's history.
 
-To run them in the hosted cloud instead, point `--cloud` at its front door, put the agent's CI
-key in `CHINWAG_CLOUD_KEY` (never on the command line) and pass `--synthetic`, your promise that the
-test files hold no real customer or member data (the CLI refuses a hosted cloud without both):
+### Get a test cloud
 
-```sh
-CHINWAG_CLOUD_KEY=... npx chinwag test \
-  --cloud <your test cloud's URL> --synthetic [--environment staging]
-```
+The owner does these; never ask for the key in chat or print it:
+
+1. Sign in at https://flow.engineer/observe (Google, GitHub or an email link).
+2. Workspace → New agent.
+3. On the agent's Developers page, "Make a CI key". It starts with `oci_` and is shown once.
+4. Put it in the agent's `.env` as `CHINWAG_CLOUD_KEY` (never on the command line).
+5. `npx chinwag test --cloud https://flow.engineer/observe --synthetic` from the agent's folder (`--cloud` is that address by default).
+
+Your agent runs on your machine with your own model key. The cloud's person simulator, tool simulator and judge are free up to $5 a day per workspace, with 2 sessions at once; test data only (`--synthetic`), and records are deleted after 30 days. `--synthetic` is the promise that the test files hold no real customer or member data;
+the CLI refuses a hosted cloud without it and the key. `--environment staging` or `production` is
+kept with the session.
 
 The open goes to the front door with the key; the session then plays at the tunnel the cloud
 answers, with the session's own token. `--agent-version` (else `GITHUB_SHA`) and `--ref` (else
 GitHub's branch) are kept with the session. A CI step (GitHub Actions shown):
 
 ```yaml
-- run: npx chinwag test --cloud <your test cloud's URL> --synthetic --environment staging
+- run: npx chinwag test --cloud https://flow.engineer/observe --synthetic --environment staging
   env:
     CHINWAG_CLOUD_KEY: ${{ secrets.CHINWAG_CLOUD_KEY }}
     OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

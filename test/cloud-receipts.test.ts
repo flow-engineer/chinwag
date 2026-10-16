@@ -310,7 +310,7 @@ test("an outbound the tunnel keeps refusing does not discard the rest of the ses
     ok(res);
   });
   try {
-    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: () => {}, build: () => ({
+    const running = runInCloud({ cloud: cloud.cloud, name: "test", tools: [], files: [], log: () => {}, retryBudgetMs: 900, build: () => ({
       channels: () => [], reacted: () => {}, receive: (_id, _incoming, deliver) => {
         void deliver({ type: "message", text: "reply" });
         return null;

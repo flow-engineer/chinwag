@@ -1,12 +1,12 @@
 // covers: simulators/src/server.ts simulators/src/platforms.ts src/agent.ts src/conversation.ts src/channels.ts
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { createServer } from "node:http";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { sqlite, type ChannelInfo, type ChannelSummary, type Deliver, type Incoming, type TemplateDefinition } from "../../src/index.ts";
-import { WHATSAPP, call, multi, respond } from "../../test/helpers.ts";
+import { createAgent, sqlite, type ChannelInfo, type ChannelSummary, type Deliver, type Incoming, type Model, type TemplateDefinition } from "../../src/index.ts";
+import { WHATSAPP, call, gate, multi, respond } from "../../test/helpers.ts";
 import { simulators, type AgentConnection, type Line } from "../src/index.ts";
 
 /** An agent that answers nothing by itself: the test delivers through the last `deliver` it got. */
@@ -132,7 +132,7 @@ function agentOn(database: ReturnType<typeof sqlite>, dir?: string) {
   return multi({ channels: { whatsapp: { info: WHATSAPP, phone: true } }, testPeople: [SAM], database, dir });
 }
 
-test("a deployed playground lets in only its token, then only the agent's test people", async () => {
+test("a deployed playground lets in only its token, from its own pages, then only the agent's test people", async () => {
   const h = agentOn(sqlite());
   const play = simulators();
   assert.throws(() => play.handler(h.agent, { token: undefined as unknown as string }), /token/);
@@ -154,6 +154,10 @@ test("a deployed playground lets in only its token, then only the agent's test p
     assert.doesNotMatch(cookie, new RegExp(token), "the cookie does not hold the token");
     assert.equal((await fetch(`${url}/`, { headers: { cookie: cookie.split(";")[0] } })).status, 200);
     assert.equal((await fetch(`${url}/api/platforms`, { headers: { authorization: `Bearer ${token}` } })).status, 200);
+    const deployed = { host: "agent.example.com", authorization: `Bearer ${token}` };
+    assert.equal((await raw(`${url}/api/platforms`, { headers: { ...deployed, "sec-fetch-site": "same-origin" } })).status, 200, "deployed, the Host is the agent's own");
+    const crossSite = await raw(`${url}/api/messages`, { method: "POST", headers: { ...deployed, "sec-fetch-site": "cross-site", "content-type": "application/json" }, body: JSON.stringify({ channel: "whatsapp", person: SAM.phone, text: "hi" }) });
+    assert.equal(crossSite.status, 403);
 
     const stranger = await fetch(`${url}/api/messages`, {
       method: "POST",
@@ -214,6 +218,48 @@ test("the playground shows the person's conversation from the agent's store, als
     assert.deepEqual(said, [["in", "a latte please", undefined], ["out", "Which size?", ["Small", "Large"]], ["out", "Our menu\nhttps://example.com/menu", undefined]]);
   } finally {
     await restarted.close();
+  }
+});
+
+/** One request with headers fetch would not let a test set (Host), → status and body. */
+function raw(url: string, options: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { method: options.method ?? "GET", headers: options.headers }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => resolve({ status: res.statusCode!, body }));
+    });
+    req.on("error", reject);
+    req.end(options.body);
+  });
+}
+
+test("the local playground runs turns only for its own page: another site and a rebound DNS name are refused", async () => {
+  const h = agentOn(sqlite());
+  await h.agent.resume();
+  const server = await simulators().listen(h.agent, 0);
+  const own = new URL(server.url).host;
+  const where = `channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`;
+  const message = JSON.stringify({ channel: "whatsapp", person: SAM.phone, text: "a latte please" });
+  const post = (headers: Record<string, string>) => raw(`${server.url}/api/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: message });
+  try {
+    assert.equal((await post({ "sec-fetch-site": "cross-site", origin: "https://evil.example" })).status, 403);
+    assert.equal((await post({ "sec-fetch-site": "same-site", origin: "http://localhost:3000" })).status, 403, "another port on this machine is another origin");
+    assert.equal((await post({ origin: "https://evil.example" })).status, 403, "an older browser: the Origin alone");
+    assert.equal((await raw(`${server.url}/api/poll?${where}&after=0`, { headers: { "sec-fetch-site": "cross-site" } })).status, 403, "nor can it read the conversation");
+    assert.equal((await post({ host: `evil.example:${new URL(server.url).port}`, "sec-fetch-site": "same-origin" })).status, 403, "a DNS name rebound to 127.0.0.1");
+    assert.equal((await raw(`${server.url}/`, { headers: { host: "evil.example" } })).status, 403);
+    assert.equal(h.calls.length, 0);
+
+    const { seq } = JSON.parse((await raw(`${server.url}/api/transcript?${where}`, { headers: { "sec-fetch-site": "same-origin" } })).body);
+    assert.equal((await post({ "sec-fetch-site": "same-origin", origin: server.url })).status, 202);
+    (await h.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Which size?" })));
+    await h.agent.conversation((await h.agent.testConversation(SAM.phone))!)!.whenIdle();
+    const polled = await raw(`${server.url}/api/poll?${where}&after=${seq}`, { headers: { host: own.replace("127.0.0.1", "localhost"), "sec-fetch-site": "same-origin" } });
+    assert.equal(polled.status, 200, "the polling fallback, also on localhost");
+    assert.ok((JSON.parse(polled.body).events as Array<{ line?: Line }>).some((e) => e.line?.kind === "out" && e.line.text === "Which size?"));
+  } finally {
+    await server.close();
   }
 });
 
@@ -332,5 +378,36 @@ test("the playground's Backend buttons run on the server behind its token, and t
     ]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("a turn's model error is printed on the terminal and reaches the playground's trace with its text", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
+  writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
+  const play = simulators();
+  // The model fails only once the message is taken, so the playground knows whose conversation it is.
+  const asked = gate();
+  const model: Model = { complete: async () => { await asked.promise; throw new Error("401 Incorrect API key"); } };
+  const channels = [{ name: "whatsapp", kind: "custom" as const, info: WHATSAPP, phone: true, send: () => {} }];
+  const agent = createAgent({ dir, model, debounceMs: 0, events: [play.events], channels, database: sqlite(), testPeople: [SAM], scheduleCheckMs: 0 });
+  await agent.resume();
+  const printed = gate<string>();
+  const error = console.error;
+  console.error = (...args: unknown[]) => { if (String(args[0]).includes("model error")) printed.open(args.map(String).join(" ")); };
+  const server = await play.listen(agent, 0);
+  const where = `channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`;
+  try {
+    const { seq } = await (await fetch(`${server.url}/api/transcript?${where}`)).json();
+    const sent = await fetch(`${server.url}/api/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "whatsapp", person: SAM.phone, text: "hi" }) });
+    assert.equal(sent.status, 202);
+    asked.open();
+    assert.equal(await printed.promise, "chinwag: model error (Sam): Error: 401 Incorrect API key");
+    await agent.conversation((await agent.testConversation(SAM.phone))!)!.whenIdle();
+    const polled = (await (await fetch(`${server.url}/api/poll?${where}&after=${seq}`)).json()) as { events: Array<{ type: string; event?: { type: string; error?: string } }> };
+    const traced = polled.events.flatMap((e) => (e.type === "trace" && e.event?.type === "model.error" ? [e.event.error] : []));
+    assert.deepEqual(traced, ["Error: 401 Incorrect API key"]);
+  } finally {
+    console.error = error;
+    await server.close();
   }
 });
