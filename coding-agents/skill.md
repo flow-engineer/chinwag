@@ -180,6 +180,14 @@ as written; `prompt` instead lets the agent write it (or decide not to); `templa
 WhatsApp template you already set up. Pass `idempotencyKey` when your system may retry, and `at`
 to send later. Outside WhatsApp's 24-hour window only templates go out (`outside_window`).
 
+When the owner's backend is a separate service, mount `nudgeHandler(agent, { token })` (from
+`chinwag`; a token of at least 32 characters, from a secret; `base` is `/nudges` by default) in the
+agent's server rather than writing a route: `POST /nudges` takes the same fields with
+`idempotency_key` and `at` in ms since the epoch, and answers `202 { id, status }` once recorded,
+before any send or turn (`queued`, or `refused`/`dropped`/`scheduled` decided then: still a 202);
+`GET /nudges/<id>` reads its state. Both need `Authorization: Bearer <token>`. Contract:
+`spec/nudges.openapi.yaml`.
+
 Templates are WhatsApp only. Declare the ones the owner set up with Meta beside `testPeople`, so
 Chinwag checks each send against them and the playground shows them as WhatsApp does:
 
