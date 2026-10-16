@@ -1,7 +1,7 @@
-// `chinwag show <run-id|last>`: one run's full record from the test cloud (the transcript, the tool
+// `chinwag show <run-id|watch-link|last>`: one run's full record from the test cloud (the transcript, the tool
 // calls the simulator played, every check with the judge's reason), so a coding agent can read why a
-// run failed without a browser. The agent's id comes from .chinwag/last-session.json, and the read
-// carries the agent's CI key: GET {cloud}/v1/agents/{agent}/tests/runs/{run}.
+// run failed without a browser. The agent's id comes from .chinwag/last-session.json (or the run's
+// watch link), and the read carries the agent's CI key: GET {cloud}/v1/agents/{agent}/tests/runs/{run}.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -38,15 +38,15 @@ export interface LastSession {
   }>;
 }
 
-export const SHOW_LINE = `  chinwag show <run-id|last> [--json]
+export const SHOW_LINE = `  chinwag show <run-id|watch-link|last> [--json]
                             Print one run's record from the test cloud: its checks with the
                             judge's reasons, the transcript and the tool calls (chinwag show --help)`;
 
 const SHOW_USAGE = `Usage:
-  chinwag show <run-id|last> [options]
+  chinwag show <run-id|watch-link|last> [options]
 
 Prints one run of the last \`chinwag test\` (or any run of this agent, by the id on its PASS or
-FAIL line): verdict, every check with the judge's reason, then the conversation in time order with
+FAIL line, or by its watch link, which needs no last session): verdict, every check with the judge's reason, then the conversation in time order with
 each tool call the simulator played and what it changed. \`last\` is the first run that did not
 pass in .chinwag/last-session.json (its first run when all passed).
 
@@ -56,8 +56,8 @@ Options:
   --dotenv <path>          Read the environment from this file instead of the folder's .env
   -h, --help               Show this help
 
-Needs CHINWAG_CLOUD_KEY (the agent's CI key, also read from .env), and the agent's id that
-\`chinwag test\` keeps in .chinwag/last-session.json.
+Needs CHINWAG_CLOUD_KEY (the agent's CI key, also read from .env), and, unless given a watch link
+on that cloud, the agent's id that \`chinwag test\` keeps in .chinwag/last-session.json.
 
 Exit status:
   0    Printed
@@ -121,30 +121,44 @@ export async function showCli(args: string[]): Promise<number> {
     console.error(`chinwag show reads the run with the agent's CI key: set CHINWAG_CLOUD_KEY.${cloud === OBSERVE_URL ? ` Make a key at ${OBSERVE_URL}: your agent, Developers.` : ""}`);
     return 1;
   }
-  const last = readLast();
-  if (typeof last === "string") {
-    console.error(last);
-    return 1;
-  }
   let runId = positionals[0]!;
-  if (runId === "last") {
-    const pickedRun = pickLast(last);
-    if (!pickedRun) {
-      console.error(`${LAST_SESSION} has no run ids: run chinwag test again, then chinwag show last.`);
+  let agent: string;
+  const link = /^(https?:\/\/.+)\/agents\/([A-Za-z0-9_-]{1,100})\/tests\/runs\/([A-Za-z0-9_-]{1,100})\/?$/.exec(runId);
+  if (link) {
+    // A run's watch link names its agent, so it needs no last session (CI, a teammate's link). The
+    // key goes only to the configured cloud, never to a host a pasted link names.
+    if (link[1] !== cloud) {
+      console.error(`That link is not on ${cloud}, the cloud chinwag show reads with your key: pass --cloud ${link[1]} if it is yours.`);
       return 1;
     }
-    runId = pickedRun;
+    agent = link[2]!;
+    runId = link[3]!;
+  } else {
+    const last = readLast();
+    if (typeof last === "string") {
+      console.error(last);
+      return 1;
+    }
+    if (runId === "last") {
+      const pickedRun = pickLast(last);
+      if (!pickedRun) {
+        console.error(`${LAST_SESSION} has no run ids: run chinwag test again, then chinwag show last.`);
+        return 1;
+      }
+      runId = pickedRun;
+    }
+    agent = last.agent!;
   }
   const id = /^[A-Za-z0-9_-]{1,100}$/;
   if (!id.test(runId)) {
-    console.error(`"${runId}" is not a run id: use the id on a run's PASS or FAIL line (trn_...), or last.`);
+    console.error(`"${runId}" is not a run id: use the id on a run's PASS or FAIL line (trn_...), its watch link, or last.`);
     return 1;
   }
-  if (!id.test(last.agent!)) {
+  if (!id.test(agent)) {
     console.error(`${LAST_SESSION} names an agent id that is not one: run chinwag test again.`);
     return 1;
   }
-  const url = `${cloud}/v1/agents/${last.agent}/tests/runs/${runId}`;
+  const url = `${cloud}/v1/agents/${agent}/tests/runs/${runId}`;
   let status: number;
   let text: string;
   try {

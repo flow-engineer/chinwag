@@ -160,7 +160,7 @@ Work in this loop, and never finish on a partial run:
 1. `npx chinwag test --synthetic --json > report.json`, and read the runs whose `verdict` is not
    `passed` (`jq '.runs[] | select(.verdict != "passed")' report.json`).
 2. `npx chinwag show last` (the first run that did not pass; it names the others) or
-   `npx chinwag show <runId>`: the checks with the judge's reasons, then the conversation in time
+   `npx chinwag show <runId>` (or the run's watch link, which needs no last session): the checks with the judge's reasons, then the conversation in time
    order with every tool call the simulator played, its input, output and what it changed.
    `--json` gives the whole record.
 3. Decide which is wrong, and say which:
