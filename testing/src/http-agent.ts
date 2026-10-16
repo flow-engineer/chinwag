@@ -51,10 +51,56 @@ const otherReply = z.discriminatedUnion("type", [
   z.object({ type: z.literal("typing"), on: z.boolean() }),
 ]);
 
-class TurnError extends Error {}
+export class TurnError extends Error {}
 
 const problems = (error: z.ZodError) =>
   error.issues.map((i) => (i.code === "unrecognized_keys" ? `${i.keys.join(", ")}: not something this platform shows` : (i.path.length ? `${i.path.join(".")}: ` : "") + i.message)).join("; ");
+
+/** POSTs one message and returns its replies, unchecked; throws a TurnError saying why when the answer fails the turn. */
+export async function postMessage(options: Pick<HttpAgentOptions, "url" | "token">, timeoutMs: number, body: HttpAgentRequest): Promise<unknown[]> {
+  let response: Response;
+  let text: string;
+  try {
+    response = await fetch(options.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(options.token ? { authorization: `Bearer ${options.token}` } : {}) },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    text = await response.text();
+  } catch (error) {
+    const e = error as Error & { cause?: { code?: string; message?: string } };
+    if (e.name === "TimeoutError") throw new TurnError(`no answer from ${options.url} within ${timeoutMs / 1000} s`);
+    throw new TurnError(`could not reach ${options.url}: ${e.cause?.code ?? e.cause?.message ?? e.message}`);
+  }
+  if (response.status !== 200) throw new TurnError(`${options.url} answered ${response.status}${text.trim() ? `: ${text.trim().slice(0, 200)}` : ""}`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new TurnError(`${options.url} answered 200 with a body that is not JSON: ${text.slice(0, 200)}`);
+  }
+  const answer = answerSchema.safeParse(parsed);
+  if (!answer.success) throw new TurnError(`${options.url} answered 200 without { "replies": [...] }: ${text.slice(0, 200)}`);
+  return answer.data.replies;
+}
+
+/** The reply as the platform takes it, or why it cannot go: the checks a Chinwag agent's send gets. */
+export function checkReply(reply: unknown, info: ChannelInfo): { outbound: Outbound } | { refused: string } {
+  const type = (reply as { type?: unknown } | null)?.type;
+  if (type !== "message") {
+    const other = otherReply.safeParse(reply);
+    return other.success ? { outbound: other.data as Outbound } : { refused: problems(other.error) };
+  }
+  const { type: _, replyTo, fields, ...rest } = reply as Extract<Outbound, { type: "message" }>;
+  const input = { ...rest, ...(replyTo !== undefined ? { reply_to: replyTo } : {}) };
+  const sent = sendInput(info).strict().safeParse(input);
+  if (!sent.success) return { refused: problems(sent.error).replaceAll("reply_to", "replyTo") };
+  if (fields !== undefined && (typeof fields !== "object" || fields === null || Array.isArray(fields))) return { refused: "fields: must be an object" };
+  const refusal = sendRefusal(info, input as Parameters<typeof sendRefusal>[1]);
+  if (refusal) return { refused: refusal };
+  return { outbound: fitMessage(info, { type: "message" as const, ...rest, ...(replyTo !== undefined ? { replyTo } : {}), ...(fields ? { fields } : {}) }) };
+}
 
 export function httpAgent(options: HttpAgentOptions) {
   const emit = emitter(options.events ?? []);
@@ -63,50 +109,6 @@ export function httpAgent(options: HttpAgentOptions) {
   /** Each conversation's last message, so the next one waits for its answer. */
   const queues = new Map<string, Promise<void>>();
 
-  async function post(body: HttpAgentRequest): Promise<unknown[]> {
-    let response: Response;
-    let text: string;
-    try {
-      response = await fetch(options.url, {
-        method: "POST",
-        headers: { "content-type": "application/json", ...(options.token ? { authorization: `Bearer ${options.token}` } : {}) },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      text = await response.text();
-    } catch (error) {
-      const e = error as Error & { cause?: { code?: string; message?: string } };
-      if (e.name === "TimeoutError") throw new TurnError(`no answer from ${options.url} within ${timeoutMs / 1000} s`);
-      throw new TurnError(`could not reach ${options.url}: ${e.cause?.code ?? e.cause?.message ?? e.message}`);
-    }
-    if (response.status !== 200) throw new TurnError(`${options.url} answered ${response.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new TurnError(`${options.url} answered 200 with a body that is not JSON: ${text.slice(0, 200)}`);
-    }
-    const answer = answerSchema.safeParse(parsed);
-    if (!answer.success) throw new TurnError(`${options.url} answered 200 without { "replies": [...] }: ${text.slice(0, 200)}`);
-    return answer.data.replies;
-  }
-
-  /** The reply as the platform takes it, or why it cannot go: the checks a Chinwag agent's send gets. */
-  function check(reply: unknown, info: ChannelInfo): { outbound: Outbound } | { refused: string } {
-    const type = (reply as { type?: unknown } | null)?.type;
-    if (type !== "message") {
-      const other = otherReply.safeParse(reply);
-      return other.success ? { outbound: other.data as Outbound } : { refused: problems(other.error) };
-    }
-    const { type: _, replyTo, fields, ...rest } = reply as Extract<Outbound, { type: "message" }>;
-    const input = { ...rest, ...(replyTo !== undefined ? { reply_to: replyTo } : {}) };
-    const sent = sendInput(info).strict().safeParse(input);
-    if (!sent.success) return { refused: problems(sent.error).replaceAll("reply_to", "replyTo") };
-    if (fields !== undefined && (typeof fields !== "object" || fields === null || Array.isArray(fields))) return { refused: "fields: must be an object" };
-    const refusal = sendRefusal(info, input as Parameters<typeof sendRefusal>[1]);
-    if (refusal) return { refused: refusal };
-    return { outbound: fitMessage(info, { type: "message" as const, ...rest, ...(replyTo !== undefined ? { replyTo } : {}), ...(fields ? { fields } : {}) }) };
-  }
 
   async function turn(conversationId: string, request: HttpAgentRequest, incoming: Incoming, info: ChannelInfo, deliver: Deliver): Promise<void> {
     const started = Date.now();
@@ -117,8 +119,8 @@ export function httpAgent(options: HttpAgentOptions) {
           incoming.attachments.map(async (a) => ({ kind: a.kind, mime: a.mime, ...(a.name ? { name: a.name } : {}), data: Buffer.from(await a.data()).toString("base64") })),
         );
       }
-      for (const reply of await post(request)) {
-        const checked = check(reply, info);
+      for (const reply of await postMessage(options, timeoutMs, request)) {
+        const checked = checkReply(reply, info);
         const text = (reply as { text?: unknown })?.text;
         const shown = typeof text === "string" ? text : `(${String((reply as { type?: unknown })?.type ?? "reply")})`;
         if ("refused" in checked) {

@@ -10,6 +10,7 @@
 // The agent's src/agent.ts exports buildAgent({ model, events, tools }) and its tools; its tests are
 // in tests/scenarios and tests/tools. An agent built on anything else is tested through its HTTP
 // endpoint instead, with --agent-url (testing/src/http-agent.ts): its own tools run for real.
+// `chinwag check-endpoint <url>` checks such an endpoint against spec/ first (testing/src/check-endpoint.ts).
 // Once a session has opened, its results go to .chinwag/last-session.json in the agent's folder
 // (what each run ended as, never what was said), and --failed runs again the scenarios that did not pass.
 
@@ -22,6 +23,7 @@ import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 import { OBSERVE_URL } from "../../src/traces.ts";
 import { cloudHeaders, runInCloud, SessionStopped, type ConnectOptions } from "./client.ts";
 import { runPrinter } from "./print-run.ts";
+import { checkEndpointCli } from "./check-endpoint.ts";
 import { httpAgent } from "./http-agent.ts";
 import { newStandalone, packageRoot } from "./new.ts";
 import { loadSuite, parseScenario, parseToolFile, suiteHash } from "./suite.ts";
@@ -31,6 +33,9 @@ const NEW_LINE = "  chinwag new <name>        Make ./<name>/, a new agent starte
 const TEST_LINE = `  chinwag test [options]    Run the agent's tests in a test cloud, from the agent's folder
                             (src/agent.ts exports buildAgent({ model, events, tools }) and tools;
                             the tests are in tests/scenarios and tests/tools)`;
+const CHECK_LINE = `  chinwag check-endpoint <url> [--token-env NAME] [--json]
+                            Check an agent's HTTP endpoint against the contract, for --agent-url
+                            (chinwag check-endpoint --help)`;
 const NEW_USAGE = `Usage:\n${NEW_LINE}\n\n  -h, --help                Show this help`;
 const TEST_OPTIONS = `Options for test:
   --cloud <url>            The test cloud (default: CHINWAG_CLOUD, else https://flow.engineer/observe)
@@ -73,13 +78,15 @@ Environment (also read from the agent folder's .env; variables already set win):
   OPENROUTER_API_KEY       The agent's model key, or OPENAI_API_KEY, ANTHROPIC_API_KEY or
                            GEMINI_API_KEY: the first with a value is used`;
 const TEST_USAGE = `Usage:\n${TEST_LINE}\n\n${TEST_OPTIONS}`;
-const USAGE = `Usage:\n${NEW_LINE}\n${TEST_LINE}\n  chinwag --version         Show the version\n\n${TEST_OPTIONS}`;
+const USAGE = `Usage:\n${NEW_LINE}\n${TEST_LINE}\n${CHECK_LINE}\n  chinwag --version         Show the version\n\n${TEST_OPTIONS}`;
 
 checkNode(process.versions.node);
 
 // The agent folder's .env (its model key, CHINWAG_CLOUD_KEY), when there is one; variables already
 // set win over the file, and no value is ever printed.
 if (process.argv[2] !== "new" && existsSync(".env")) process.loadEnvFile(".env");
+
+if (process.argv[2] === "check-endpoint") process.exit(await checkEndpointCli(process.argv.slice(3)));
 
 /** Where every session's results go, in the agent's folder; `chinwag new` git-ignores .chinwag/. */
 const LAST_SESSION = join(".chinwag", "last-session.json");

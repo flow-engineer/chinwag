@@ -1,14 +1,20 @@
-// covers: testing/src/http-agent.ts
+// covers: testing/src/http-agent.ts spec/request.schema.json spec/response.schema.json
 // An agent on another framework, tested by its HTTP endpoint (chinwag test --agent-url): each of the
 // person's messages is one POST of the contract's JSON, its { replies } go to the platform after the
 // checks a Chinwag agent's send gets, and a failed answer (a status, a timeout) ends only that turn,
-// saying why. The turn's events let the cloud know when the agent is done.
+// saying why. The turn's events let the cloud know when the agent is done. Every request sent and
+// every answer taken here is also checked against spec/'s JSON Schemas, so the spec cannot drift.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
-import { SMS, WHATSAPP, type ChannelInfo, type ChinwagEvent, type Incoming, type Outbound } from "../src/index.ts";
+import { SMS, WHATSAPP, z, type ChannelInfo, type ChinwagEvent, type Incoming, type Outbound } from "../src/index.ts";
 import { httpAgent, type HttpAgentOptions, type HttpAgentRequest } from "../testing/src/http-agent.ts";
+
+const spec = (name: string) => z.fromJSONSchema(JSON.parse(readFileSync(new URL(`../spec/${name}`, import.meta.url), "utf8")));
+const requestSchema = spec("request.schema.json");
+const responseSchema = spec("response.schema.json");
 
 interface Seen {
   body: HttpAgentRequest;
@@ -22,7 +28,9 @@ async function turn(answer: (res: ServerResponse) => void, incoming: Incoming, o
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
-      seen.push({ body: JSON.parse(raw), headers: req.headers });
+      const body = JSON.parse(raw);
+      assert.deepEqual(requestSchema.safeParse(body).error?.issues, undefined, "the request follows spec/request.schema.json");
+      seen.push({ body, headers: req.headers });
       answer(res);
     });
   });
@@ -45,7 +53,10 @@ async function turn(answer: (res: ServerResponse) => void, incoming: Incoming, o
   return { id, seen, delivered, events, logged, types: events.map((e) => e.type) };
 }
 
-const replies = (body: unknown) => (res: ServerResponse) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+const replies = (body: unknown) => {
+  assert.deepEqual(responseSchema.safeParse(body).error?.issues, undefined, "the answer follows spec/response.schema.json");
+  return (res: ServerResponse) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+};
 
 test("a message is one POST of the contract; its reply goes to the person", async () => {
   const r = await turn(replies({ replies: [{ type: "message", text: "Hi Sam, what can I get you?", buttons: ["Latte", "Cold brew"] }] }), { text: "hi" });
@@ -95,4 +106,9 @@ test("the token goes as a bearer header, --channel names the channel, files go a
   assert.equal(r.seen[0].headers.authorization, "Bearer tok_1");
   assert.deepEqual(r.seen[0].body.message, { text: "my receipt", attachments: [{ kind: "image", mime: "image/jpeg", name: "receipt.jpg", data: Buffer.from(photo).toString("base64") }] });
   assert.equal(r.seen[0].body.channel, "app");
+});
+
+test("a tapped button quoting the agent's message goes as message.choice and message.replyTo", async () => {
+  const r = await turn(replies({ replies: [] }), { text: "Oat", choice: { title: "Oat" }, replyTo: { text: "Which milk?", fromAgent: true } });
+  assert.deepEqual(r.seen[0].body.message, { text: "Oat", replyTo: { text: "Which milk?", fromAgent: true }, choice: { title: "Oat" } });
 });
