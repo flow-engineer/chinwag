@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, tool, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
+import { createAgent, tool, type AgentOptions, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
 import type { ChannelInfo, ChannelKind, ChatMessage, Keywords, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
 
 /**
@@ -108,6 +108,7 @@ export function multi(options: {
   templates?: TemplateDefinition[];
   history?: { maxTokens?: number; toolResultChars?: number };
   defaultCountryCode?: string;
+  intercept?: AgentOptions["intercept"];
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
@@ -136,6 +137,7 @@ export function multi(options: {
     templates: options.templates,
     history: options.history,
     defaultCountryCode: options.defaultCountryCode,
+    intercept: options.intercept,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>

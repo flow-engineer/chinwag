@@ -1,7 +1,7 @@
 // covers: src/nudges.ts src/schedules.ts src/store.ts src/conversation.ts src/agent.ts src/channels.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { SMS_KEYWORDS, type TemplateDefinition } from "../src/index.ts";
+import { SMS_KEYWORDS, sms, type TemplateDefinition } from "../src/index.ts";
 import { SMS, WHATSAPP, call, last, multi, respond } from "./helpers.ts";
 
 const SAM = { channel: "sms", address: "+15550100100" };
@@ -221,6 +221,59 @@ test("STOP on SMS stops everything the business starts, with no model call, unti
   await h.conversation.whenIdle();
   assert.equal((await h.agent.nudge({ to: h.to, text: "Your order is ready." })).status, "sent");
   assert.equal(h.calls.length, 3);
+});
+
+test("intercept sees STOP, START and HELP first, marked as keywords; its own reply goes instead of Chinwag's, and the STOP holds", async () => {
+  const seen: Array<[string, string | null]> = [];
+  const keywords = { ...SMS_KEYWORDS, replies: { stop: "You're unsubscribed.", start: "Welcome back.", help: "Reply STOP to opt out." } };
+  const h = multi({
+    channels: { sms: { info: SMS, phone: true, kind: "sms", keywords } },
+    intercept: (_id, text, message) => {
+      seen.push([text, message.keyword]);
+      return message.keyword === "stop" ? "Okay, no more texts from us." : message.keyword === "help" ? "Text us any question." : null;
+    },
+  });
+  assert.equal(await h.message("sms", SAM.address, "STOP"), null);
+  assert.equal((await h.agent.nudge({ to: SAM, text: "Your order is ready." })).status, "dropped");
+  assert.equal(await h.message("sms", SAM.address, "help"), null);
+  assert.equal(await h.message("sms", SAM.address, "Start"), null);
+  assert.equal((await h.agent.nudge({ to: SAM, text: "Your order is ready." })).status, "sent");
+  assert.deepEqual(seen, [["STOP", "stop"], ["help", "help"], ["Start", "start"]]);
+  assert.deepEqual(h.texts("sms"), ["Okay, no more texts from us.", "Text us any question.", "Welcome back.", "Your order is ready."], "one reply each: the hook's, else Chinwag's");
+  assert.equal(h.calls.length, 0);
+});
+
+test("a STOP is kept, and Chinwag's reply sent, when intercept throws on it", async () => {
+  const keywords = { ...SMS_KEYWORDS, replies: { stop: "You're unsubscribed." } };
+  let calls = 0;
+  const h = multi({ channels: { sms: { info: SMS, phone: true, kind: "sms", keywords } }, intercept: () => { calls++; throw new Error("the flag store is down"); } });
+  assert.equal(await h.message("sms", SAM.address, "STOP"), null);
+  assert.equal(calls, 1, "the hook saw it");
+  assert.deepEqual(h.texts("sms"), ["You're unsubscribed."]);
+  assert.equal((await h.agent.nudge({ to: SAM, text: "Your order is ready." })).status, "dropped");
+});
+
+test("receive() keeps a STOP the hook answered, and sends only the hook's reply", async () => {
+  const keywords = { ...SMS_KEYWORDS, replies: { stop: "You're unsubscribed." } };
+  const h = multi({ channels: { sms: { info: SMS, phone: true, kind: "sms", keywords } }, intercept: (_id, _text, message) => (message.keyword === "stop" ? "Okay, no more texts." : null) });
+  await h.agent.resume();
+  const sent: string[] = [];
+  assert.equal(h.agent.receive("c1", "STOP", (o) => void (o.type === "message" && sent.push(o.text)), { channelName: "sms" }), null);
+  await h.agent.conversation("c1")!.stored();
+  assert.deepEqual(sent, ["Okay, no more texts."]);
+  assert.equal((await h.agent.nudge({ to: { channel: "sms", address: "c1" }, text: "Your order is ready." })).status, "dropped");
+});
+
+test("with keywords: false, STOP is a message like any other: the hook sees no keyword and the agent answers", async () => {
+  const seen: Array<string | null> = [];
+  const keywords = sms({ sendMessage: async () => {} }, { keywords: false }).keywords;
+  const h = multi({ channels: { sms: { info: SMS, phone: true, kind: "sms", keywords } }, intercept: (_id, _text, message) => (seen.push(message.keyword), null) });
+  const a = await h.message("sms", SAM.address, "STOP");
+  (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Stop what?" })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.deepEqual(seen, [null]);
+  assert.deepEqual(h.texts("sms"), ["Stop what?"]);
+  assert.equal((await h.agent.nudge({ to: SAM, text: "Your order is ready." })).status, "sent");
 });
 
 test("a model error in a nudge texts the person nothing, and the nudge settles as failed; their own turn still says sorry", async () => {

@@ -183,6 +183,20 @@ Built in, so you don't write them as tools:
 - **Scheduled messages.** People ask ("remind me at 9 tomorrow"); the agent schedules, lists and cancels them in the person's own time zone. When one is due, the agent writes it in the context of the chat.
 - **No-contact rules.** "No promotions", "nothing before 9am": the agent keeps them per person, and they apply on every channel to everything the business starts, sent now or scheduled.
 - **STOP, START and HELP.** On SMS (STOP; START; HELP, INFO) and WhatsApp (STOP, UNSUBSCRIBE; START), a message that is only the keyword is answered with no model call. STOP keeps a hard rule: no nudge, scheduled message or reminder goes to that person, on any channel, until they text START; the agent still answers when they write, and cannot lift it. Set the replies, or other words, with `sms(provider, { keywords: { replies: { stop, start, help } } })` (`keywords: false` turns them off); without a `help` reply the agent answers HELP. A reply left out sends nothing, for providers that send their own. Which words carriers or regulators expect differs by country (some US carrier rules expect STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT too), so check your market's rules; Chinwag's default on SMS is STOP only. For the fuller list, `sms(provider, { keywords: US_CARRIER_KEYWORDS })` (with your replies: `{ ...US_CARRIER_KEYWORDS, replies }`), or name your own words: `keywords: { stop: ["STOP", "ARRET"] }`.
+
+  Your `intercept` sees these words first, with `message.keyword` set to `"stop"`, `"start"` or `"help"` (`null` for any other message), so an agent that keeps its own opt-out state can update it. Chinwag keeps or lifts the STOP whatever the hook returns, and also when it throws; a reply the hook returns goes instead of Chinwag's, never both:
+
+  ```ts
+  const optedOut = new Set<string>();
+  createAgent({
+    // ...
+    intercept: (conversationId, text, message) => {
+      if (message.keyword === "stop") optedOut.add(conversationId);
+      if (message.keyword === "start") optedOut.delete(conversationId);
+      return null; // Chinwag's own reply goes
+    },
+  });
+  ```
 - **Nudges, messages your business starts:**
 
 ```ts
@@ -356,7 +370,7 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `templates` | The WhatsApp templates you set up with Meta (header, body, footer, buttons): each send is checked against its declaration, and the playground shows it as WhatsApp does |
 | `transcribe` | Speech to text for voice notes, with the provider you choose |
 | `context` | Text added to every turn: who this person is, the time |
-| `intercept` | Answer some messages without the model (STOP and HELP are built in on SMS and WhatsApp) |
+| `intercept` | Answer some messages without the model; it sees STOP, START and HELP first, marked in `message.keyword` (they are built in on SMS and WhatsApp) |
 | `timeZone` | The business's time zone, for schedules when a person's is unknown |
 | `deadlineMs` | The longest a reply waits for a tool (60,000); a tool can set its own |
 | `partialAfterMs` | How long a finished tool's result waits for the others (5,000) |
