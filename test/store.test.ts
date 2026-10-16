@@ -5,11 +5,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
-import { createAgent, sqlite, Store, tool, type Outbound } from "../src/index.ts";
+import { createAgent, sqlite, SMS_KEYWORDS, Store, tool, type Database, type Outbound } from "../src/index.ts";
 import { SMS, WHATSAPP, call, gate, last, multi, respond, scriptedModel, users } from "./helpers.ts";
 
 const CHANNELS = { sms: { info: SMS, phone: true } };
 const file = () => join(mkdtempSync(join(tmpdir(), "chinwag-db-")), "chinwag.db");
+
+/** A database that dies at the first write to `table`: that write and every statement after it fail, as when the process is killed there. */
+function diesAt(table: string, db: Database): Database {
+  let dead = false;
+  const guard = (sql: string) => {
+    if (dead || sql.startsWith(`INSERT INTO ${table} `)) {
+      dead = true;
+      throw new Error("the process died");
+    }
+  };
+  const on = (inner: Omit<Database, "transaction">): Omit<Database, "transaction"> => ({
+    durable: inner.durable,
+    dialect: inner.dialect,
+    query: async (sql, params) => (guard(sql), inner.query(sql, params)),
+    run: async (sql, params) => (guard(sql), inner.run(sql, params)),
+  });
+  return { ...on(db), transaction: (work) => db.transaction((tx) => work(on(tx))) };
+}
 
 test("an agent started again on the same database carries on the conversation", async () => {
   const path = file();
@@ -186,4 +204,29 @@ test("a delivery failure or a reaction reported after a restart reaches the agen
   assert.deepEqual(users(told.request.messages).slice(-2), ['[They reacted 👍 to your message: "Hi Sam!"]', '[Not delivered] "Hi Sam!": carrier rejected it']);
   told.answer(respond());
   await after.agent.conversation(a!.conversationId)!.whenIdle();
+});
+
+test("a provider's message id is kept with what its message stored, so a crash between them loses neither and the retry is taken", async () => {
+  const channels = { sms: { info: SMS, phone: true, kind: "sms" as const, keywords: SMS_KEYWORDS } };
+  for (const [table, text] of [["inbox", "book me in for 10"], ["no_contact", "STOP"]] as const) {
+    const path = file();
+    const before = multi({ channels, database: diesAt(table, sqlite(path)) });
+    await before.agent.resume();
+    const sent = { channel: "sms", from: "+15550100100", message: text, messageId: "SM1" };
+    const a = await before.agent.message(sent);
+    if (a) await before.agent.conversation(a.conversationId)!.stored();
+
+    const after = multi({ channels, database: sqlite(path), dir: before.dir });
+    await after.agent.resume();
+    await after.agent.message(sent);
+    assert.ok(!after.events.some((e) => e.type === "message.duplicate"), `the retry is taken (crash at ${table})`);
+    if (table === "inbox") {
+      const turn = await after.nextCall(0);
+      assert.equal(users(turn.request.messages).at(-1), "[SM1] book me in for 10");
+      turn.answer(respond(call("send_sms", { text: "Booked." })));
+      await after.agent.conversation(a!.conversationId)!.whenIdle();
+    } else {
+      assert.equal((await after.agent.nudge({ to: { channel: "sms", address: "+15550100100" }, text: "Sale today!" })).status, "dropped", "their STOP is kept");
+    }
+  }
 });

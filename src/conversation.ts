@@ -333,7 +333,15 @@ export class Conversation {
     if (link) link.lastMessageAt = at;
     const fields = { messageCount: this.messageCount, recentChannels: this.recentChannels };
     this.persist(async () => {
-      item.inbox = await this.settings.store.addInbox(this.id, "message", { id, text: item.text, shown: item.shown, ...(item.choice ? { choice: true } : {}), channel, ...(item.media ? { media: item.media.map(stored) } : {}) });
+      const payload = { id, text: item.text, shown: item.shown, ...(item.choice ? { choice: true } : {}), channel, ...(item.media ? { media: item.media.map(stored) } : {}) };
+      const inbox = await this.settings.store.addMessage(this.id, payload, ownId ? { channel, messageId: id } : undefined);
+      if (inbox === null) {
+        // Another runner took this provider id first (a retry reached both): the message is theirs.
+        this.pending = this.pending.filter((waiting) => waiting !== item);
+        this.settings.emit(this.id, "message.duplicate", { messageId: id, channel });
+        return;
+      }
+      item.inbox = inbox;
       this.knownInbox.add(item.inbox);
       await this.settings.store.updateConversation(this.id, fields);
       if (link) await this.settings.store.touchIdentity(channel, link.address, at);
@@ -446,20 +454,19 @@ export class Conversation {
    * They texted a STOP or START keyword: their STOP is kept (or lifted) with no model call, and
    * the agent learns it at its next turn. Resolves once it is stored.
    */
-  keyword(kind: "stop" | "start", text: string, channel: string): Promise<void> {
+  keyword(kind: "stop" | "start", text: string, channel: string, messageId?: string): Promise<void> {
     const { store } = this.settings;
+    const inbound = messageId === undefined ? undefined : { channel, messageId };
     this.settings.emit(this.id, "keyword", { keyword: kind, text, channel });
     if (kind === "stop") {
       const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true };
       this.stop = rule;
       this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: nothing the business starts (nudges, scheduled messages) reaches them until they text START. Answer them when they write.`, true);
-      return this.persist(async () => {
-        if (!(await store.noContact(this.id, this.settings.now())).some((r) => r.hard)) await store.addNoContact(this.id, rule.id, rule.rule, null, true);
-      });
+      return this.persist(() => store.setStop(this.id, rule, inbound));
     }
     this.stop = null;
     this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: messages the business starts may reach them again.`, true);
-    return this.persist(() => store.removeHardNoContact(this.id));
+    return this.persist(() => store.setStop(this.id, null, inbound));
   }
 
   get busy(): boolean {

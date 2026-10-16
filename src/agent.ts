@@ -351,8 +351,9 @@ export class Agent {
     await this.settings.ready;
     const identity = await this.conversationFor(adapter, input.channel, input.from, input.person);
     const conversationId = identity.conversationId;
-    if (input.messageId !== undefined && !(await this.store.inbound(conversationId, input.channel, input.messageId))) {
-      // The provider sent this message before (a webhook retried): it was taken then.
+    if (input.messageId !== undefined && (await this.store.inboundTaken(conversationId, input.channel, input.messageId))) {
+      // The provider sent this message before (a webhook retried): it was taken then. Its id is
+      // written with what the message stores (its inbox row, a STOP), so a crash keeps neither.
       this.settings.emit(conversationId, "message.duplicate", { messageId: input.messageId, channel: input.channel });
       return { conversationId, messageId: input.messageId };
     }
@@ -362,15 +363,17 @@ export class Agent {
     const deliver = this.deliverer(adapter, input.from, conversationId);
     conversation.link({ name: input.channel, info: adapter.info, params: adapter.params, instructions: adapter.instructions, address: input.from, deliver, lastMessageAt: null });
     const text = typeof input.message === "string" ? input.message : input.message.text;
-    const answer = this.keyword(conversation, adapter.keywords, input.message, input.channel);
+    // Answered with no model call, and nothing else stored: the id alone is kept, so a retry is not answered again.
+    const once = async () => input.messageId === undefined || (await this.store.inbound(conversationId, input.channel, input.messageId));
+    const answer = this.keyword(conversation, adapter.keywords, input.message, input.channel, input.messageId);
     if (answer) {
       await answer.stored;
-      if (answer.reply) await deliver({ type: "message", text: answer.reply });
+      if (answer.reply && (answer.kind !== "help" || (await once()))) await deliver({ type: "message", text: answer.reply });
       return null;
     }
     const fixed = this.options.intercept?.(conversationId, text) ?? null;
     if (fixed !== null) {
-      if (fixed) await deliver({ type: "message", text: fixed });
+      if (fixed && (await once())) await deliver({ type: "message", text: fixed });
       return null;
     }
     return { conversationId, messageId: conversation.receive(input.message, { channel: input.channel, messageId: input.messageId }) };
@@ -381,14 +384,14 @@ export class Agent {
    * to send back (if anything), once it is stored. Null for any other message, and for HELP when
    * the channel has no reply for it (the agent answers).
    */
-  private keyword(conversation: Conversation, keywords: Keywords | undefined, message: string | Incoming, channel: string): { reply?: string; stored: Promise<void> } | null {
+  private keyword(conversation: Conversation, keywords: Keywords | undefined, message: string | Incoming, channel: string, messageId?: string): { kind: "stop" | "start" | "help"; reply?: string; stored: Promise<void> } | null {
     if (typeof message !== "string" && (message.attachments?.length || message.choice)) return null;
     const text = typeof message === "string" ? message : message.text;
     const kind = keywordOf(keywords, text);
     if (!kind) return null;
     const reply = keywords!.replies?.[kind];
-    if (kind === "help") return reply ? { reply, stored: Promise.resolve() } : null;
-    return { reply, stored: conversation.keyword(kind, text, channel) };
+    if (kind === "help") return reply ? { kind, reply, stored: Promise.resolve() } : null;
+    return { kind, reply, stored: conversation.keyword(kind, text, channel, messageId) };
   }
 
   /** The identity a message comes from, made (and linked to its person's conversation) the first time it writes. */

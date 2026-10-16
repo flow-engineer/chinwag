@@ -295,12 +295,29 @@ export class Store {
     });
   }
 
+  /** A provider's message id already taken in this conversation on this channel (a webhook sent again). */
+  async inboundTaken(conversationId: string, channel: string, messageId: string): Promise<boolean> {
+    return (await this.db.query("SELECT 1 FROM inbound WHERE agent_id = ? AND conversation_id = ? AND channel = ? AND message_id = ?", [this.agentId, conversationId, channel, messageId])).length > 0;
+  }
+
   /**
-   * Records a message id a channel's provider gave in this conversation; false when it was
-   * already taken (a webhook sent again), so the message is not taken twice.
+   * Records a provider's message id for a message that stores nothing else (answered with no
+   * model call); false when it was already taken.
    */
-  async inbound(conversationId: string, channel: string, messageId: string): Promise<boolean> {
-    return (await this.db.run("INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, conversationId, channel, messageId, Date.now()])) > 0;
+  async inbound(conversationId: string, channel: string, messageId: string, db: Omit<Database, "transaction"> = this.db): Promise<boolean> {
+    return (await db.run("INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", [this.agentId, conversationId, channel, messageId, Date.now()])) > 0;
+  }
+
+  /**
+   * A person's message into the inbox, with the provider's id for it in the same transaction, so
+   * a crash never keeps the id without the message (its retry would be refused). Returns the inbox
+   * row's id, or null when the id was already taken: nothing is written then.
+   */
+  async addMessage(conversationId: string, payload: Record<string, unknown>, inbound?: { channel: string; messageId: string }): Promise<number | null> {
+    return this.db.transaction(async (tx) => {
+      if (inbound && !(await this.inbound(conversationId, inbound.channel, inbound.messageId, tx))) return null;
+      return this.addInbox(conversationId, "message", payload, tx);
+    });
   }
 
   // The inbox.
@@ -436,8 +453,8 @@ export class Store {
 
   // What a person asked not to be messaged about.
 
-  async addNoContact(conversationId: string, id: string, rule: string, until: number | null, hard = false): Promise<void> {
-    await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, hard, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, hard ? 1 : 0, Date.now()]);
+  async addNoContact(conversationId: string, id: string, rule: string, until: number | null): Promise<void> {
+    await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, created_at) VALUES (?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, Date.now()]);
   }
 
   /** Removes one of the agent's rules; a STOP is not one of them (only START lifts it). */
@@ -445,9 +462,20 @@ export class Store {
     return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND id = ? AND hard = 0", [this.agentId, conversationId, id])) > 0;
   }
 
-  /** They texted START: their STOP is lifted. */
-  async removeHardNoContact(conversationId: string): Promise<boolean> {
-    return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId])) > 0;
+  /**
+   * They texted STOP (`stop` is its rule, kept unless one is already in force) or START (null:
+   * their STOP is lifted), with the provider's id for the message in the same transaction. False
+   * when the id was already taken: nothing is changed then.
+   */
+  async setStop(conversationId: string, stop: { id: string; rule: string } | null, inbound?: { channel: string; messageId: string }): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      if (inbound && !(await this.inbound(conversationId, inbound.channel, inbound.messageId, tx))) return false;
+      if (!stop) await tx.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId]);
+      else if (!(await tx.query("SELECT 1 FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId])).length) {
+        await tx.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, hard, created_at) VALUES (?, ?, ?, ?, NULL, 1, ?)", [this.agentId, stop.id, conversationId, stop.rule, Date.now()]);
+      }
+      return true;
+    });
   }
 
   /** The rules still in force at `now` (a rule with an `until` in the past has ended). */
