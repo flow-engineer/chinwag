@@ -230,3 +230,41 @@ test("a provider's message id is kept with what its message stored, so a crash b
     }
   }
 });
+
+test("provider message ids are deleted once older than 7 days, in batches, by one of two runners, at most hourly", async () => {
+  const path = file();
+  let deletes = [0, 0];
+  const counted = (i: number): Database => {
+    const db = sqlite(path);
+    return { ...db, run: (sql, params) => (sql.startsWith("DELETE FROM inbound") && deletes[i]++, db.run(sql, params)) };
+  };
+  const start = Date.now();
+  const clock = { now: start };
+  const runners: Array<ReturnType<typeof multi>> = [];
+  for (const i of [0, 1]) {
+    runners.push(multi({ channels: CHANNELS, database: counted(i), now: () => clock.now }));
+    await runners[i].agent.resume();
+  }
+  const db = sqlite(path);
+  const ids = async () => (await db.query("SELECT message_id FROM inbound")).map((r) => String(r.message_id));
+  await db.run(
+    `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2001)
+     INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) SELECT 'default', 'p_1', 'sms', 'old' || i, ? FROM n`,
+    [start],
+  );
+  await db.run("INSERT INTO inbound (agent_id, conversation_id, channel, message_id, at) VALUES ('default', 'p_1', 'sms', 'recent', ?)", [start + 6 * 86_400_000]);
+  const pass = async (at: number) => {
+    clock.now = start + at;
+    deletes = [0, 0];
+    await Promise.all(runners.map((r) => r.agent.runDue()));
+    return [...deletes].sort();
+  };
+  const minutes = (m: number) => m * 60_000;
+
+  assert.deepEqual(await pass(7 * 86_400_000 - minutes(30)), [0, 1], "one runner looks");
+  assert.equal((await ids()).length, 2002, "nothing is 7 days old yet");
+  assert.deepEqual(await pass(7 * 86_400_000 + minutes(10)), [0, 0], "the next look is an hour after the last");
+  assert.equal((await ids()).length, 2002);
+  assert.deepEqual(await pass(7 * 86_400_000 + minutes(30)), [0, 3], "one runner deletes them, 1,000 at a time");
+  assert.deepEqual(await ids(), ["recent"]);
+});

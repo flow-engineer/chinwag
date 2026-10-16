@@ -81,6 +81,9 @@ const MIGRATIONS: Array<(t: Types) => string> = [
      agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, channel TEXT NOT NULL, message_id TEXT NOT NULL, at ${t.int} NOT NULL,
      PRIMARY KEY (agent_id, conversation_id, channel, message_id));
    ALTER TABLE conversations ADD COLUMN turns INTEGER NOT NULL DEFAULT 0`,
+  // Provider ids are deleted once old; upkeep jobs (that pruning) are claimed, so one runner does each.
+  (t) => `CREATE INDEX inbound_at ON inbound (agent_id, at);
+   CREATE TABLE upkeep (agent_id TEXT NOT NULL, job TEXT NOT NULL, next_at ${t.int} NOT NULL, PRIMARY KEY (agent_id, job))`,
 ];
 
 export interface ConversationRow {
@@ -317,6 +320,26 @@ export class Store {
     return this.db.transaction(async (tx) => {
       if (inbound && !(await this.inbound(conversationId, inbound.channel, inbound.messageId, tx))) return null;
       return this.addInbox(conversationId, "message", payload, tx);
+    });
+  }
+
+  /** Deletes up to `limit` provider message ids recorded before `before`; returns how many it deleted. */
+  async pruneInbound(before: number, limit: number): Promise<number> {
+    return this.db.run(
+      `DELETE FROM inbound WHERE agent_id = ? AND (conversation_id, channel, message_id) IN
+         (SELECT conversation_id, channel, message_id FROM inbound WHERE agent_id = ? AND at < ? LIMIT ?)`,
+      [this.agentId, this.agentId, before, limit],
+    );
+  }
+
+  /**
+   * Claims an upkeep job that is due at `now` until `nextAt`, only if no other runner claimed it
+   * first (as a schedule's run is claimed): true for the one runner that does it.
+   */
+  async claimUpkeep(job: string, now: number, nextAt: number): Promise<boolean> {
+    return this.db.transaction(async (tx) => {
+      await tx.run("INSERT INTO upkeep (agent_id, job, next_at) VALUES (?, ?, 0) ON CONFLICT DO NOTHING", [this.agentId, job]);
+      return (await tx.run("UPDATE upkeep SET next_at = ? WHERE agent_id = ? AND job = ? AND next_at <= ?", [nextAt, this.agentId, job, now])) > 0;
     });
   }
 

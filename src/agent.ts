@@ -94,6 +94,11 @@ export interface AgentOptions {
   timeZone?: string;
   /** How often due scheduled messages are looked for. Default 5,000 ms; 0 turns the timer off. */
   scheduleCheckMs?: number;
+  /**
+   * How long a provider's message id is kept, so a webhook retried within it is taken once.
+   * Older ones are deleted, hourly, by one runner, on the scheduled messages' timer. Default 7.
+   */
+  keepMessageIdsDays?: number;
   /** The clock (tests move it). */
   now?: () => number;
   /**
@@ -171,6 +176,9 @@ export interface NudgeResult {
 export type NudgeStatus = "sent" | "silent" | "dropped" | "refused" | "failed" | "scheduled";
 
 const NO_EXTRAS: ChannelInfo = { reactions: false, status: false };
+const HOUR_MS = 3_600_000;
+/** Provider ids deleted per statement, so each one holds its locks briefly. */
+const PRUNE_BATCH = 1_000;
 
 export class Agent {
   private readonly conversations = new Map<string, Conversation>();
@@ -189,6 +197,8 @@ export class Agent {
   /** Where each identity (channel, address) last wrote from; sends go back the same way. */
   private readonly via = new Map<string, Via>();
   private playgroundSink: PlaygroundSink | null = null;
+  /** Before this, this runner does not ask for the pruning claim again (it, or another runner, had it). */
+  private pruneAfter = 0;
   private readonly traces: Traces | null;
 
   constructor(options: AgentOptions) {
@@ -591,7 +601,10 @@ export class Agent {
     this.nudgeWaiters.delete(id);
   }
 
-  /** Looks for due scheduled messages once and hands each to its conversation. Returns how many. */
+  /**
+   * Looks for due scheduled messages once and hands each to its conversation. Returns how many.
+   * Once an hour, one runner also deletes provider message ids older than `keepMessageIdsDays`.
+   */
   async runDue(): Promise<number> {
     await this.settings.ready;
     if (this.store.durable && !this.resumed) return 0;
@@ -604,7 +617,17 @@ export class Agent {
       return windowClosed({ info: this.infoOf(s.channel, s.conversationId), lastMessageAt: identity.lastMessageAt }, now) ? "outside_window" : null;
     });
     for (const q of queued) this.wake(q.conversationId, q.inbox);
+    await this.pruneMessageIds(now).catch((error) => console.warn("chinwag: pruning message ids:", error));
     return queued.length;
+  }
+
+  /** Deletes provider message ids past their keep, in batches, when this runner claims it (at most hourly). */
+  private async pruneMessageIds(now: number): Promise<void> {
+    if (now < this.pruneAfter) return;
+    this.pruneAfter = now + HOUR_MS;
+    if (!(await this.store.claimUpkeep("prune_message_ids", now, now + HOUR_MS))) return;
+    const before = now - (this.options.keepMessageIdsDays ?? 7) * 24 * HOUR_MS;
+    while ((await this.store.pruneInbound(before, PRUNE_BATCH)) === PRUNE_BATCH);
   }
 
   /** The agent's channels without their sends: what the simulators and the test cloud play. */
