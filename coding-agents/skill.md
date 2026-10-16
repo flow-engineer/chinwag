@@ -225,7 +225,7 @@ import { buildAgent } from "./agent.ts";
 
 const play = simulators({ title: "My agent" });
 const agent = buildAgent({ events: [play.events] });
-await play.listen(agent, 8788);           // 127.0.0.1 only; no token needed there
+await play.listen(agent, 8788);           // 127.0.0.1 only, its own page only; no token needed there
 ```
 
 Open the printed link, pick a test person and a channel, and chat; `/person` shows every channel
