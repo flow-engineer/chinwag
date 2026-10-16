@@ -44,7 +44,7 @@
   "scripts": {
     "build": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node -e \"for (const f of ['page.html', 'person.html']) fs.copyFileSync('simulators/src/' + f, 'dist/simulators/src/' + f)\"",
     "prepack": "npm run build",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --test --test-timeout=30000 \"test/**/*.test.ts\"",
     "test:changed": "node scripts/test-changed.ts",
     "new": "node scripts/new-agent.ts",
     "typecheck": "tsc --noEmit"

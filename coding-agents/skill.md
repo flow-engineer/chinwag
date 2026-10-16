@@ -143,7 +143,8 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   (`{ ..., app_link }`), and the agent only passes it on.
 - One person is one conversation across every channel they use. Channels are joined only by what
   each verified: your `resolve` key, else the same phone number on channels marked `phone`. Never
-  join people any other way.
+  join people any other way. When the SMS provider gives national numbers, set
+  `defaultCountryCode` ("+91") so they match the full number WhatsApp gives.
 - With several channels the agent gets a send tool per channel (`send_sms`, `send_web`) and
   answers each message where it came. Don't add your own.
 - After a restart, `resume()` carries on: cut-off turns run again, background tools that were
@@ -161,7 +162,12 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 
 Built in, so don't build them as tools: scheduled messages (`schedule_message`, `list_scheduled`,
 `cancel_scheduled`, in the person's local time), and what a person asked not to be messaged about
-(`add_no_contact`, `remove_no_contact`).
+(`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
+`whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
+no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
+SMS takes only STOP by default; the words carriers or regulators expect differ by country, so
+check the market's rules (`keywords: US_CARRIER_KEYWORDS` adds STOPALL, UNSUBSCRIBE, CANCEL, END
+and QUIT, as some US carrier rules expect; `keywords: { stop: [...] }` sets your own).
 
 Messages the business starts are nudges: `agent.nudge({ to: { channel, address }, text })` sends
 as written; `prompt` instead lets the agent write it (or decide not to); `template` sends a

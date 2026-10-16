@@ -14,6 +14,8 @@ export interface OpenAICompatibleOptions {
   images?: boolean;
   /** The model reads PDFs (file parts). Default true on OpenRouter, which reads them for any model; false elsewhere. */
   pdfs?: boolean;
+  /** Its context window in tokens, so the history sent is kept within it. */
+  contextTokens?: number;
 }
 
 /** The first of these with a value is the agent's model. `MODEL` overrides that provider's default id. */
@@ -51,6 +53,7 @@ export function openAICompatible(options: OpenAICompatibleOptions = {}): Model {
   const model = options.model?.trim() || fromEnv?.model || KEYS[0].model;
   return {
     reads: { images: options.images ?? true, pdfs: options.pdfs ?? baseURL.startsWith("https://openrouter.ai/") },
+    ...(options.contextTokens ? { contextTokens: options.contextTokens } : {}),
     async complete(request: ModelRequest): Promise<ModelResponse> {
       const completion = await client.chat.completions.create(
         {

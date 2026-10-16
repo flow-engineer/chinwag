@@ -173,7 +173,7 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 ```
 
 - **Each platform's rules are built in:** WhatsApp buttons, lists, replies, reactions and its 24-hour window; SMS as plain text in segments; your app's own fields. Features your provider lacks are never offered to the model.
-- **One person, one conversation.** The same number on SMS and WhatsApp is one person. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
+- **One person, one conversation.** The same number on SMS and WhatsApp is one person, however each provider writes it (`+1 555 010 0100`, `15550100100`: both are `+15550100100`), also when their first messages on both arrive at once. If your SMS provider gives national numbers (`098765 43210`), set `createAgent({ defaultCountryCode: "+91" })`: on every phone channel but WhatsApp, a number with no `+` or `00` is then read as that country's (its trunk 0 dropped), so it joins `919876543210` on WhatsApp; without it, bare digits are taken as international. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
 - **The agent gets one send tool per channel** (`send_sms`, `send_whatsapp`, `send_app`) and answers each message where it came in. `instructions` guide the agent on that channel only.
 
 ## Reminders and nudges
@@ -181,19 +181,21 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 Built in, so you don't write them as tools:
 
 - **Scheduled messages.** People ask ("remind me at 9 tomorrow"); the agent schedules, lists and cancels them in the person's own time zone. When one is due, the agent writes it in the context of the chat.
-- **No-contact rules.** "No promotions", "nothing before 9am": the agent keeps them per person, and they apply on every channel.
+- **No-contact rules.** "No promotions", "nothing before 9am": the agent keeps them per person, and they apply on every channel to everything the business starts, sent now or scheduled.
+- **STOP, START and HELP.** On SMS (STOP; START; HELP, INFO) and WhatsApp (STOP, UNSUBSCRIBE; START), a message that is only the keyword is answered with no model call. STOP keeps a hard rule: no nudge, scheduled message or reminder goes to that person, on any channel, until they text START; the agent still answers when they write, and cannot lift it. Set the replies, or other words, with `sms(provider, { keywords: { replies: { stop, start, help } } })` (`keywords: false` turns them off); without a `help` reply the agent answers HELP. A reply left out sends nothing, for providers that send their own. Which words carriers or regulators expect differs by country (some US carrier rules expect STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT too), so check your market's rules; Chinwag's default on SMS is STOP only. For the fuller list, `sms(provider, { keywords: US_CARRIER_KEYWORDS })` (with your replies: `{ ...US_CARRIER_KEYWORDS, replies }`), or name your own words: `keywords: { stop: ["STOP", "ARRET"] }`.
 - **Nudges, messages your business starts:**
 
 ```ts
 await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt: "Their order is ready for pickup." });
 ```
 
-`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe. A nudge a no-contact rule covers is dropped, and outside WhatsApp's 24-hour window only templates go out.
+`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped, and outside WhatsApp's 24-hour window only templates go out. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
 
 ## State, restarts and hosting
 
 - Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). Postgres: `postgres(pool)` over your own node-postgres pool. Any other engine: implement the three-method `Database` interface, or pass a whole `store` of your own.
-- After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun.
+- After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun. A tool's `context.idempotencyKey` is the same when the agent calls it again with the same input in that turn, so your backend can do it once; `context.callId` and `context.signal` (aborted when the person is forgotten) are there too.
+- Pass the provider's own id as `messageId` to `agent.message()`: a webhook the provider sends again is taken once. Ids are kept 7 days (`keepMessageIdsDays`); once an hour one runner deletes older ones, a batch at a time, on the scheduled messages' timer.
 - `agent.status()` says whether anything is running and for how long it has been idle, so your platform can stop idle agents and start them on the next message.
 - Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file. An `EventSink` is a function that gets each event (`{ type, conversationId, at, ... }`) and must not throw:
 
@@ -334,7 +336,7 @@ The café's agent as an HTTP endpoint, with its two tools and one model through 
 
 ## Models
 
-Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`.
+Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`. Give `contextTokens` (the model's window) and a long chat's history is kept within it: the latest messages go to every call, older ones are left out (the agent is told).
 
 For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku-5.5`) or **GPT-6.1 Sol** (`openai/gpt-6.1-sol`, about 3x the cost). In our tests, GPT Luna repeated tool calls and answered twice.
 
@@ -354,12 +356,13 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `templates` | The WhatsApp templates you set up with Meta (header, body, footer, buttons): each send is checked against its declaration, and the playground shows it as WhatsApp does |
 | `transcribe` | Speech to text for voice notes, with the provider you choose |
 | `context` | Text added to every turn: who this person is, the time |
-| `intercept` | Answer some messages without the model (STOP, HELP) |
+| `intercept` | Answer some messages without the model (STOP and HELP are built in on SMS and WhatsApp) |
 | `timeZone` | The business's time zone, for schedules when a person's is unknown |
 | `deadlineMs` | The longest a reply waits for a tool (60,000); a tool can set its own |
 | `partialAfterMs` | How long a finished tool's result waits for the others (5,000) |
 | `debounceMs` | Quiet time after a message before the reply starts (300) |
 | `maxSteps` | Model steps per turn (8) |
+| `history` | How much of a long chat each model call carries: `{ maxTokens, toolResultChars }` (60% of the model's `contextTokens`, else 50,000 tokens; tool results cut at 12,000 characters) |
 | `inlineSkills` | Put every skill in the prompt instead of loading on demand |
 | `shareUpdates` | Live status lines on web and app UIs (on); a string replaces the guidance |
 | `traces` | Where traces go (from the environment by default, see above) |

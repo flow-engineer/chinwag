@@ -33,6 +33,10 @@ export const findSlots = tool({
   or scheduled messages, or for opting out of messages: Chinwag has them.
 - Key a person's data by `context.person` (who Chinwag verified they are) or `context.conversationId`,
   never by an id the model passed.
+- A tool that changes something (books, pays, sends) passes `context.idempotencyKey` to its backend:
+  it is the same for the same input in the same turn, also when the turn runs again after a
+  restart, so the booking happens once. `context.callId` is the model's id for the call;
+  `context.signal` aborts when the person is forgotten.
 - Don't decide what runs in the background. The reply waits for every call; one moves to the
   background only if the person writes again meanwhile or it passes its limit (the agent's
   `deadlineMs`, 60 s by default), and its result comes back into the chat by itself. Set

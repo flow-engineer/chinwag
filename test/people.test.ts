@@ -1,23 +1,49 @@
-// covers: src/agent.ts src/conversation.ts src/talk.ts
+// covers: src/agent.ts src/conversation.ts src/talk.ts src/store.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
-import { tool } from "../src/index.ts";
+import { sqlite, Store, tool } from "../src/index.ts";
 import { SMS, WEB_APP, WHATSAPP, call, last, multi, respond, users } from "./helpers.ts";
 
 const PHONES = { sms: { info: SMS, phone: true }, whatsapp: { info: WHATSAPP, phone: true } };
 
-test("the same phone number on two channels is one person, in one conversation", async () => {
+test("the same phone number on two channels is one person, in one conversation, however each channel writes it", async () => {
   const h = multi({ channels: PHONES });
   const a = await h.message("sms", "+1 (555) 010-0100", "hi");
   (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Hi!" })));
   await h.agent.conversation(a!.conversationId)!.whenIdle();
-  const b = await h.message("whatsapp", "+15550100100", "it's me on WhatsApp");
+  // WhatsApp gives the number as bare international digits.
+  const b = await h.message("whatsapp", "15550100100", "it's me on WhatsApp");
   assert.equal(b!.conversationId, a!.conversationId);
   const second = await h.nextCall(1);
   assert.deepEqual(users(second.request.messages), ["[sms · m1] hi", "[whatsapp · m2] it's me on WhatsApp"], "one history across both channels");
   second.answer(respond(call("send_whatsapp", { text: "Got you here too." })));
   await h.agent.conversation(a!.conversationId)!.whenIdle();
+});
+
+test("with a default country code, a national number on SMS and the full one on WhatsApp are one person; without it, two", async () => {
+  const channels = { sms: { info: SMS, phone: true, kind: "sms" as const }, whatsapp: { info: WHATSAPP, phone: true, kind: "whatsapp" as const } };
+  const database = sqlite();
+  const h = multi({ channels, database, defaultCountryCode: "+91" });
+  const national = await h.message("sms", "098765 43210", "hi");
+  const whatsapp = await h.message("whatsapp", "919876543210", "hi");
+  const full = await h.message("sms", "+91 98765 43210", "hi");
+  assert.equal(new Set([national!.conversationId, whatsapp!.conversationId, full!.conversationId]).size, 1);
+  assert.deepEqual((await new Store(database, "default").allConversations()).map((c) => c.personKey), ["phone:+919876543210"]);
+
+  const plain = multi({ channels });
+  const a = await plain.message("sms", "09876543210", "hi");
+  const b = await plain.message("whatsapp", "919876543210", "hi");
+  assert.notEqual(a!.conversationId, b!.conversationId, "bare digits are international without it");
+  assert.throws(() => multi({ channels, defaultCountryCode: "IN" }), /calling code such as "\+91"/);
+});
+
+test("first messages from one number on two channels at once make one conversation", async () => {
+  const database = sqlite();
+  const h = multi({ channels: PHONES, database });
+  const [a, b] = await Promise.all([h.message("sms", "+15550007777", "hi"), h.message("whatsapp", "15550007777", "hi")]);
+  assert.equal(a!.conversationId, b!.conversationId);
+  assert.deepEqual((await new Store(database, "default").allConversations()).map((c) => c.personKey), ["phone:+15550007777"]);
 });
 
 test("different numbers, and a web visitor with no resolver, are never joined", async () => {

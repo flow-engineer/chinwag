@@ -1,13 +1,13 @@
 // covers: src/nudges.ts src/schedules.ts src/store.ts src/conversation.ts src/agent.ts src/channels.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { TemplateDefinition } from "../src/index.ts";
+import { SMS_KEYWORDS, type TemplateDefinition } from "../src/index.ts";
 import { SMS, WHATSAPP, call, last, multi, respond } from "./helpers.ts";
 
 const SAM = { channel: "sms", address: "+15550100100" };
 
 /** Sam has written once and been answered. */
-async function withSam(channels: Record<string, { info: typeof SMS; phone?: boolean }> = { sms: { info: SMS, phone: true } }, clock = { now: Date.UTC(2026, 9, 12, 16) }, templates?: TemplateDefinition[]) {
+async function withSam(channels: Parameters<typeof multi>[0]["channels"] = { sms: { info: SMS, phone: true } }, clock = { now: Date.UTC(2026, 9, 12, 16) }, templates?: TemplateDefinition[]) {
   const h = multi({ channels, now: () => clock.now, templates });
   const channel = Object.keys(channels)[0];
   const a = await h.message(channel, SAM.address, "hi");
@@ -170,4 +170,93 @@ test("a no-contact rule ends at its until date, and goes when the agent removes 
   await h.conversation.whenIdle();
   assert.equal((await h.agent.nudge({ to: h.to, text: "Today's special" })).status, "sent");
   assert.equal(h.calls.length, 6, "no rules left, so no model call for the nudge");
+});
+
+test("a scheduled text from the business goes through their no-contact rules, as one sent now does", async () => {
+  const h = await withSam();
+  await h.message("sms", SAM.address, "no promotions please");
+  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Got it." }), call("add_no_contact", { rule: "no promotions" })));
+  (await h.nextCall(2)).answer(respond());
+  await h.conversation.whenIdle();
+
+  assert.equal((await h.agent.nudge({ to: h.to, text: "Big sale today!", at: h.clock.now + 120_000 })).status, "scheduled");
+  h.clock.now += 120_000;
+  assert.equal(await h.agent.runDue(), 1);
+  const check = await h.nextCall(3);
+  assert.deepEqual(check.request.tools.map((t) => t.name), ["decide"]);
+  check.answer(respond(call("decide", { send: false })));
+  await h.conversation.whenIdle();
+  assert.deepEqual(h.texts("sms"), ["Hi!", "Got it."], "the scheduled sale text was dropped");
+  assert.ok(h.events.some((e) => e.type === "model.call" && e.purpose === "no-contact check"), "the check's cost is an event");
+});
+
+test("STOP on SMS stops everything the business starts, with no model call, until START; HELP gets the owner's reply", async () => {
+  const keywords = { ...SMS_KEYWORDS, replies: { stop: "You're unsubscribed. Reply START to resume.", help: "Reply STOP to opt out." } };
+  const h = await withSam({ sms: { info: SMS, phone: true, kind: "sms", keywords } });
+  assert.equal(await h.message("sms", SAM.address, "Stop."), null);
+  assert.equal(await h.message("sms", SAM.address, "help"), null);
+  assert.deepEqual(h.texts("sms"), ["Hi!", "You're unsubscribed. Reply START to resume.", "Reply STOP to opt out."]);
+
+  assert.match((await h.agent.nudge({ to: h.to, text: "Your order is ready." })).reason!, /they texted Stop\. on sms/);
+  assert.equal((await h.agent.nudge({ to: h.to, prompt: "Tell them about the sale" })).status, "dropped");
+  assert.equal((await h.agent.nudge({ to: h.to, template: { name: "order_ready" } })).status, "dropped");
+  await h.agent.nudge({ to: h.to, text: "Your session starts soon.", at: h.clock.now + 120_000 });
+  h.clock.now += 120_000;
+  assert.equal(await h.agent.runDue(), 0, "the scheduled one is skipped");
+  assert.equal(h.calls.length, 1, "no model call for any of it");
+
+  // They write again: the agent answers, knows about the STOP, and cannot lift it itself.
+  await h.message("sms", SAM.address, "what time do you open?");
+  const asked = await h.nextCall(1);
+  assert.ok(asked.request.messages.some((m) => m.role === "user" && /They texted "Stop\." on sms/.test(m.content)));
+  const stopRule = /\[(nc_stop_\w+)\]/.exec(asked.request.system)![1];
+  asked.answer(respond(call("send_sms", { text: "We open at 9." }), call("remove_no_contact", { id: stopRule })));
+  const removed = await h.nextCall(2);
+  assert.match(last(removed.request.messages).content, /only when they text START/);
+  removed.answer(respond());
+  await h.conversation.whenIdle();
+  assert.equal((await h.agent.nudge({ to: h.to, text: "Your order is ready." })).status, "dropped");
+
+  assert.equal(await h.message("sms", SAM.address, "START"), null);
+  await h.conversation.whenIdle();
+  assert.equal((await h.agent.nudge({ to: h.to, text: "Your order is ready." })).status, "sent");
+  assert.equal(h.calls.length, 3);
+});
+
+test("a model error in a nudge texts the person nothing, and the nudge settles as failed; their own turn still says sorry", async () => {
+  const h = await withSam();
+  await h.message("sms", SAM.address, "no promos please");
+  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Got it." }), call("add_no_contact", { rule: "no promotions" })));
+  (await h.nextCall(2)).answer(respond());
+  await h.conversation.whenIdle();
+
+  const text = h.agent.nudge({ to: h.to, text: "Your session is tomorrow at 10." });
+  (await h.nextCall(3)).fail(new Error("503 overloaded"));
+  assert.deepEqual(await text, { id: (await text).id, status: "failed", reason: "their no-contact rules could not be checked: 503 overloaded" });
+  const prompt = h.agent.nudge({ to: h.to, prompt: "Their session is tomorrow at 10" });
+  (await h.nextCall(4)).fail(new Error("503 overloaded"));
+  assert.deepEqual(await prompt, { id: (await prompt).id, status: "failed", reason: "the agent's turn failed: 503 overloaded" });
+  await h.conversation.whenIdle();
+  assert.deepEqual(h.texts("sms"), ["Hi!", "Got it."], "no apology to someone who did not write");
+  assert.equal(h.events.filter((e) => e.type === "model.error").length, 2);
+
+  await h.message("sms", SAM.address, "is it at 10?");
+  (await h.nextCall(5)).fail(new Error("503 overloaded"));
+  await h.conversation.whenIdle();
+  assert.equal(h.texts("sms").at(-1), "Sorry, something went wrong on my side. Could you send that again?");
+});
+
+test("two calls with one idempotency key at once send once, and both get its result; a scheduled one is written once", async () => {
+  const h = await withSam();
+  const nudge = { to: h.to, text: "Reminder", idempotencyKey: "order-1" };
+  const [a, b] = await Promise.all([h.agent.nudge(nudge), h.agent.nudge(nudge)]);
+  assert.deepEqual(a, b);
+  assert.equal(a.status, "sent");
+  assert.deepEqual(h.texts("sms"), ["Hi!", "Reminder"]);
+
+  const later = { to: h.to, text: "Your session starts soon.", at: h.clock.now + 120_000, idempotencyKey: "session-1" };
+  const [c, d] = await Promise.all([h.agent.nudge(later), h.agent.nudge(later)]);
+  assert.deepEqual(c, d);
+  h.clock.now += 120_000;
+  assert.equal(await h.agent.runDue(), 1, "one schedule, so it goes out once");
 });
