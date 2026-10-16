@@ -25,7 +25,7 @@ Node 22.18 or later. Your agent is TypeScript that Node runs as it is, with no b
 
 ```bash
 npx chinwag new my-agent && cd my-agent && npm install
-cp .env.example .env        # then put your OpenRouter key in it: OPENROUTER_API_KEY=sk-or-...
+cp .env.example .env        # then put one model key in it; the file says where to make one
 npm start
 ```
 
@@ -201,7 +201,7 @@ await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt
   const log: EventSink = (event) => console.log(event.type, event.conversationId);
   createAgent({ /* ... */ events: [log] });
   ```
-- Traces: with `CHINWAG_TRACES_KEY` and `CHINWAG_TRACES_URL` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces` (`CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only).
+- Traces: with `CHINWAG_TRACES_KEY` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces`, where the URL is `CHINWAG_TRACES_URL`, else https://flow.engineer/observe (the trace key is made there). `CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only.
 
 ## Testing
 
@@ -228,21 +228,31 @@ expect:
 `tests/tools/*.yaml` describe how each tool behaves (normal, slow, each error). Run the suite from the agent's folder:
 
 ```bash
-npx chinwag test --cloud <test cloud URL> --runs 3 --only latte-correction
+npx chinwag test --cloud https://flow.engineer/observe --synthetic --runs 3 --only latte-correction
 ```
 
-**Get a test cloud.** (Placeholder: how to get access to a hosted test cloud is coming soon.)
-
-`chinwag test` needs a test cloud: pass `--cloud <url>` or set `CHINWAG_CLOUD`. A hosted test cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic` (your attestation that the test files hold no real customer data). Your agent stays on your machine with its own model and key; the test cloud plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation. Before anything is sent it reads every test file as the cloud does, and a mistake stops it with the file and line (`tests/scenarios/latte-correction.yaml:3: person.goal: missing`).
+Your agent stays on your machine with its own model and key; the test cloud ([get one](#get-a-test-cloud)) plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation. Before anything is sent it reads every test file as the cloud does, and a mistake stops it with the file and line (`tests/scenarios/latte-correction.yaml:3: person.goal: missing`).
 
 The command exits 0 when every run passed, and 1 when the session finished and a run failed. A refusal from the cloud (a bad CI key, an invalid suite, the spend cap) or a failure before the session opens exits 1 and prints only that message. If the tunnel, the stream, or the connection fails after the session has opened, it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report, says the cloud keeps playing until it is stopped from the dashboard, and exits 130.
 
+### Get a test cloud
+
+1. Sign in at https://flow.engineer/observe (Google, GitHub or an email link).
+2. Workspace → New agent.
+3. On the agent's Developers page, "Make a CI key". It starts with `oci_` and is shown once.
+4. Put it in the agent's `.env` as `CHINWAG_CLOUD_KEY` (never on the command line).
+5. `npx chinwag test --cloud https://flow.engineer/observe --synthetic` from the agent's folder (`--cloud` is that address by default).
+
+Your agent runs on your machine with your own model key. The cloud's person simulator, tool simulator and judge are free up to $5 a day per workspace, with 2 sessions at once; test data only (`--synthetic`), and records are deleted after 30 days.
+
+`--cloud` (or `CHINWAG_CLOUD`) points at another test cloud. A hosted cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic`, your attestation that the test files hold no real customer data; without the key the command stops and says where to make one.
+
 ### Test an agent you already have
 
-An agent built on any framework is tested through an HTTP endpoint, with no rewrite. It needs a test cloud like any run (see [Testing](#testing)): `--cloud` or `CHINWAG_CLOUD`, and for a hosted one `CHINWAG_CLOUD_KEY` and `--synthetic`. From a folder with `tests/scenarios/*.yaml`, with your agent running:
+An agent built on any framework is tested through an HTTP endpoint, with no rewrite. It needs a test cloud like any run (see [Get a test cloud](#get-a-test-cloud)): `CHINWAG_CLOUD_KEY` and `--synthetic` for the hosted one, the default, or `--cloud` for another. From a folder with `tests/scenarios/*.yaml`, with your agent running:
 
 ```bash
-npx chinwag test --agent-url http://localhost:3000/chinwag --cloud <test cloud URL> --synthetic
+npx chinwag test --agent-url http://localhost:3000/chinwag --cloud https://flow.engineer/observe --synthetic
 ```
 
 Before the session opens, the command sends one `HEAD` request to the URL (never a message), and stops with "Could not reach your agent at <url>" if nothing answers; any HTTP status counts as an answer.
@@ -285,7 +295,7 @@ Your agent's own tools run on its side, for real, so `tests/tools/*.yaml` are no
 
 ## Models
 
-Any OpenAI-compatible API. `openAICompatible` defaults to OpenRouter and reads `OPENROUTER_API_KEY`; pass `baseURL` and `apiKey` for OpenAI, Gemini, Anthropic or a local server.
+Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for a local server or any other address.
 
 For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku-5.5`) or **GPT-6.1 Sol** (`openai/gpt-6.1-sol`, about 3x the cost). In our tests, GPT Luna repeated tool calls and answered twice.
 

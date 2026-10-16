@@ -103,7 +103,7 @@ export interface AgentOptions {
   templates?: TemplateDefinition[];
   /**
    * Send every turn to a traces endpoint as a trace. Default: from the environment, on when
-   * CHINWAG_TRACES_KEY is set (with CHINWAG_TRACES_URL, and CHINWAG_TRACES_CONTENT=1 for content),
+   * CHINWAG_TRACES_KEY is set (address CHINWAG_TRACES_URL, else https://flow.engineer/observe; CHINWAG_TRACES_CONTENT=1 for content),
    * never under `node --test`.
    */
   traces?: TracesOptions;

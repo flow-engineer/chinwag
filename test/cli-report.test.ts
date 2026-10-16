@@ -114,7 +114,7 @@ test("the command line: --version, each command's own --help, and a plain line f
   assert.ok(!existsSync(join(dir, "x")));
 });
 
-test("what is wrong on this machine is said before the cloud is called, and an address that does not answer is named", { timeout: 15_000 }, async () => {
+test("what is wrong on this machine is said before the cloud is called, an address that does not answer is named, and the default cloud asks for its key", { timeout: 15_000 }, async () => {
   const closed = "http://127.0.0.1:9";
   const empty = mkdtempSync(join(tmpdir(), "chinwag-cli-"));
   const noAgent = await cliOutput(["test", "--cloud", closed], empty);
@@ -131,7 +131,8 @@ test("what is wrong on this machine is said before the cloud is called, and an a
   const named = await cliOutput(["test", "--cloud", closed], good);
   assert.equal(named.code, 1);
   assert.match(named.out, /^Could not reach http:\/\/127\.0\.0\.1:9: ECONNREFUSED\.$/m);
-  assert.match((await cliOutput(["test"], good)).out, /^Could not reach http:\/\/127\.0\.0\.1:8900: ECONNREFUSED\. Set CHINWAG_CLOUD or pass --cloud\.$/m);
+  // No cloud named: the hosted one, which needs a key before anything is sent.
+  assert.match((await cliOutput(["test"], good)).out, /^A hosted cloud needs the agent's CI key: set CHINWAG_CLOUD_KEY\. Make a key at https:\/\/flow\.engineer\/observe: your agent, Developers\.$/m);
 });
 
 test("Ctrl-C prints the same partial report and exits 130", { timeout: 15_000 }, async () => {

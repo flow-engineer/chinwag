@@ -36,7 +36,11 @@ test("chinwag new makes an agent of its own: chinwag imports, a package on this 
   assert.equal(JSON.parse(readFileSync(join(dir, "tsconfig.json"), "utf8")).extends, undefined);
   for (const skill of ["chinwag", "chinwag-tools", "chinwag-tests"]) assert.ok(existsSync(join(dir, ".claude", "skills", skill, "SKILL.md")), skill);
   assert.equal(readFileSync(join(dir, "CLAUDE.md"), "utf8"), "@AGENTS.md\n");
-  assert.ok(existsSync(join(dir, "tests", "scenarios")) && existsSync(join(dir, ".env.example")));
+  assert.ok(existsSync(join(dir, "tests", "scenarios")));
+  const env = readFileSync(join(dir, ".env.example"), "utf8");
+  for (const key of ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CHINWAG_CLOUD_KEY", "CHINWAG_TRACES_KEY"]) assert.match(env, new RegExp(`^${key}=$`, "m"), key);
+  assert.match(env, /^CHINWAG_CLOUD=https:\/\/flow\.engineer\/observe$/m);
+  assert.match(env, /^CHINWAG_TRACES_URL=https:\/\/flow\.engineer\/observe$/m);
   assert.throws(() => newStandalone("my-agent", { into }), /already exists/);
   assert.throws(() => newStandalone("My_Agent", { into }), /not a usable name/);
 });

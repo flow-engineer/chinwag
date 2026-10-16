@@ -2,8 +2,8 @@
 // The chinwag command. `chinwag new <name>` makes ./<name>/, an agent started from the café example
 // (testing/src/new.ts). `chinwag test`, or `chinwag` with flags, runs an agent's tests in the cloud,
 // from the agent's folder:
-//   chinwag test --cloud http://127.0.0.1:8900 [--runs 3] [--only late-order,refund]
-// A hosted cloud (any --cloud off this machine, such as https://tests.example.com) needs the
+//   chinwag test [--cloud https://flow.engineer/observe] [--runs 3] [--only late-order,refund]
+// A hosted cloud (any --cloud off this machine, the default included) needs the
 // agent's CI key in CHINWAG_CLOUD_KEY and --synthetic, the attestation that the test files hold no real
 // customer or member data. --agent-version (else GITHUB_SHA), --ref (else GitHub's branch) and
 // --environment (staging or production) are kept with the session.
@@ -17,6 +17,7 @@ import { request as httpsRequest } from "node:https";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
+import { OBSERVE_URL } from "../../src/traces.ts";
 import { cloudHeaders, runInCloud, SessionStopped, type ConnectOptions } from "./client.ts";
 import { runPrinter } from "./print-run.ts";
 import { httpAgent } from "./http-agent.ts";
@@ -30,7 +31,7 @@ const TEST_LINE = `  chinwag test [options]    Run the agent's tests in a test c
                             the tests are in tests/scenarios and tests/tools)`;
 const NEW_USAGE = `Usage:\n${NEW_LINE}\n\n  -h, --help                Show this help`;
 const TEST_OPTIONS = `Options for test:
-  --cloud <url>            The test cloud (default: CHINWAG_CLOUD, else http://127.0.0.1:8900)
+  --cloud <url>            The test cloud (default: CHINWAG_CLOUD, else https://flow.engineer/observe)
   --runs <n>               Runs per scenario (default: 1)
   --only <ids>             Only these scenarios, comma-separated (file names without .yaml)
   --synthetic              Attest the test files hold no real customer data (a hosted cloud needs it)
@@ -57,8 +58,11 @@ Exit status:
 
 Environment (also read from the agent folder's .env; variables already set win):
   CHINWAG_CLOUD            The test cloud, when --cloud is not given
-  CHINWAG_CLOUD_KEY        The agent's CI key, for a hosted cloud
-  CHINWAG_AGENT_TOKEN      With --agent-url: sent to it as authorization: Bearer <token>`;
+  CHINWAG_CLOUD_KEY        The agent's CI key, for a hosted cloud (oci_...: make one at
+                           https://flow.engineer/observe, your agent, Developers)
+  CHINWAG_AGENT_TOKEN      With --agent-url: sent to it as authorization: Bearer <token>
+  OPENROUTER_API_KEY       The agent's model key, or OPENAI_API_KEY, ANTHROPIC_API_KEY or
+                           GEMINI_API_KEY: the first with a value is used`;
 const TEST_USAGE = `Usage:\n${TEST_LINE}\n\n${TEST_OPTIONS}`;
 const USAGE = `Usage:\n${NEW_LINE}\n${TEST_LINE}\n  chinwag --version         Show the version\n\n${TEST_OPTIONS}`;
 
@@ -106,7 +110,7 @@ if (command === "new") {
   }
   console.log(`Made ./${name}/ from the café example (Pip). Next:
   1. cd ${name} && npm install
-  2. Add your key: cp .env.example .env, then put your OpenRouter key in it
+  2. Add one model key: cp .env.example .env; the file says where to make one
   3. npm start, then open the link it prints
   4. Tell your coding agent what to build: its skills are in .claude/skills/`);
   process.exit(0);
@@ -118,22 +122,22 @@ if (command !== undefined && (command !== "test" || rest.length)) {
 }
 
 const runs = checkRuns(values.runs);
-// The cloud the developer named, with --cloud or CHINWAG_CLOUD; else the default, which may not answer.
-const namedCloud = values.cloud || process.env.CHINWAG_CLOUD || undefined;
-const cloud = namedCloud ?? "http://127.0.0.1:8900";
+const cloud = values.cloud || process.env.CHINWAG_CLOUD || OBSERVE_URL;
+const ciKey = process.env.CHINWAG_CLOUD_KEY || undefined;
 
 let openHeaders: Record<string, string>;
 try {
   openHeaders = cloudHeaders({
     cloud,
-    ciKey: process.env.CHINWAG_CLOUD_KEY || undefined,
+    ciKey,
     synthetic: values.synthetic!,
     agentVersion: values["agent-version"] || undefined,
     ref: values.ref || undefined,
     environment: values.environment,
   });
 } catch (error) {
-  console.error((error as Error).message);
+  const where = !ciKey && cloud.replace(/\/+$/, "") === OBSERVE_URL ? ` Make a key at ${OBSERVE_URL}: your agent, Developers.` : "";
+  console.error(`${(error as Error).message}${where}`);
   process.exit(1);
 }
 
@@ -241,10 +245,10 @@ try {
   });
 } catch (error) {
   if (error instanceof SessionStopped) {
-    reportStop(error.runs, stoppedReason(error, cloud, namedCloud !== undefined), error.dashboard || dashboard);
+    reportStop(error.runs, stoppedReason(error, cloud), error.dashboard || dashboard);
     process.exit(2);
   }
-  console.error(stoppedReason(error, cloud, namedCloud !== undefined));
+  console.error(stoppedReason(error, cloud));
   process.exit(1);
 }
 
@@ -275,10 +279,10 @@ function expectedRuns(sent: ReturnType<typeof loadSuite>, runs: number): number 
 }
 
 /** Why the session stopped or never opened; a network failure names the address and its code. */
-function stoppedReason(error: unknown, cloud: string, named: boolean): string {
+function stoppedReason(error: unknown, cloud: string): string {
   const code = networkCode(error);
   if (!code) return error instanceof Error ? error.message : String(error);
-  return `Could not reach ${cloud}: ${code}.${named ? "" : " Set CHINWAG_CLOUD or pass --cloud."}`;
+  return `Could not reach ${cloud}: ${code}.`;
 }
 
 /** The connection's error code, from the error or what caused it. */
