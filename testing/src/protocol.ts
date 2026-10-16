@@ -148,6 +148,9 @@ export interface RunSummary {
   watch: string;
   /** The first try never reached the agent, so this run is the second try. */
   retried?: boolean;
+  /** The cloud's code when it could not play or judge the run (judge_failed, spend_cap, simulator_failed, ...).
+   * The run then says nothing about the agent, whatever `passed` and `ended` say. */
+  error?: string;
 }
 
 export interface SessionSummary {

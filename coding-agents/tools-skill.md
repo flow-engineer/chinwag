@@ -64,10 +64,10 @@ responses:
   - when: The order goes through (usual)
     latency_ms: 4800
     input: { name: Sam, items: [{ item: Latte, size: large, milk: oat, quantity: 1 }] }
-    output: { order_id: BL-1040, ready_by: "2026-10-11T15:42:00Z", pay_at_pickup: true }
+    output: { order_id: BL-1040, ready_by: "{{now + 10m}}", pay_at_pickup: true }
   - when: The point of sale is busy; the order still goes through
     latency_ms: 11000
-    output: { order_id: BL-1041, ready_by: "2026-10-11T15:55:00Z", pay_at_pickup: true }
+    output: { order_id: BL-1041, ready_by: "{{now + 15m}}", pay_at_pickup: true }
   - when: The point of sale is down
     latency_ms: 3000
     error: Point of sale unavailable
@@ -81,5 +81,9 @@ responses:
   example of a call.
 - Use real responses when you have them (copy them from the agent's recorded tool calls, with
   personal data removed); otherwise write realistic ones in exactly the shape `run` returns.
+- Examples show the shape, not the answer: the simulator takes ids, names and dates from the
+  scenario's world, the call's input and what the agent already said. Write dates as placeholders
+  for the test's clock (`{{now + 10m}}`, `{{now + 2d | date}}`; see the `chinwag-tests` skill),
+  never as written dates, which go stale.
 - Latency lives only here. Scenarios describe situations ("the point of sale is slow this
   morning"); the simulator picks the matching response and latency on each call.

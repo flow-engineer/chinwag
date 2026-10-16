@@ -17,10 +17,10 @@ responses:
     input:
       name: Sam
       items: [{ item: Latte, size: large, milk: oat, quantity: 1 }]
-    output: { order_id: BL-1040, ready_by: "2026-10-11T15:42:00Z", pay_at_pickup: true }
+    output: { order_id: BL-1040, ready_by: "{{now + 10m}}", pay_at_pickup: true }
   - when: The point of sale is busy; the order still goes through
     latency_ms: 11000
-    output: { order_id: BL-1041, ready_by: "2026-10-11T15:55:00Z", pay_at_pickup: true }
+    output: { order_id: BL-1041, ready_by: "{{now + 15m}}", pay_at_pickup: true }
   - when: The point of sale is down
     latency_ms: 3000
     error: Point of sale unavailable
