@@ -792,3 +792,62 @@ test("a lost session is opened again at most once, only on a cloud that says reo
     } finally { cloud.close(); }
   }
 });
+
+test("a slow event upload is logged only when verbose", { timeout: 10_000 }, async () => {
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+    if (url.endsWith("/stream")) return void res.writeHead(200, { "content-type": "text/event-stream" }).end(frame({ type: "drain" }) + frame(finished));
+    // An upload the cloud takes a second to answer is slow by the client's measure.
+    if (url.endsWith("/events")) return void setTimeout(() => res.writeHead(200, { "content-type": "application/json" }).end("{}"), 1_000);
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    for (const verbose of [false, true]) {
+      const logs: string[] = [];
+      await runInCloud({
+        cloud: cloud.url, name: "test", tools: [], files: [], log: (line) => logs.push(line), verbose,
+        build: ({ events }) => {
+          events[0]!({ type: "turn.started", conversationId: "c", at: 0 } as never);
+          return { channels: () => [], receive: () => "m", reacted: () => {} };
+        },
+      });
+      assert.equal(logs.some((line) => line.startsWith("event upload slow")), verbose, logs.join("\n"));
+    }
+  } finally { cloud.close(); }
+});
+
+test("a busy cloud's refused open is sent once more after its Retry-After, only within the cap, and the second open's agent id is passed on", { timeout: 10_000 }, async () => {
+  const busy = { "content-type": "application/json", "retry-after": "0" };
+  const cases = [
+    { refusals: [[503, { error: { type: "capacity", message: "All slots are busy." } }]], cap: 60_000, opens: 2, opened: true },
+    { refusals: [[429, { error: { type: "rate_limited" } }], [429, { error: { type: "rate_limited" } }]], cap: 60_000, opens: 2, opened: false },
+    { refusals: [[429, { error: { type: "rate_limited" } }]], cap: -1, opens: 1, opened: false },
+  ] as const;
+  for (const item of cases) {
+    let opens = 0;
+    const cloud = await listen(({ url }, res) => {
+      if (url === "/api/sessions") {
+        const refusal = item.refusals[opens++];
+        if (refusal) return void res.writeHead(refusal[0], busy).end(JSON.stringify(refusal[1]));
+        return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d", agent: "agt_1" }));
+      }
+      if (url.endsWith("/stream")) return void res.writeHead(200, { "content-type": "text/event-stream" }).end(frame(finished));
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+    const logs: string[] = [];
+    let agent: string | undefined;
+    try {
+      const playing = runInCloud({
+        cloud: cloud.url, name: "test", tools: [], files: [], log: (line) => logs.push(line), openRetryCapMs: item.cap,
+        build: () => ({ channels: () => [], receive: () => "m", reacted: () => {} }),
+        onDashboard: (_url, _id, id) => { agent = id; },
+      });
+      if (item.opened) {
+        await playing;
+        assert.equal(agent, "agt_1");
+        assert.match(logs.join("\n"), /^The cloud is busy \(503 capacity\); trying once more in 0 s\.$/m);
+      } else await assert.rejects(playing, /429/);
+      assert.equal(opens, item.opens, JSON.stringify(item));
+    } finally { cloud.close(); }
+  }
+});

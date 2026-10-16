@@ -10,7 +10,7 @@ export function runPrinter(log: (line: string) => void = console.log): (run: Run
     printed.add(r.runId);
     const gaveUp = r.passed && r.ended === "gave_up" ? " (passed, the person gave up)" : "";
     const retried = r.retried ? "; tried once more" : "";
-    log(`${r.passed ? "PASS" : "FAIL"}  ${r.scenario} #${r.run} (${r.channel}): ${r.turns} turns, ended: ${r.ended}${gaveUp}${retried}; slowest acknowledgement ${r.slowestAckMs === null ? "never" : `${r.slowestAckMs} ms`}; cost ${usd(r.agentUsage.costUsd)} agent + ${usd(r.testUsage.costUsd)} test`);
+    log(`${r.passed ? "PASS" : "FAIL"}  ${r.scenario} #${r.run} (${r.channel}) ${r.runId}: ${r.turns} turn${r.turns === 1 ? "" : "s"}, ended: ${r.ended}${gaveUp}${retried}; slowest acknowledgement ${r.slowestAckMs === null ? "never" : `${r.slowestAckMs} ms`}; cost ${usd(r.agentUsage.costUsd)} agent + ${usd(r.testUsage.costUsd)} test`);
     for (const c of r.checks.filter((c) => !c.pass)) log(`      ✗ ${c.kind}: ${c.text}\n        ${c.reason}`);
     log(`      watch: ${r.watch}`);
   };

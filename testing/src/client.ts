@@ -31,8 +31,8 @@ export interface ConnectOptions {
   openHeaders?: Record<string, string>;
   /** Called as each run finishes, before the session's summary. An older cloud sends none. */
   onRun?: (run: RunSummary) => void;
-  /** Called once the session has opened, with its dashboard link and its id. */
-  onDashboard?: (url: string, sessionId: string) => void;
+  /** Called once the session has opened, with its dashboard link, its id, and the cloud's id for the agent (a hosted cloud answers one). */
+  onDashboard?: (url: string, sessionId: string, agent?: string) => void;
   /** How long one POST waits before the size allowance. Default 30s, plus 1s per 100KB of body. A tool call waits {@link CLOUD_MODEL_BUDGET_MS} plus the simulator's latency, unless this is set. */
   postTimeoutMs?: number;
   /** How long the stream may sit with no bytes, including the cloud's 15s ping. Default 45s. */
@@ -43,6 +43,24 @@ export interface ConnectOptions {
   resumeWindowMs?: number;
   /** How often a resumable stream is replaced, before the tunnel's one-hour request cap. Default 50 minutes. */
   streamRefreshMs?: number;
+  /** The longest Retry-After a busy cloud's refused open is sent again after, once. Default 60s. */
+  openRetryCapMs?: number;
+  /** Also log slow event uploads. */
+  verbose?: boolean;
+}
+
+/** The open's answer; a hosted cloud also names its id for the agent the CI key belongs to. */
+type OpenAnswer = Opened & { agent?: string };
+
+/** The session opened, then the cloud ended it with a `failed` command. `code` is the reason's leading
+ * code (`capacity: ...` gives capacity), when it starts with one. */
+export class CloudEnded extends Error {
+  readonly code?: string;
+  constructor(error: string) {
+    super(`the cloud stopped the session: ${error}`);
+    this.name = "CloudEnded";
+    this.code = /^([a-z_]+):/.exec(error)?.[1];
+  }
 }
 
 /** The tunnel, the stream, or the connection failed after the session opened. `runs` are the ones already received. The CLI prints them and exits 2. */
@@ -227,6 +245,7 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
   const postTimeoutMs = options.postTimeoutMs ?? POST_TIMEOUT_MS;
   const streamIdleMs = options.streamIdleMs ?? STREAM_IDLE_MS;
   const retryBudgetMs = options.retryBudgetMs ?? RETRY_BUDGET_MS;
+  const openRetryCapMs = options.openRetryCapMs ?? OPEN_RETRY_CAP_MS;
   const resumeWindowMs = options.resumeWindowMs ?? RESUME_WINDOW_MS;
   const streamRefreshMs = options.streamRefreshMs ?? STREAM_REFRESH_MS;
   let idempotent = false;
@@ -324,7 +343,7 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
         throw new Error(`event upload failed; acceptance unknown, ${again}`, { cause: error });
       } finally {
         const roundtrip = Date.now() - started;
-        if (failed || roundtrip >= 1_000 || wait >= 1_000) {
+        if (failed || (options.verbose && (roundtrip >= 1_000 || wait >= 1_000))) {
           log(`event upload ${failed ? "failed" : "slow"}: roundtrip_ms=${roundtrip} count=${count} bytes=${bytes} queue_wait_ms=${wait}`);
         }
       }
@@ -357,7 +376,7 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
     reopen: true,
     ...(only ? { only } : {}),
   };
-  const opened = await post<Opened>(`${base}/api/sessions`, open, options.openHeaders, controller.signal, undefined, postTimeoutMs);
+  const opened = await openOnce(`${base}/api/sessions`, open, options.openHeaders, controller.signal, postTimeoutMs, openRetryCapMs, log);
   idempotent = opened.idempotency === true;
   openedId = opened.sessionId;
   reopenable = opened.reopen === true;
@@ -373,9 +392,9 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
       what: "file upload",
     });
   }
-  log(`Session ${opened.sessionId}: suite ${suiteHash(options.files).slice(0, 12)}, ${options.files.length} files (${uploads.length} uploaded).`);
+  log(`Session ${opened.sessionId}: suite ${suiteHash(options.files).slice(0, 12)}, ${options.files.length} files (${uploads.length} new to the cloud, the rest it already had).`);
   dashboard = opened.dashboard;
-  options.onDashboard?.(dashboard, opened.sessionId);
+  options.onDashboard?.(dashboard, opened.sessionId, typeof opened.agent === "string" && opened.agent ? opened.agent : undefined);
   log(`Watch it: ${opened.dashboard}`);
   session = `${tunnel}/api/sessions/${opened.sessionId}`;
 
@@ -503,7 +522,7 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
       if (!drained) await drainWork();
       return command.summary;
     } else if (command.type === "failed") {
-      throw new Error(`the cloud stopped the session: ${command.error}`);
+      throw new CloudEnded(command.error);
     }
   };
   /** The stream opened again after the last command handled, with backoff, until the resume window closes. */
@@ -587,7 +606,7 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
     if (error instanceof SessionStopped) throw error;
     const reason = failure ?? (error instanceof Error ? error : new Error(String(error)));
     // Exit 2 is a transport failure after the session exists. A refusal, or anything
-    // before the open answers, is the error itself (the CLI exits 1 and prints it alone).
+    // before the open answers, is the error itself (the CLI prints it alone and exits by its kind, report.ts).
     if (dashboard && isTransportFailure(reason)) {
       if (reopenable && saysGone(reason)) throw new SessionGone(reason.message, runs, dashboard, openedId);
       throw new SessionStopped(reason.message, runs, dashboard);
@@ -621,9 +640,7 @@ function openStream(url: string, headers: Record<string, string>, signal: AbortS
       response.on("data", (chunk: string) => { if (text.length < 4_096) text += chunk; });
       response.on("error", () => {});
       response.on("end", () => {
-        let code: string | undefined;
-        try { code = JSON.parse(text).error; } catch { /* the body was not JSON */ }
-        const cause = new PostError(url, status, text, typeof code === "string" ? code : undefined, retryAfterOf(flatHeaders(response.headers)));
+        const cause = new PostError(url, status, text, retryAfterOf(flatHeaders(response.headers)));
         reject(new Error(`could not open the stream (${status})`, { cause }));
       });
     });
@@ -632,15 +649,40 @@ function openStream(url: string, headers: Record<string, string>, signal: AbortS
   });
 }
 
-class PostError extends Error {
+/** The cloud answered a call with a status that is not 2xx. `code` is a JSON `error` string (the tunnel's
+ * refusals, which retries go by); `type` is a JSON `error` object's type (a hosted cloud's front door). */
+export class PostError extends Error {
   readonly status: number;
   readonly code?: string;
+  readonly type?: string;
   readonly retryAfterMs?: number;
-  constructor(url: string, status: number, text: string, code?: string, retryAfterMs?: number) {
+  constructor(url: string, status: number, text: string, retryAfterMs?: number) {
     super(`${url}: ${status} ${shown(text)}`);
+    this.name = "PostError";
     this.status = status;
-    this.code = code;
+    let error: unknown;
+    try { error = (JSON.parse(text) as { error?: unknown }).error; } catch { /* the body was not JSON */ }
+    if (typeof error === "string") this.code = error;
+    else if (error && typeof error === "object" && typeof (error as { type?: unknown }).type === "string") this.type = (error as { type: string }).type;
     this.retryAfterMs = retryAfterMs;
+  }
+}
+
+const OPEN_RETRY_CAP_MS = 60_000;
+
+/** The open, sent once more when the cloud is busy (a 429 that is not the spend cap, or a 503 capacity)
+ * and its Retry-After is at most `capMs`. */
+async function openOnce(url: string, body: OpenSession, headers: Record<string, string> | undefined, signal: AbortSignal, timeoutMs: number, capMs: number, log: (line: string) => void): Promise<OpenAnswer> {
+  try {
+    return await post<OpenAnswer>(url, body, headers, signal, undefined, timeoutMs);
+  } catch (error) {
+    if (!(error instanceof PostError) || error.retryAfterMs === undefined || error.retryAfterMs > capMs) throw error;
+    const why = error.type ?? error.code;
+    const busy = (error.status === 429 && why !== "spend_cap") || (error.status === 503 && why === "capacity");
+    if (!busy) throw error;
+    log(`The cloud is busy (${error.status}${why ? ` ${why}` : ""}); trying once more in ${Math.ceil(error.retryAfterMs / 1000)} s.`);
+    await pause(error.retryAfterMs, signal);
+    return await post<OpenAnswer>(url, body, headers, signal, undefined, timeoutMs);
   }
 }
 
@@ -655,7 +697,7 @@ function unavailable(error: unknown): boolean {
 }
 
 /** The tunnel, the stream, or the connection, as opposed to a refusal the cloud wrote as JSON. */
-function isTransportFailure(error: unknown): boolean {
+export function isTransportFailure(error: unknown): boolean {
   let current: unknown = error;
   for (let guard = 0; current instanceof Error && guard < 6; guard++) {
     if (current instanceof TimeoutError || current instanceof StreamLost) return true;
@@ -830,9 +872,7 @@ async function post<T = unknown>(url: string, body: unknown, headers: Record<str
   const payload = serialized ?? JSON.stringify(body ?? {});
   const { status, text, headers: responseHeaders } = await requestOnce(url, payload, headers, signal, postBudgetMs(timeoutMs, Buffer.byteLength(payload)));
   if (status < 200 || status >= 300) {
-    let code: string | undefined;
-    try { code = JSON.parse(text).error; } catch { /* the body was not JSON */ }
-    throw new PostError(url, status, text, code, retryAfterOf(responseHeaders));
+    throw new PostError(url, status, text, retryAfterOf(responseHeaders));
   }
   return (text ? JSON.parse(text) : {}) as T;
 }
