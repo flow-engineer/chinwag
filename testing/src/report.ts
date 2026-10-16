@@ -25,6 +25,8 @@ export interface ReportRun {
   channel: string;
   run: number;
   verdict: Verdict;
+  /** The cloud's code when it could not play or judge the run (judge_failed, spend_cap, ...); else null. */
+  error: string | null;
   ended: string | null;
   turns: number | null;
   watch: string | null;
@@ -45,6 +47,13 @@ export interface JsonReport {
   counts: { runs: number; passed: number; failed: number; errored: number; notPlayed: number };
   costUsd: { agent: number; test: number };
   runs: ReportRun[];
+}
+
+/** A run's verdict: errored when the cloud names an error for it or ended it run_failed, since the cloud
+ * could not play or judge it and that says nothing about the agent (a judge_failed run can end goal_met). */
+export function runVerdict(run: { passed: boolean; ended: string; error?: string }): Exclude<Verdict, "not_played"> {
+  if (run.error || run.ended === "run_failed") return "errored";
+  return run.passed ? "passed" : "failed";
 }
 
 export const EXIT: Record<Outcome, number> = { passed: 0, failed: 1, invalid: 1, errored: 2, transport: 2, refused: 3, interrupted: 130 };

@@ -95,8 +95,10 @@ connects out to the cloud, which plays the person and the tools and judges.
    address, shows every session over time and each scenario's history.
 4. `--json` prints one JSON report on stdout at the end, whatever the exit (everything else goes to
    stderr): `outcome`, `exitCode`, `sessionId`, `agent`, `error`, `counts`, `costUsd` and per run
-   `runId`, `scenario`, `channel`, `run`, `verdict`, `ended`, `turns`, `watch` and `failedChecks`
-   (`kind`, `text` and the judge's `reason`). Each session that opened also leaves
+   `runId`, `scenario`, `channel`, `run`, `verdict`, `error` (the cloud's code when it could not play
+   or judge the run, such as `judge_failed`; the run is then `errored` and its line reads `ERROR`,
+   whatever it ended as), `ended`, `turns`, `watch` and `failedChecks` (`kind`, `text` and the judge's
+   `reason`). Each session that opened also leaves
    `.chinwag/last-session.json` in the agent's folder (its path is printed on every exit): `sessionId`,
    `agent`, `dashboard`, `suiteHash`, `endedAt`, `ended` (`finished`, `stopped` or `interrupted`),
    `only` (the scenarios it was limited to, else `null`) and per run `scenario` (file name without

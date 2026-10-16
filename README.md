@@ -274,13 +274,13 @@ Each run's line carries its id (`FAIL  latte-correction #1 (whatsapp) trn_…: 6
   "costUsd": { "agent": 0.0123, "test": 0.0456 },
   "runs": [
     { "runId": "trn_…", "scenario": "latte-correction", "channel": "whatsapp", "run": 1, "verdict": "failed",
-      "ended": "goal_met", "turns": 6, "watch": "https://…",
+      "error": null, "ended": "goal_met", "turns": 6, "watch": "https://…",
       "failedChecks": [{ "kind": "judge", "text": "The agent asks Sam to confirm before placing the order.", "reason": "…" }] }
   ]
 }
 ```
 
-`outcome` is `passed` (exit 0), `failed` or `invalid` (1), `errored` or `transport` (2), `refused` (3) or `interrupted` (130). `error` is `{ "message", "status", "type", "retryAfterSeconds" }` when the session did not finish (`type` is the cloud's code, such as `spend_cap`; the others are `null` when it did not say).
+`outcome` is `passed` (exit 0), `failed` or `invalid` (1), `errored` or `transport` (2), `refused` (3) or `interrupted` (130). A run's `verdict` is `errored` whenever the cloud names an `error` for it (such as `judge_failed`, `simulator_failed` or `spend_cap`), whatever it `ended` as: the cloud could not play or judge it, so it says nothing about the agent. Its line reads `ERROR` instead of `PASS` or `FAIL`, and the run's `error` is that code (else `null`). `error` is `{ "message", "status", "type", "retryAfterSeconds" }` when the session did not finish (`type` is the cloud's code, such as `spend_cap`; the others are `null` when it did not say).
 
 `--only latte-correction,order-fails` runs only those scenarios (file names without `.yaml`); every tool file still goes. Once the session has opened, every exit (0, 1, 2, 3 or 130) writes `.chinwag/last-session.json` in the agent's folder and prints its path; `chinwag new` git-ignores `.chinwag/`. It holds what each run ended as and the judge's reasons, never the messages (a reason can quote one, which is why the file stays on your machine; the suite is synthetic by `--synthetic`):
 

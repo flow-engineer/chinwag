@@ -28,7 +28,7 @@ import { runPrinter } from "./print-run.ts";
 import { checkEndpointCli } from "./check-endpoint.ts";
 import { httpAgent } from "./http-agent.ts";
 import { newStandalone, packageRoot } from "./new.ts";
-import { EXIT, finishedOutcome, loadEnv, networkCode, reportError, stoppedOutcome, type JsonReport, type Outcome, type ReportRun, type Verdict } from "./report.ts";
+import { EXIT, finishedOutcome, loadEnv, networkCode, reportError, runVerdict, stoppedOutcome, type JsonReport, type Outcome, type ReportRun, type Verdict } from "./report.ts";
 import { LAST_SESSION, SHOW_LINE, showCli, type LastSession } from "./show.ts";
 import { loadSuite, parseScenario, parseToolFile, suiteHash } from "./suite.ts";
 import type { RunSummary } from "./protocol.ts";
@@ -292,17 +292,19 @@ try {
 
 say("");
 for (const r of summary.runs) printRun(r);
-const passed = summary.runs.filter((r) => r.passed).length;
+const passed = summary.runs.filter((r) => runVerdict(r) === "passed").length;
+const errored = summary.runs.filter((r) => runVerdict(r) === "errored").length;
 const total = (pick: (r: (typeof summary.runs)[number]) => number) => summary.runs.reduce((n, r) => n + pick(r), 0);
 const agentModels = [...new Set(summary.runs.flatMap((r) => r.agentModels))].join(", ") || "unknown";
 const noModel = summary.runs.filter((r) => r.agentModels.length === 0 && r.agentUsage.input + r.agentUsage.output === 0).length;
 const modelCalls = noModel ? `${noModel} ${noModel === 1 ? "run never called" : "runs never called"} the agent's model.` : "Every run called the agent's model.";
-const checkFails = summary.runs.filter((r) => r.checks.some((c) => !c.pass)).length;
+const checkFails = summary.runs.filter((r) => runVerdict(r) === "failed" && r.checks.some((c) => !c.pass)).length;
+const erroredLine = errored ? ` ${errored} errored (the cloud could not play or judge ${errored === 1 ? "it" : "them"}).` : "";
 const tokens = (n: number) => n.toLocaleString("en-US");
-say(`\n${passed} of ${summary.runs.length} runs passed. ${modelCalls} ${checkFails} failed a check. Agent: ${agentModels}; person, tools and judge: ${summary.testModel}.`);
+say(`\n${passed} of ${summary.runs.length} runs passed.${erroredLine} ${modelCalls} ${checkFails} failed a check. Agent: ${agentModels}; person, tools and judge: ${summary.testModel}.`);
 for (const channel of [...new Set(summary.runs.map((r) => r.channel))]) {
   const runs = summary.runs.filter((r) => r.channel === channel);
-  say(`  ${channel}: ${runs.filter((r) => r.passed).length} of ${runs.length} passed`);
+  say(`  ${channel}: ${runs.filter((r) => runVerdict(r) === "passed").length} of ${runs.length} passed`);
 }
 if (summary.lost) say(`The cloud lost session ${summary.lost.sessionId} part way; a second session played its unfinished runs. The first: ${summary.lost.dashboard}`);
 say(`Cost: ${usd(total((r) => r.agentUsage.costUsd))} agent (${tokens(total((r) => r.agentUsage.input))} in, ${tokens(total((r) => r.agentUsage.output))} out) + ${usd(total((r) => r.testUsage.costUsd))} test models.\n${summary.dashboard}`);
@@ -334,8 +336,8 @@ function mergedRuns(received: RunSummary[]): Merged[] {
     scenario,
     channel: r.channel,
     run: r.run,
-    // run_failed: the cloud could not play or judge the run, which says nothing about the agent.
-    verdict: r.ended === "run_failed" ? "errored" : r.passed ? "passed" : "failed",
+    // An error or run_failed: the cloud could not play or judge the run, which says nothing about the agent.
+    verdict: runVerdict(r),
     summary: r,
   });
   const out: Merged[] = [];
@@ -404,6 +406,7 @@ function end(outcome: Outcome, options: { received?: RunSummary[]; error?: JsonR
       channel: m.channel,
       run: m.run,
       verdict: m.verdict,
+      error: m.summary?.error || null,
       ended: m.summary?.ended ?? null,
       turns: m.summary?.turns ?? null,
       watch: m.summary?.watch || null,

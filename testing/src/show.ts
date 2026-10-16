@@ -77,7 +77,7 @@ interface RunRecord {
   checks?: Array<{ kind?: string; text?: string; pass?: boolean; reason?: string }>;
   error?: unknown;
   detail?: unknown;
-  summary?: { passed?: boolean; ended?: string; turns?: number; watch?: string };
+  summary?: { passed?: boolean; ended?: string; turns?: number; watch?: string; error?: string };
 }
 
 type Line =
@@ -234,11 +234,13 @@ function render(record: RunRecord, runId: string): string[] {
   const s = record.summary ?? {};
   const checks = record.checks ?? [];
   const passed = s.passed ?? (checks.length > 0 && checks.every((c) => c.pass));
-  const verdict = s.ended === "run_failed" ? "ERROR" : passed ? "PASS" : "FAIL";
+  // An error (judge_failed, spend_cap, ...) or run_failed: the cloud could not play or judge the run.
+  const error = record.error ?? s.error;
+  const verdict = error || s.ended === "run_failed" ? "ERROR" : passed ? "PASS" : "FAIL";
   const where = record.scenario?.path ?? record.scenario?.id ?? "?";
   out.push(`${verdict}  ${where}${record.scenario?.title ? ` (${record.scenario.title})` : ""}`);
   out.push(`  channel ${record.channel ?? "?"}, run ${record.run ?? "?"}, ${record.runId ?? runId}; ended: ${s.ended ?? "?"}${s.turns === undefined ? "" : `, ${s.turns} turn${s.turns === 1 ? "" : "s"}`}`);
-  if (record.error) out.push(`  error: ${typeof record.error === "string" ? record.error : brief(record.error)}`);
+  if (error) out.push(`  error: ${typeof error === "string" ? error : brief(error)} (the cloud could not play or judge this run; it says nothing about the agent)`);
   if (checks.length) {
     out.push("", "Checks:");
     for (const c of [...checks.filter((c) => !c.pass), ...checks.filter((c) => c.pass)]) {
