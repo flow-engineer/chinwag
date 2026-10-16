@@ -65,6 +65,14 @@ export interface AgentOptions {
   /** Quiet time after a message before the reply starts, to catch quick bursts. Default 300 ms. */
   debounceMs?: number;
   maxSteps?: number;
+  /**
+   * How much of a long conversation each model call carries. The latest messages are kept, older
+   * ones are left out (the agent is told so), and what it pinned about the person is always in its
+   * instructions. `maxTokens` is the whole call's budget, roughly: default 60% of the model's
+   * `contextTokens` when it gives one, else 50,000. A tool result is cut to `toolResultChars`
+   * characters (default 12,000).
+   */
+  history?: { maxTokens?: number; toolResultChars?: number };
   events?: EventSink[];
   /** This agent's id in the database (several agents can share one). Default "default". */
   id?: string;
@@ -212,6 +220,8 @@ export class Agent {
       partialAfterMs: options.partialAfterMs ?? 5_000,
       debounceMs: options.debounceMs ?? 300,
       maxSteps: options.maxSteps ?? 8,
+      historyTokens: options.history?.maxTokens ?? (options.model.contextTokens ? Math.floor(options.model.contextTokens * 0.6) : 50_000),
+      toolResultChars: options.history?.toolResultChars ?? 12_000,
       maxRestarts: Number.POSITIVE_INFINITY,
       talk: {
         shareUpdates: options.shareUpdates !== false,

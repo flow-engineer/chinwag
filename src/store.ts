@@ -77,6 +77,10 @@ const MIGRATIONS: Array<(t: Types) => string> = [
      agent_id TEXT NOT NULL, channel TEXT NOT NULL, message_id TEXT NOT NULL, conversation_id TEXT NOT NULL, at ${t.int} NOT NULL,
      PRIMARY KEY (agent_id, channel, message_id));
    ALTER TABLE conversations ADD COLUMN turns INTEGER NOT NULL DEFAULT 0`,
+  // What the agent pinned about a person: in its instructions every turn, however long the chat.
+  (t) => `CREATE TABLE pins (
+     agent_id TEXT NOT NULL, id TEXT NOT NULL, conversation_id TEXT NOT NULL, text TEXT NOT NULL, created_at ${t.int} NOT NULL,
+     PRIMARY KEY (agent_id, id))`,
 ];
 
 export interface ConversationRow {
@@ -249,7 +253,7 @@ export class Store {
     const scope = [this.agentId, conversationId];
     await this.db.transaction(async (tx) => {
       await tx.run("DELETE FROM schedule_runs WHERE agent_id = ? AND schedule_id IN (SELECT id FROM schedules WHERE agent_id = ? AND conversation_id = ?)", [this.agentId, ...scope]);
-      for (const table of ["schedules", "nudges", "no_contact", "background_tools", "inbox", "messages", "inbound", "identities"]) {
+      for (const table of ["schedules", "nudges", "no_contact", "pins", "background_tools", "inbox", "messages", "inbound", "identities"]) {
         await tx.run(`DELETE FROM ${table} WHERE agent_id = ? AND conversation_id = ?`, scope);
       }
       await tx.run("DELETE FROM conversations WHERE agent_id = ? AND id = ?", scope);
@@ -428,6 +432,21 @@ export class Store {
 
   async settleNudge(id: string, status: string, reason?: string): Promise<void> {
     await this.db.run("UPDATE nudges SET status = ?, reason = ? WHERE agent_id = ? AND id = ?", [status, reason ?? null, this.agentId, id]);
+  }
+
+  // What the agent pinned about a person.
+
+  async addPin(conversationId: string, id: string, text: string): Promise<void> {
+    await this.db.run("INSERT INTO pins (agent_id, id, conversation_id, text, created_at) VALUES (?, ?, ?, ?, ?)", [this.agentId, id, conversationId, text, Date.now()]);
+  }
+
+  async removePin(conversationId: string, id: string): Promise<boolean> {
+    return (await this.db.run("DELETE FROM pins WHERE agent_id = ? AND conversation_id = ? AND id = ?", [this.agentId, conversationId, id])) > 0;
+  }
+
+  async pins(conversationId: string): Promise<Array<{ id: string; text: string }>> {
+    const rows = await this.db.query("SELECT id, text FROM pins WHERE agent_id = ? AND conversation_id = ? ORDER BY created_at, id", [this.agentId, conversationId]);
+    return rows.map((r) => ({ id: String(r.id), text: String(r.text) }));
   }
 
   // What a person asked not to be messaged about.

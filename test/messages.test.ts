@@ -114,3 +114,34 @@ test("a message the provider sends again (a webhook retried) is taken once", asy
   assert.equal(h.calls.length, 1, "no turn for the repeat");
   assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2);
 });
+
+test("a long conversation sends the model only its latest messages that fit, and what the agent pinned always", async () => {
+  const report = tool({ name: "report", description: "", input: z.object({}), run: () => "x".repeat(5_000) });
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, tools: [report], history: { maxTokens: 5_000, toolResultChars: 1_000 } });
+  const a = await h.message("sms", "+15550100100", "I'm Sam, allergic to nuts");
+  (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Noted, Sam." }), call("pin", { text: "Sam, allergic to nuts" })));
+  (await h.nextCall(1)).answer(respond());
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  for (let i = 0; i < 8; i++) {
+    await h.message("sms", "+15550100100", `${i}: ${"a long story ".repeat(120)}`);
+    (await h.nextCall(2 + i)).answer(respond(call("send_sms", { text: "Mm." })));
+    await h.agent.conversation(a!.conversationId)!.whenIdle();
+  }
+  await h.message("sms", "+15550100100", "what can I eat?");
+  const ask = await h.nextCall(10);
+  const sent = ask.request.messages;
+  assert.match(sent[0].role === "user" ? sent[0].content : "", /^\[Chinwag\] Older messages of this conversation are no longer shown/);
+  assert.equal(sent[1].role, "user", "it starts at the start of an entry, never at a tool result");
+  assert.ok(!sent.some((m) => m.role === "user" && m.content.includes("allergic")), "the first message is left out");
+  assert.match(users(sent).at(-1)!, /what can I eat\?$/);
+  assert.match(ask.request.system, /What you pinned about them\n- \[pin_\w+\] Sam, allergic to nuts/);
+  const chars = ask.request.system.length + JSON.stringify(ask.request.tools).length + sent.reduce((n, m) => n + (m.content?.length ?? 0) + (m.role === "assistant" ? JSON.stringify(m.toolCalls ?? []).length : 0), 0);
+  assert.ok(chars / 3 <= 5_000, `within the budget (${Math.round(chars / 3)} tokens)`);
+  assert.ok(h.events.some((e) => e.type === "history.trimmed"));
+
+  ask.answer(respond(call("send_sms", { text: "Checking." }), call("report")));
+  const result = await h.nextCall(11);
+  assert.match(last(result.request.messages).content, /^x{1000}\n\[Chinwag\] Cut: the result was 5000 characters; only the first 1000 are shown\.$/);
+  result.answer(respond(call("send_sms", { text: "Anything without nuts." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+});

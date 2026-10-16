@@ -161,7 +161,9 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 
 Built in, so don't build them as tools: scheduled messages (`schedule_message`, `list_scheduled`,
 `cancel_scheduled`, in the person's local time), and what a person asked not to be messaged about
-(`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
+(`add_no_contact`, `remove_no_contact`), and facts kept about a person however long the chat gets
+(`pin`, `unpin`: older messages are left out of a long chat's model calls, pinned notes never).
+STOP, START and HELP are built in on `sms()` and
 `whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
 no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
 

@@ -336,7 +336,7 @@ The café's agent as an HTTP endpoint, with its two tools and one model through 
 
 ## Models
 
-Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`.
+Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`. Give `contextTokens` (the model's window) and a long chat's history is kept within it: the latest messages go to every call, older ones are left out (the agent is told), and what it pinned about the person (`pin`, `unpin`, built in) is in its instructions every turn.
 
 For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku-5.5`) or **GPT-6.1 Sol** (`openai/gpt-6.1-sol`, about 3x the cost). In our tests, GPT Luna repeated tool calls and answered twice.
 
@@ -362,6 +362,7 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `partialAfterMs` | How long a finished tool's result waits for the others (5,000) |
 | `debounceMs` | Quiet time after a message before the reply starts (300) |
 | `maxSteps` | Model steps per turn (8) |
+| `history` | How much of a long chat each model call carries: `{ maxTokens, toolResultChars }` (60% of the model's `contextTokens`, else 50,000 tokens; tool results cut at 12,000 characters) |
 | `inlineSkills` | Put every skill in the prompt instead of loading on demand |
 | `shareUpdates` | Live status lines on web and app UIs (on); a string replaces the guidance |
 | `traces` | Where traces go (from the environment by default, see above) |

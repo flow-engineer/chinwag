@@ -28,7 +28,8 @@ export interface ChinwagEvent {
     | "reaction.in"
     | "attachment.failed"
     | "keyword"
-    | "message.duplicate";
+    | "message.duplicate"
+    | "history.trimmed";
   conversationId: string;
   at: number;
   [detail: string]: unknown;

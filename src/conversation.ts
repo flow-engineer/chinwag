@@ -35,14 +35,14 @@
 
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import type { z } from "zod";
+import { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
 import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
-import { render, toSpec, type Tool } from "./tools.ts";
+import { render, tool, toSpec, type Tool } from "./tools.ts";
 import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, PersonMessage, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
@@ -62,6 +62,10 @@ export interface ConversationSettings {
   partialAfterMs: number;
   debounceMs: number;
   maxSteps: number;
+  /** About how many tokens one model call may carry (instructions, tools and history). */
+  historyTokens: number;
+  /** The longest a tool result is kept, in characters. */
+  toolResultChars: number;
   /** How many times one step restarts for new messages before it lets the step finish. */
   maxRestarts: number;
   talk: TalkSettings;
@@ -100,6 +104,9 @@ const ACKNOWLEDGE_FIRST =
   "(react to their message or send a short line) and make your tool calls again.";
 const INTERRUPTED = "[Chinwag] Cut off by a restart: this may or may not have happened. Check before you rely on it.";
 const APOLOGY = "Sorry, something went wrong on my side. Could you send that again?";
+const EARLIER = "[Chinwag] Older messages of this conversation are no longer shown to you. What you pinned about them is in your instructions.";
+/** The most notes the agent may pin about one person. */
+const PINS_MAX = 20;
 const NOT_SHOWN = "[Chinwag] You are no longer shown the photos or documents in these messages; ask them to send one again if you need it.";
 
 /** Photos and PDFs the model is shown at once, the latest; each is resent on every model call. */
@@ -230,6 +237,8 @@ export class Conversation {
   private closed = false;
   /** This turn took in a message from the person: if it fails, they are told. */
   private theirMessages = false;
+  /** History entries left out of the latest model call (0: none), so a change is an event once. */
+  private leftOut = 0;
   /** They texted STOP (as of the latest look): what the business starts is dropped, with no model call. */
   private stop: NoContactRow | null = null;
 
@@ -257,6 +266,7 @@ export class Conversation {
         agentZone: settings.timeZone,
       }),
       ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone ?? settings.timeZone ?? "UTC" }),
+      ...pinTools(settings.store, id),
     ];
     this.builtins = new Map(builtins.map((t) => [t.name, t]));
     this.builtinSpecs = builtins.map(toSpec);
@@ -714,6 +724,7 @@ export class Conversation {
       }
     }
     const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC");
+    const pinned = pinsSection(await store.pins(this.id));
     // A message that came while those loaded had no step to restart: it joins the first one.
     this.absorb();
     let restarts = 0;
@@ -728,14 +739,14 @@ export class Conversation {
       const views = this.views();
       const several = views.length > 1;
       this.sendTools = new Map(views.map((v) => [sendToolName(v.name), v.name]));
-      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, context].filter(Boolean).join("\n\n");
+      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, pinned, context].filter(Boolean).join("\n\n");
       const specs = [...this.settings.specs, ...this.builtinSpecs, ...talkSpecs(views, this.settings.talk)];
       const abort = new AbortController();
       if (restarts < this.settings.maxRestarts) this.stepAbort = abort;
       const callStarted = Date.now();
       let response;
       try {
-        response = await this.settings.model.complete({ system, messages: this.history.map(forModel), tools: specs, signal: abort.signal });
+        response = await this.settings.model.complete({ system, messages: this.window(system, specs), tools: specs, signal: abort.signal });
       } catch (error) {
         if (!abort.signal.aborted) throw error;
       } finally {
@@ -818,7 +829,7 @@ export class Conversation {
       const problems = said.some((s) => s.refused);
       const results = new Map<string, string>();
       talk.forEach((call, i) => results.set(call.id, said[i].content));
-      work.forEach((call, i) => results.set(call.id, done[i]));
+      work.forEach((call, i) => results.set(call.id, this.capped(done[i])));
       for (const call of response.toolCalls) {
         this.history.push({ role: "tool", toolCallId: call.id, content: results.get(call.id) ?? "" });
       }
@@ -1029,6 +1040,36 @@ export class Conversation {
     settle("sent");
   }
 
+  /**
+   * The history the model is sent: all of it while it fits the budget, else the latest entries
+   * that do, from the start of one (never between a call and its result), after a line that says
+   * older ones are left out. The latest turn always goes, however long.
+   */
+  private window(system: string, specs: ToolSpec[]): ChatMessage[] {
+    const all = this.history.map(forModel);
+    let room = this.settings.historyTokens - tokens(system) - tokens(JSON.stringify(specs)) - tokens(EARLIER);
+    let start = all.length;
+    for (let i = all.length - 1; i >= 0; i--) {
+      room -= size(all[i]);
+      if (room < 0) break;
+      if (all[i].role === "user") start = i;
+    }
+    if (room >= 0) start = 0;
+    else if (start === all.length) start = Math.max(0, all.findLastIndex((m) => m.role === "user"));
+    if (start !== this.leftOut) {
+      this.leftOut = start;
+      if (start) this.settings.emit(this.id, "history.trimmed", { leftOut: start, kept: all.length - start });
+    }
+    return start ? [{ role: "user", content: EARLIER }, ...all.slice(start)] : all;
+  }
+
+  /** A tool result as the history keeps it: cut at toolResultChars, saying so. */
+  private capped(text: string): string {
+    const max = this.settings.toolResultChars;
+    if (text.length <= max) return text;
+    return `${text.slice(0, max)}\n[Chinwag] Cut: the result was ${text.length} characters; only the first ${max} are shown.`;
+  }
+
   /** The send tools the agent has right now, for Chinwag's notes: "send_sms", or "send_sms or send_app". */
   private sendToolsNow(): string {
     return [...this.channels.keys()].map((c) => sendToolName(c)).join(" or ");
@@ -1138,7 +1179,7 @@ export class Conversation {
       this.tasks.delete(task.id);
       this.persist(() => this.settings.store.removeTask(this.id, task.id));
       this.settings.emit(this.id, "task.done", { callId: call.id, tool: call.name, task: task.id, ms: Date.now() - startedAt, ok: result.ok, output: clipOutput(result.text) });
-      this.note(`[Background result: ${call.name} (${task.id})] ${result.text}\n[Chinwag] They have not seen this result: tell them with ${this.sendToolsNow()}.`);
+      this.note(`[Background result: ${call.name} (${task.id})] ${this.capped(result.text)}\n[Chinwag] They have not seen this result: tell them with ${this.sendToolsNow()}.`);
       this.checkIdle();
     });
     return (
@@ -1272,6 +1313,47 @@ function personMessages(entry: Extract<ChatMessage, { role: "user" }>, only: str
     const text = rest.startsWith("] ") ? rest.slice(2) : tapped >= 0 ? rest.slice(tapped + 10) : rest.slice(rest.indexOf('"] ') + 3);
     return { id: m[2], channel: m[1] ?? only, text, ...(tapped >= 0 ? { choice: true } : {}) };
   });
+}
+
+/** About how many tokens a text is (a little over, for safety: 3 characters a token). */
+function tokens(text: string | null | undefined): number {
+  return Math.ceil((text?.length ?? 0) / 3);
+}
+
+/** About how many tokens a history entry takes, a photo or PDF shown counted as 1,500. */
+function size(entry: ChatMessage): number {
+  if (entry.role === "assistant") return tokens(entry.content) + tokens(JSON.stringify(entry.toolCalls ?? []));
+  if (entry.role === "tool") return tokens(entry.content);
+  return tokens(entry.content) + (entry.media?.filter((m) => m.data).length ?? 0) * 1_500;
+}
+
+/** Pin and unpin: what the agent keeps about a person outside the history, so it is never left out. */
+function pinTools(store: StoreApi, conversationId: string): Tool[] {
+  return [
+    tool({
+      name: "pin",
+      description: "Keep a short fact about this person that must not be lost however long the chat gets: their name, an allergy, a goal. Pinned notes are in your instructions every turn; old messages may not be.",
+      input: z.object({ text: z.string().min(1).max(300) }),
+      run: async ({ text }) => {
+        if ((await store.pins(conversationId)).length >= PINS_MAX) return { error: `They already have ${PINS_MAX} pinned notes. Unpin one first.` };
+        const id = `pin_${randomUUID().slice(0, 6)}`;
+        await store.addPin(conversationId, id, text);
+        return { pinned: { id, text } };
+      },
+    }),
+    tool({
+      name: "unpin",
+      description: "Remove a pinned note, by id, when it is no longer true.",
+      input: z.object({ id: z.string() }),
+      run: async ({ id }) => ({ removed: await store.removePin(conversationId, id) }),
+    }),
+  ];
+}
+
+/** The pinned notes as the agent reads them each turn; empty when there are none. */
+function pinsSection(pins: Array<{ id: string; text: string }>): string {
+  if (!pins.length) return "";
+  return ["## What you pinned about them", ...pins.map((p) => `- [${p.id}] ${p.text}`)].join("\n");
 }
 
 /** A photo or PDF as it is stored: named, without its bytes. */

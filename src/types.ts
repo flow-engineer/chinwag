@@ -63,6 +63,8 @@ export interface ModelResponse {
 /** Any model behind Chinwag. `complete` must reject promptly when `signal` aborts. */
 export interface Model {
   complete(request: ModelRequest): Promise<ModelResponse>;
+  /** Its context window in tokens, when known: each call is kept well within it (see `history`). */
+  contextTokens?: number;
   /** What it reads besides text, as `media` on the person's messages. Without it: text only, and a note for each photo or PDF. */
   reads?: { images?: boolean; pdfs?: boolean };
 }
