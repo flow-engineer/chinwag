@@ -226,6 +226,9 @@ export class Agent {
     this.options = options;
     this.channelsByName = new Map((options.channels ?? []).map((c) => [c.name, c]));
     if (this.channelsByName.size !== (options.channels ?? []).length) throw new Error("chinwag: two channels have the same name");
+    // A person's key is "key:<resolve's value>", "phone:<number>" or "<channel>:<address>": a channel
+    // named key or phone would make a channel identity read as one of the other two.
+    for (const name of ["key", "phone"]) if (this.channelsByName.has(name)) throw new Error(`chinwag: "${name}" is reserved; give the channel another name`);
     this.now = options.now ?? Date.now;
     if (options.defaultCountryCode !== undefined && !/^\+?[1-9]\d{0,2}$/.test(options.defaultCountryCode.trim())) throw new Error(`chinwag: defaultCountryCode is a calling code such as "+91", not "${options.defaultCountryCode}"`);
     this.countryCode = options.defaultCountryCode?.trim().replace(/^\+/, "");
