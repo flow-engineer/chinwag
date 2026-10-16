@@ -714,7 +714,10 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
     if (req.method === "GET" && path === "/api/person") {
       if (!agent.contact || !agent.outbox) return json(res, 404, { error: "this agent has no contact record" });
       const id = await agent.testConversation(person.phone);
-      return json(res, 200, { now: options.clock?.now() ?? Date.now(), contact: await agent.contact(to), outbox: id ? await agent.outbox(id) : { schedules: [], held: [] } });
+      // One person on every channel: their record from whichever channel they have written on.
+      let contact = await agent.contact(to);
+      for (const c of agent.channels()) contact ??= await agent.contact({ channel: c.name, address: c.kind === "custom" ? `test:${person.phone}` : person.phone });
+      return json(res, 200, { now: options.clock?.now() ?? Date.now(), contact, outbox: id ? await agent.outbox(id) : { schedules: [], held: [] } });
     }
     if (req.method === "POST" && path === "/api/nudge") {
       if (!agent.recordNudge) return json(res, 404, { error: "this agent takes no nudges" });
