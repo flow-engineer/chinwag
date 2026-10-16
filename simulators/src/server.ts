@@ -30,7 +30,7 @@
 //
 // The person's messages have the agent's ids (m1, m2, ...); the agent's messages get a1, a2, ...
 
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -55,6 +55,7 @@ import {
   type TestPerson,
   type TranscriptEntry,
 } from "../../src/index.ts";
+import { requireToken, sameSecret, wrongTries } from "../../src/http.ts";
 import { PLATFORMS, channelOf, platform as platformOf, smsSegments, type Platform } from "./platforms.ts";
 
 /** What the test cloud's simulators need from an agent. */
@@ -193,9 +194,6 @@ const MAX_BODY = 16_384;
 /** A message may carry files (base64): up to 4, about 11 MB in all, above the largest the agent reads (10 MB). */
 const MAX_MESSAGE_BODY = 15_000_000;
 const MAX_FILES = 4;
-/** Wrong tokens one address may try in a window before it is refused for the rest of it. */
-const MAX_FAILURES = 10;
-const FAILURE_WINDOW_MS = 15 * 60_000;
 const COOKIE = "chinwag_playground";
 /** The events kept per conversation for pollers, and how long one stays kept after nobody asked for it. */
 const RECENT_EVENTS = 500;
@@ -729,25 +727,17 @@ interface Gate {
  * `Authorization: Bearer`. Compared in constant time; wrong tokens are limited per address.
  */
 function tokenGate(token: string | undefined): Gate {
-  if (typeof token !== "string" || token.length < 32) throw new Error("chinwag simulators: a deployed playground needs a token of at least 32 characters");
-  const hash = (text: string) => createHash("sha256").update(text).digest();
-  const same = (given: string, wanted: string) => timingSafeEqual(hash(given), hash(wanted));
+  requireToken(token, "chinwag simulators: a deployed playground");
   // The cookie holds a value made from the token, not the token itself.
-  const session = hash(`chinwag-playground:${token}`).toString("hex");
-  const failures = new Map<string, { count: number; until: number }>();
+  const session = createHash("sha256").update(`chinwag-playground:${token}`).digest("hex");
+  const tries = wrongTries();
 
   return {
     allows(req, res, url, base) {
       const ip = req.socket.remoteAddress ?? "unknown";
-      const now = Date.now();
-      const failed = failures.get(ip);
-      if (failed && failed.until <= now) failures.delete(ip);
-      const blocked = (failures.get(ip)?.count ?? 0) >= MAX_FAILURES;
+      const blocked = tries.blocked(ip);
       const fail = () => {
-        for (const [k, v] of failures) if (v.until <= now) failures.delete(k);
-        const entry = failures.get(ip) ?? { count: 0, until: now + FAILURE_WINDOW_MS };
-        entry.count++;
-        failures.set(ip, entry);
+        tries.failed(ip);
         refuse(res, 401);
         return false;
       };
@@ -758,7 +748,7 @@ function tokenGate(token: string | undefined): Gate {
         return false;
       }
       if (query !== null) {
-        if (req.method !== "GET" || !same(query, token)) return fail();
+        if (req.method !== "GET" || !sameSecret(query, token)) return fail();
         url.searchParams.delete("token");
         const secure = (req.socket as TLSSocket).encrypted || req.headers["x-forwarded-proto"] === "https";
         const cookie = `${COOKIE}=${session}; Path=${base || "/"}; HttpOnly; SameSite=Strict${secure ? "; Secure" : ""}`;
@@ -766,9 +756,9 @@ function tokenGate(token: string | undefined): Gate {
         res.writeHead(303, { "set-cookie": cookie, location: url.pathname + (rest ? `?${rest}` : ""), "cache-control": "no-store" }).end();
         return false;
       }
-      if (bearer !== undefined) return same(bearer, token) ? true : fail();
+      if (bearer !== undefined) return sameSecret(bearer, token) ? true : fail();
       const cookie = (req.headers.cookie ?? "").split(/;\s*/).find((c) => c.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1);
-      if (cookie !== undefined && same(cookie, session)) return true;
+      if (cookie !== undefined && sameSecret(cookie, session)) return true;
       refuse(res, 401);
       return false;
     },
