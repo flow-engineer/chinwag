@@ -65,7 +65,7 @@ test("each turn is one trace: the person's ids and channel, its model calls, too
   assert.equal(request.headers.authorization, `Bearer ${KEY}`);
   assert.equal(request.headers["content-type"], "application/json");
   const [resourceSpans] = request.body.resourceSpans;
-  assert.deepEqual(attrs(resourceSpans.resource), { "service.name": "cafe", "telemetry.sdk.name": "chinwag", "service.version": "v7" });
+  assert.deepEqual(attrs(resourceSpans.resource), { "service.name": "cafe", "telemetry.sdk.name": "chinwag", "chinwag.run_kind": "production", "service.version": "v7" });
   const spans = resourceSpans.scopeSpans[0].spans;
   assert.equal(new Set(spans.map((s: any) => s.traceId)).size, 1, "one trace");
   assert.match(spans[0].traceId, /^[0-9a-f]{32}$/);
@@ -89,6 +89,24 @@ test("each turn is one trace: the person's ids and channel, its model calls, too
   assert.equal(tool["gen_ai.tool.call.arguments"], '{"day":"thursday"}');
   assert.equal(tool["gen_ai.tool.call.result"], "free on thursday");
   assert.ok(children.filter((s: any) => attrs(s)["gen_ai.operation.name"] === "chat").length >= 2, "a span per model call");
+});
+
+test("under chinwag test, every trace says it is a test's and names the test session, so it is kept apart from real conversations", async (t) => {
+  process.env.CHINWAG_RUN_KIND = "test";
+  process.env.CHINWAG_TEST_SESSION = "tse_01JTESTSESSION0000000000000";
+  t.after(() => {
+    delete process.env.CHINWAG_RUN_KIND;
+    delete process.env.CHINWAG_TEST_SESSION;
+  });
+  const endpoint = await fakeEndpoint();
+  const h = agentFor(endpoint.url, false);
+  await playTurn(h, "+15550100123");
+  const request = await endpoint.next(1);
+  endpoint.close();
+  const [resourceSpans] = request.body.resourceSpans;
+  assert.equal(attrs(resourceSpans.resource)["chinwag.run_kind"], "test");
+  const root = resourceSpans.scopeSpans[0].spans.find((s: any) => !s.parentSpanId);
+  assert.equal(attrs(root)["chinwag.test.session"], "tse_01JTESTSESSION0000000000000");
 });
 
 test("without content on, traces hold no text: no messages, replies, tool inputs or results", async () => {

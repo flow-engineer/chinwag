@@ -2,7 +2,7 @@
 // The chinwag command. `chinwag new <name>` makes ./<name>/, an agent started from the café example
 // (testing/src/new.ts). `chinwag test`, or `chinwag` with flags, runs an agent's tests in the cloud,
 // from the agent's folder:
-//   chinwag test [--cloud https://flow.engineer/observe] [--runs 3] [--only late-order,refund | --failed]
+//   chinwag test [--cloud https://flow.engineer/observe] [--runs 3] [--only late-order,refund | --failed] [--json]
 // A hosted cloud (any --cloud off this machine, the default included) needs the
 // agent's CI key in CHINWAG_CLOUD_KEY and --synthetic, the attestation that the test files hold no real
 // customer or member data. --agent-version (else GITHUB_SHA), --ref (else GitHub's branch) and
@@ -12,9 +12,11 @@
 // endpoint instead, with --agent-url (testing/src/http-agent.ts): its own tools run for real.
 // `chinwag check-endpoint <url>` checks such an endpoint against spec/ first (testing/src/check-endpoint.ts).
 // Once a session has opened, its results go to .chinwag/last-session.json in the agent's folder
-// (what each run ended as, never what was said), and --failed runs again the scenarios that did not pass.
+// (what each run ended as and the judge's reasons, never the messages), and --failed runs again the
+// scenarios that did not pass. --json prints one report (testing/src/report.ts) on stdout at every exit,
+// and `chinwag show <run>` prints one run's record from the cloud (testing/src/show.ts).
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, renameSync, writeFileSync, writeSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { basename, dirname, join } from "node:path";
@@ -26,6 +28,8 @@ import { runPrinter } from "./print-run.ts";
 import { checkEndpointCli } from "./check-endpoint.ts";
 import { httpAgent } from "./http-agent.ts";
 import { newStandalone, packageRoot } from "./new.ts";
+import { EXIT, finishedOutcome, loadEnv, networkCode, reportError, runVerdict, stoppedOutcome, type JsonReport, type Outcome, type ReportRun, type Verdict } from "./report.ts";
+import { LAST_SESSION, SHOW_LINE, showCli, type LastSession } from "./show.ts";
 import { loadSuite, parseScenario, parseToolFile, suiteHash } from "./suite.ts";
 import type { RunSummary } from "./protocol.ts";
 
@@ -45,6 +49,10 @@ const TEST_OPTIONS = `Options for test:
                            session (.chinwag/last-session.json), on every channel each plays.
                            Goes with --runs, not with --only
   --synthetic              Attest the test files hold no real customer data (a hosted cloud needs it)
+  --json                   Print one JSON report on stdout when it ends, whatever the exit; every
+                           other line goes to stderr
+  --dotenv <path>          Read the environment from this file instead of the folder's .env
+  --verbose                Also print slow event uploads
   --agent-version <v>      Kept with the session (default: GITHUB_SHA)
   --ref <ref>              Kept with the session (default: GitHub's branch)
   --environment <name>     staging or production, kept with the session
@@ -58,19 +66,24 @@ const TEST_OPTIONS = `Options for test:
 
 Exit status:
   0    Every run passed
-  1    A run failed, the cloud refused the session, or the session never opened.
-       The message is printed on its own
-  2    The tunnel, the stream, or the connection failed after the session opened.
-       The runs that had finished are printed, then "N of M runs finished before: <reason>"
-       and the dashboard link
+  1    A run failed. Or nothing was sent: a wrong flag, a test file that does not parse,
+       no CHINWAG_CLOUD_KEY. The message is printed on its own
+  2    The connection, the tunnel or the stream failed (before or after the session opened),
+       the cloud answered 5xx or no JSON, the cloud ended the session for its own failure, or
+       runs errored (the cloud could not play or judge them) and none failed. After the open:
+       the runs that had finished, then "N of M runs finished before: <reason>" and the dashboard
+  3    The cloud refused: the open (a bad or wrong key 401/403, an invalid request 400, busy
+       429 rate_limited, the spend cap 429 spend_cap, 503 capacity), or it ended the session
+       for the spend cap or capacity. A busy open with Retry-After up to 60 s is sent once more
   130  Interrupted (Ctrl-C). The same partial report as exit 2. The cloud keeps
        playing until it is stopped from the dashboard
 
 Results: once the session has opened, every exit writes .chinwag/last-session.json in the agent's
-folder: the session id, dashboard link, suite hash and time, and per run its scenario, channel,
-number, verdict (passed, failed, errored or not_played) and failed checks. No message text.
+folder: the session id, the cloud's agent id, dashboard link, suite hash and time, and per run its
+scenario, channel, number, run id, verdict (passed, failed, errored or not_played) and failed checks
+with the judge's reasons. Never the messages. The folder is git-ignored and the suite synthetic.
 
-Environment (also read from the agent folder's .env; variables already set win):
+Environment (also read from the agent folder's .env, or --dotenv; variables already set win):
   CHINWAG_CLOUD            The test cloud, when --cloud is not given
   CHINWAG_CLOUD_KEY        The agent's CI key, for a hosted cloud (oci_...: make one at
                            https://flow.engineer/observe, your agent, Developers)
@@ -78,18 +91,16 @@ Environment (also read from the agent folder's .env; variables already set win):
   OPENROUTER_API_KEY       The agent's model key, or OPENAI_API_KEY, ANTHROPIC_API_KEY or
                            GEMINI_API_KEY: the first with a value is used`;
 const TEST_USAGE = `Usage:\n${TEST_LINE}\n\n${TEST_OPTIONS}`;
-const USAGE = `Usage:\n${NEW_LINE}\n${TEST_LINE}\n${CHECK_LINE}\n  chinwag --version         Show the version\n\n${TEST_OPTIONS}`;
+const USAGE = `Usage:\n${NEW_LINE}\n${TEST_LINE}\n${SHOW_LINE}\n${CHECK_LINE}\n  chinwag --version         Show the version\n\n${TEST_OPTIONS}`;
 
 checkNode(process.versions.node);
 
-// The agent folder's .env (its model key, CHINWAG_CLOUD_KEY), when there is one; variables already
-// set win over the file, and no value is ever printed.
-if (process.argv[2] !== "new" && existsSync(".env")) process.loadEnvFile(".env");
-
-if (process.argv[2] === "check-endpoint") process.exit(await checkEndpointCli(process.argv.slice(3)));
-
-/** Where every session's results go, in the agent's folder; `chinwag new` git-ignores .chinwag/. */
-const LAST_SESSION = join(".chinwag", "last-session.json");
+if (process.argv[2] === "check-endpoint") {
+  // Its token may be in the agent folder's .env; no value is ever printed.
+  loadEnv(undefined);
+  process.exit(await checkEndpointCli(process.argv.slice(3)));
+}
+if (process.argv[2] === "show") process.exit(await showCli(process.argv.slice(3)));
 
 const TEST_FLAGS = {
   cloud: { type: "string" },
@@ -99,8 +110,11 @@ const TEST_FLAGS = {
   /** Only the scenarios that did not pass in .chinwag/last-session.json. */
   failed: { type: "boolean", default: false },
   synthetic: { type: "boolean", default: false },
-  "agent-version": { type: "string", default: process.env.GITHUB_SHA },
-  ref: { type: "string", default: process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME },
+  json: { type: "boolean", default: false },
+  dotenv: { type: "string" },
+  verbose: { type: "boolean", default: false },
+  "agent-version": { type: "string" },
+  ref: { type: "string" },
   environment: { type: "string" },
   "agent-url": { type: "string" },
   channel: { type: "string" },
@@ -137,37 +151,45 @@ if (command === "new") {
   process.exit(0);
 }
 
-if (command !== undefined && (command !== "test" || rest.length)) {
-  console.error(`chinwag: unknown command "${positionals.join(" ")}".\n\n${USAGE}`);
-  process.exit(1);
-}
+/** Every human line of `chinwag test`: stdout, or stderr with --json, where stdout is the report. */
+const say = values.json ? (line: string) => console.error(line) : (line: string) => console.log(line);
+
+// What the report says; filled in as the command gets that far.
+let files: ReturnType<typeof loadSuite> = [];
+let picked: Set<string> | undefined;
+let perScenario = 1;
+let sessionId = "";
+let dashboard = "";
+let agentId = "";
+const seen: RunSummary[] = [];
+
+if (command !== undefined && (command !== "test" || rest.length)) invalid(`chinwag: unknown command "${positionals.join(" ")}".\n\n${USAGE}`);
+
+const envProblem = loadEnv(values.dotenv);
+if (envProblem) invalid(envProblem);
 
 const runs = checkRuns(values.runs);
 const cloud = values.cloud || process.env.CHINWAG_CLOUD || OBSERVE_URL;
 const ciKey = process.env.CHINWAG_CLOUD_KEY || undefined;
 
-let openHeaders: Record<string, string>;
+let openHeaders: Record<string, string> = {};
 try {
   openHeaders = cloudHeaders({
     cloud,
     ciKey,
     synthetic: values.synthetic!,
-    agentVersion: values["agent-version"] || undefined,
-    ref: values.ref || undefined,
+    agentVersion: values["agent-version"] || process.env.GITHUB_SHA || undefined,
+    ref: values.ref || process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME || undefined,
     environment: values.environment,
   });
 } catch (error) {
   const where = !ciKey && cloud.replace(/\/+$/, "") === OBSERVE_URL ? ` Make a key at ${OBSERVE_URL}: your agent, Developers.` : "";
-  console.error(`${(error as Error).message}${where}`);
-  process.exit(1);
+  invalid(`${(error as Error).message}${where}`);
 }
 
 const dir = process.cwd();
 const agentUrl = values["agent-url"];
-if (!agentUrl && values.channel) {
-  console.error("--channel goes with --agent-url.");
-  process.exit(1);
-}
+if (!agentUrl && values.channel) invalid("--channel goes with --agent-url.");
 // The package name keeps the agent's history together; an agent tested by its URL may have none.
 const packageJson = join(dir, "package.json");
 const name = (existsSync(packageJson) ? (JSON.parse(readFileSync(packageJson, "utf8")) as { name?: string }).name : undefined) ?? (agentUrl ? basename(dir) : "agent");
@@ -178,25 +200,19 @@ const title = existsSync(prompt) ? /^#\s+(.+)$/m.exec(readFileSync(prompt, "utf8
 let agent: Pick<ConnectOptions, "tools" | "build">;
 if (agentUrl) {
   const timeout = Number(values["agent-timeout"]);
-  if (!/^https?:\/\/[^/]/.test(agentUrl) || !URL.canParse(agentUrl)) {
-    console.error("--agent-url must be an http:// or https:// URL, such as http://localhost:3000/chinwag.");
-    process.exit(1);
-  }
-  if (!(timeout > 0)) {
-    console.error("--agent-timeout must be a number of seconds above 0.");
-    process.exit(1);
-  }
+  if (!/^https?:\/\/[^/]/.test(agentUrl) || !URL.canParse(agentUrl)) invalid("--agent-url must be an http:// or https:// URL, such as http://localhost:3000/chinwag.");
+  if (!(timeout > 0)) invalid("--agent-timeout must be a number of seconds above 0.");
   const token = process.env.CHINWAG_AGENT_TOKEN || undefined;
   agent = { tools: [], build: ({ events }) => httpAgent({ url: agentUrl, token, channel: values.channel, timeoutMs: timeout * 1000, events }) };
 } else {
   if (!existsSync(join(dir, "src/agent.ts"))) {
-    console.error(`No src/agent.ts in ${dir}. Run chinwag test from your agent's folder, where src/agent.ts exports buildAgent({ model, events, tools }) and tools, or pass --agent-url to test an agent on another framework by its HTTP endpoint.`);
-    process.exit(1);
+    invalid(`No src/agent.ts in ${dir}. Run chinwag test from your agent's folder, where src/agent.ts exports buildAgent({ model, events, tools }) and tools, or pass --agent-url to test an agent on another framework by its HTTP endpoint.`);
   }
+  // Chinwag runs the agent here, so its traces are marked as a test's (src/traces.ts).
+  process.env.CHINWAG_RUN_KIND = "test";
   const module = await import(pathToFileURL(join(dir, "src/agent.ts")).href);
   if (typeof module.buildAgent !== "function" || !Array.isArray(module.tools)) {
-    console.error("src/agent.ts must export buildAgent({ model, events, tools }) and tools, or pass --agent-url to test an agent by its HTTP endpoint.");
-    process.exit(1);
+    invalid("src/agent.ts must export buildAgent({ model, events, tools }) and tools, or pass --agent-url to test an agent by its HTTP endpoint.");
   }
   agent = { tools: module.tools, build: ({ tools, events }) => module.buildAgent({ tools, events }) };
 }
@@ -219,26 +235,20 @@ function only(files: ReturnType<typeof loadSuite>, ids: Set<string> | undefined)
   if (!ids) return files;
   const kept = files.filter((f) => !f.path.startsWith("scenarios/") || ids.has(f.path.slice("scenarios/".length, -".yaml".length)));
   const missing = [...ids].filter((id) => !kept.some((f) => f.path === `scenarios/${id}.yaml`));
-  if (missing.length) {
-    console.error(`No scenario named ${missing.join(", ")}.`);
-    process.exit(1);
-  }
+  if (missing.length) invalid(`No scenario named ${missing.join(", ")}.`);
   return kept;
 }
 
 const usd = (n: number) => `$${n.toFixed(4)}`;
-const printRun = runPrinter();
+const printRun = runPrinter(say);
 const suite = loadSuite(join(dir, "tests"));
-const picked = values.failed ? failedLastTime(suite) : values.only ? new Set(values.only.split(",").map((s) => s.trim())) : undefined;
+picked = values.failed ? failedLastTime(suite) : values.only ? new Set(values.only.split(",").map((s) => s.trim())) : undefined;
 const chosen = only(suite, picked);
 checkSuite(chosen);
-const files = forUrl(chosen);
+files = forUrl(chosen);
 if (agentUrl) await checkAgentReachable(agentUrl);
-const perScenario = runs;
+perScenario = runs;
 const expected = expectedRuns(files, perScenario);
-const seen: RunSummary[] = [];
-let dashboard = "";
-let sessionId = "";
 
 function reportStop(done: RunSummary[], reason: string, link: string, ended: Ended) {
   for (const run of done) printRun(run);
@@ -250,7 +260,7 @@ function reportStop(done: RunSummary[], reason: string, link: string, ended: End
 
 process.on("SIGINT", () => {
   reportStop(seen, "interrupted", dashboard, "interrupted");
-  process.exit(130);
+  end("interrupted", { received: seen, error: reportError(undefined, "interrupted") });
 });
 
 let summary: Awaited<ReturnType<typeof runInCloud>>;
@@ -264,79 +274,75 @@ try {
     testsDir: join(dir, "tests"),
     runs: perScenario,
     openHeaders,
+    log: say,
+    verbose: values.verbose,
     onRun: (run) => { seen.push(run); printRun(run); },
-    onDashboard: (url, id) => { dashboard = url; sessionId = id; },
+    onDashboard: (url, id, cloudAgent) => { dashboard = url; sessionId = id; agentId = cloudAgent ?? agentId; process.env.CHINWAG_TEST_SESSION = id; },
   });
 } catch (error) {
+  const reason = stoppedReason(error, cloud);
   if (error instanceof SessionStopped) {
-    reportStop(error.runs, stoppedReason(error, cloud), error.dashboard || dashboard, "stopped");
-    process.exit(2);
+    dashboard = error.dashboard || dashboard;
+    reportStop(error.runs, reason, dashboard, "stopped");
+    end("transport", { received: error.runs, error: reportError(error, reason) });
   }
-  console.error(stoppedReason(error, cloud));
+  console.error(reason);
   // The cloud stopped a session that had opened: what finished is kept, the rest is not_played.
   saveSession("stopped", seen, dashboard, console.error);
-  process.exit(1);
+  end(stoppedOutcome(error, sessionId !== ""), { received: seen, error: reportError(error, reason) });
 }
 
-console.log("");
+say("");
 for (const r of summary.runs) printRun(r);
-const passed = summary.runs.filter((r) => r.passed).length;
+const passed = summary.runs.filter((r) => runVerdict(r) === "passed").length;
+const errored = summary.runs.filter((r) => runVerdict(r) === "errored").length;
 const total = (pick: (r: (typeof summary.runs)[number]) => number) => summary.runs.reduce((n, r) => n + pick(r), 0);
 const agentModels = [...new Set(summary.runs.flatMap((r) => r.agentModels))].join(", ") || "unknown";
 const noModel = summary.runs.filter((r) => r.agentModels.length === 0 && r.agentUsage.input + r.agentUsage.output === 0).length;
-const checkFails = summary.runs.filter((r) => r.checks.some((c) => !c.pass)).length;
-console.log(`\n${passed} of ${summary.runs.length} runs passed. ${noModel} received no agent model call. ${checkFails} failed a check. Agent: ${agentModels}; person, tools and judge: ${summary.testModel}.`);
+const modelCalls = noModel ? `${noModel} ${noModel === 1 ? "run never called" : "runs never called"} the agent's model.` : "Every run called the agent's model.";
+const checkFails = summary.runs.filter((r) => runVerdict(r) === "failed" && r.checks.some((c) => !c.pass)).length;
+const erroredLine = errored ? ` ${errored} errored (the cloud could not play or judge ${errored === 1 ? "it" : "them"}).` : "";
+const tokens = (n: number) => n.toLocaleString("en-US");
+say(`\n${passed} of ${summary.runs.length} runs passed.${erroredLine} ${modelCalls} ${checkFails} failed a check. Agent: ${agentModels}; person, tools and judge: ${summary.testModel}.`);
 for (const channel of [...new Set(summary.runs.map((r) => r.channel))]) {
   const runs = summary.runs.filter((r) => r.channel === channel);
-  console.log(`  ${channel}: ${runs.filter((r) => r.passed).length} of ${runs.length} passed`);
+  say(`  ${channel}: ${runs.filter((r) => runVerdict(r) === "passed").length} of ${runs.length} passed`);
 }
-if (summary.lost) console.log(`The cloud lost session ${summary.lost.sessionId} part way; a second session played its unfinished runs. The first: ${summary.lost.dashboard}`);
-console.log(`Cost: ${usd(total((r) => r.agentUsage.costUsd))} agent (${total((r) => r.agentUsage.input).toLocaleString()} in, ${total((r) => r.agentUsage.output).toLocaleString()} out) + ${usd(total((r) => r.testUsage.costUsd))} test models.\n${summary.dashboard}`);
+if (summary.lost) say(`The cloud lost session ${summary.lost.sessionId} part way; a second session played its unfinished runs. The first: ${summary.lost.dashboard}`);
+say(`Cost: ${usd(total((r) => r.agentUsage.costUsd))} agent (${tokens(total((r) => r.agentUsage.input))} in, ${tokens(total((r) => r.agentUsage.output))} out) + ${usd(total((r) => r.testUsage.costUsd))} test models.\n${summary.dashboard}`);
 sessionId = summary.sessionId || sessionId;
-saveSession("finished", summary.runs, summary.dashboard || dashboard, console.log);
-process.exit(passed === summary.runs.length ? 0 : 1);
+dashboard = summary.dashboard || dashboard;
+saveSession("finished", summary.runs, dashboard, say);
+end(finishedOutcome(mergedRuns(summary.runs)), { received: summary.runs });
 
 /** How a session ended: its summary came, it broke off or the cloud stopped it, or Ctrl-C. */
-type Ended = "finished" | "stopped" | "interrupted";
+type Ended = LastSession["ended"];
 
-/** .chinwag/last-session.json: what each run ended as, for `--failed` and for coding agents. */
-interface LastSession {
-  sessionId: string;
-  dashboard: string;
-  suiteHash: string;
-  /** When the session ended, as an ISO time. */
-  endedAt: string;
-  ended: Ended;
-  /** The scenarios this session was limited to (--only, --failed); null when it ran the whole suite. */
-  only: string[] | null;
-  runs: Array<{
-    /** The scenario's file name without .yaml, as --only takes it. */
-    scenario: string;
-    channel: string;
-    run: number;
-    verdict: "passed" | "failed" | "errored" | "not_played";
-    /** Only the checks' kind and text, as the test file says them: never the judge's reason. */
-    failedChecks: Array<{ kind: string; text: string }>;
-  }>;
+/** One run the session was to play, with what the cloud reported for it (none: it was never played). */
+interface Merged {
+  scenario: string;
+  channel: string;
+  run: number;
+  verdict: Verdict;
+  summary?: RunSummary;
 }
 
-/** Writes the session's results, once it has opened, and prints where; a run that never came is not_played. */
-function saveSession(ended: Ended, received: RunSummary[], link: string, print: (line: string) => void): void {
-  if (!sessionId) return;
+/** Each run sent (scenario file, channel, number) with its report; a run that never came is not_played. */
+function mergedRuns(received: RunSummary[]): Merged[] {
   const sent = files.filter((f) => f.path.startsWith("scenarios/"));
   const fileOf = new Map<string, string>();
   const byRun = new Map<string, RunSummary>();
   const key = (scenario: string, channel: string, run: number) => `${scenario}\n${channel}\n${run}`;
   for (const r of received) byRun.set(key(r.scenario, r.channel, r.run), r);
-  const saved = (scenario: string, r: RunSummary): LastSession["runs"][number] => ({
+  const merged = (scenario: string, r: RunSummary): Merged => ({
     scenario,
     channel: r.channel,
     run: r.run,
-    // run_failed: the cloud could not play or judge the run, which says nothing about the agent.
-    verdict: r.ended === "run_failed" ? "errored" : r.passed ? "passed" : "failed",
-    failedChecks: r.checks.filter((c) => !c.pass).map((c) => ({ kind: c.kind, text: c.text })),
+    // An error or run_failed: the cloud could not play or judge the run, which says nothing about the agent.
+    verdict: runVerdict(r),
+    summary: r,
   });
-  const out: LastSession["runs"] = [];
+  const out: Merged[] = [];
   for (const file of sent) {
     const scenario = parseScenario(file);
     const id = file.path.slice("scenarios/".length, -".yaml".length);
@@ -345,20 +351,39 @@ function saveSession(ended: Ended, received: RunSummary[], link: string, print: 
       for (const channel of scenario.channels) {
         const r = byRun.get(key(scenario.id, channel, run));
         byRun.delete(key(scenario.id, channel, run));
-        out.push(r ? saved(id, r) : { scenario: id, channel, run, verdict: "not_played", failedChecks: [] });
+        out.push(r ? merged(id, r) : { scenario: id, channel, run, verdict: "not_played" });
       }
     }
   }
   // A run the cloud numbered or named differently is still kept, never lost.
-  for (const r of byRun.values()) out.push(saved(fileOf.get(r.scenario) ?? r.scenario, r));
+  for (const r of byRun.values()) out.push(merged(fileOf.get(r.scenario) ?? r.scenario, r));
+  return out;
+}
+
+/** The failed checks, with the judge's reasons: the reason can quote the conversation, which the suite attests is synthetic. */
+function failedChecks(r?: RunSummary) {
+  return (r?.checks ?? []).filter((c) => !c.pass).map((c) => ({ kind: c.kind, text: c.text, reason: c.reason }));
+}
+
+/** Writes the session's results, once it has opened, and prints where. */
+function saveSession(ended: Ended, received: RunSummary[], link: string, print: (line: string) => void): void {
+  if (!sessionId) return;
   const last: LastSession = {
     sessionId,
+    ...(agentId ? { agent: agentId } : {}),
     dashboard: link,
     suiteHash: suiteHash(files),
     endedAt: new Date().toISOString(),
     ended,
     only: picked ? [...picked] : null,
-    runs: out,
+    runs: mergedRuns(received).map((m) => ({
+      scenario: m.scenario,
+      channel: m.channel,
+      run: m.run,
+      runId: m.summary?.runId ?? null,
+      verdict: m.verdict,
+      failedChecks: failedChecks(m.summary),
+    })),
   };
   const path = join(dir, LAST_SESSION);
   try {
@@ -372,40 +397,85 @@ function saveSession(ended: Ended, received: RunSummary[], link: string, print: 
   print(`Results: ${LAST_SESSION} (chinwag test --failed runs again what did not pass)`);
 }
 
+/** Exits with the outcome's status, printing the JSON report on stdout first with --json. */
+function end(outcome: Outcome, options: { received?: RunSummary[]; error?: JsonReport["error"] } = {}): never {
+  const exitCode = EXIT[outcome];
+  if (values.json) {
+    const received = options.received ?? [];
+    const runs: ReportRun[] = sessionId ? mergedRuns(received).map((m) => ({
+      runId: m.summary?.runId ?? null,
+      scenario: m.scenario,
+      channel: m.channel,
+      run: m.run,
+      verdict: m.verdict,
+      error: m.summary?.error || null,
+      ended: m.summary?.ended ?? null,
+      turns: m.summary?.turns ?? null,
+      watch: m.summary?.watch || null,
+      failedChecks: failedChecks(m.summary),
+    })) : [];
+    const count = (verdict: Verdict) => runs.filter((r) => r.verdict === verdict).length;
+    const cost = (pick: (r: RunSummary) => number) => received.reduce((n, r) => n + pick(r), 0);
+    const report: JsonReport = {
+      version: 1,
+      outcome,
+      exitCode,
+      sessionId: sessionId || null,
+      agent: agentId || null,
+      dashboard: dashboard || null,
+      suiteHash: files.length ? suiteHash(files) : null,
+      error: options.error ?? null,
+      counts: { runs: runs.length, passed: count("passed"), failed: count("failed"), errored: count("errored"), notPlayed: count("not_played") },
+      costUsd: { agent: cost((r) => r.agentUsage.costUsd), test: cost((r) => r.testUsage.costUsd) },
+      runs,
+    };
+    writeAll(`${JSON.stringify(report)}\n`);
+  }
+  process.exit(exitCode);
+}
+
+/** Nothing was sent: prints what is wrong and exits 1 (with --json, after the report). */
+function invalid(message: string): never {
+  console.error(message);
+  end("invalid", { error: reportError(undefined, message) });
+}
+
+/** stdout in full before the exit, even when it is a pipe the reader is slow to empty. */
+function writeAll(text: string): void {
+  let bytes = Buffer.from(text);
+  while (bytes.length) {
+    try {
+      bytes = bytes.subarray(writeSync(1, bytes));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+    }
+  }
+}
+
 /** The scenarios that did not pass in the last session, or exits: 0 when nothing failed, 1 when there is no last session. */
 function failedLastTime(suite: ReturnType<typeof loadSuite>): Set<string> {
-  if (values.only) {
-    console.error("--failed picks its scenarios from the last session and does not go with --only: run one or the other.");
-    process.exit(1);
-  }
+  if (values.only) invalid("--failed picks its scenarios from the last session and does not go with --only: run one or the other.");
   const path = join(dir, LAST_SESSION);
-  if (!existsSync(path)) {
-    console.error(`No ${LAST_SESSION} in ${dir}: run chinwag test first, then chinwag test --failed runs again what did not pass.`);
-    process.exit(1);
-  }
+  if (!existsSync(path)) invalid(`No ${LAST_SESSION} in ${dir}: run chinwag test first, then chinwag test --failed runs again what did not pass.`);
   let last: LastSession;
   try {
     last = JSON.parse(readFileSync(path, "utf8")) as LastSession;
     if (!Array.isArray(last.runs)) throw new Error("it has no runs");
   } catch (error) {
-    console.error(`${LAST_SESSION} could not be read (${(error as Error).message}): run chinwag test again.`);
-    process.exit(1);
+    invalid(`${LAST_SESSION} could not be read (${(error as Error).message}): run chinwag test again.`);
   }
   const ids = [...new Set(last.runs.filter((r) => r.verdict !== "passed").map((r) => r.scenario))];
   if (!ids.length) {
-    console.log(`Nothing failed in the last session (${last.sessionId}).`);
-    if (last.only) console.log(`It ran only ${last.only.join(", ")}: run chinwag test for the whole suite.`);
-    process.exit(0);
+    say(`Nothing failed in the last session (${last.sessionId}).`);
+    if (last.only) say(`It ran only ${last.only.join(", ")}: run chinwag test for the whole suite.`);
+    end("passed");
   }
   const have = new Set(suite.filter((f) => f.path.startsWith("scenarios/")).map((f) => f.path.slice("scenarios/".length, -".yaml".length)));
   const gone = ids.filter((id) => !have.has(id));
   const kept = ids.filter((id) => have.has(id));
   if (gone.length) console.warn(`No longer in tests/scenarios, skipped: ${gone.join(", ")}.`);
-  if (!kept.length) {
-    console.error(`None of the scenarios that did not pass in session ${last.sessionId} are still in tests/scenarios: run chinwag test.`);
-    process.exit(1);
-  }
-  console.log(`Running again what did not pass in session ${last.sessionId}, on every channel each plays: ${kept.join(", ")}.`);
+  if (!kept.length) invalid(`None of the scenarios that did not pass in session ${last.sessionId} are still in tests/scenarios: run chinwag test.`);
+  say(`Running again what did not pass in session ${last.sessionId}, on every channel each plays: ${kept.join(", ")}.`);
   return new Set(kept);
 }
 
@@ -427,21 +497,6 @@ function stoppedReason(error: unknown, cloud: string): string {
   return `Could not reach ${cloud}: ${code}.`;
 }
 
-/** The connection's error code, from the error or what caused it. */
-function networkCode(error: unknown): string | undefined {
-  let current = error;
-  for (let guard = 0; current instanceof Error && guard < 6; guard++) {
-    const code = (current as NodeJS.ErrnoException).code;
-    if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "ETIMEDOUT" || code === "ECONNRESET") return code;
-    for (const inner of current instanceof AggregateError ? current.errors : []) {
-      const innerCode = networkCode(inner);
-      if (innerCode) return innerCode;
-    }
-    current = current.cause;
-  }
-  return undefined;
-}
-
 /** The command's flags, or exits 1 with what is wrong and that command's usage. */
 function parseCommandLine() {
   const isNew = process.argv[2] === "new";
@@ -460,8 +515,7 @@ function parseCommandLine() {
 /** --runs as a whole number above 0, or exits 1. */
 function checkRuns(runs: string): number {
   if (/^[1-9]\d*$/.test(runs)) return Number(runs);
-  console.error(`--runs must be a whole number above 0, such as 3 (got "${runs}").`);
-  process.exit(1);
+  invalid(`--runs must be a whole number above 0, such as 3 (got "${runs}").`);
 }
 
 /** Every scenario and tool file read as the cloud reads it, before anything is sent; exits 1 with each problem at its line. */
@@ -477,8 +531,7 @@ function checkSuite(sent: ReturnType<typeof loadSuite>): void {
     }
   }
   if (!problems.length) return;
-  console.error(`${problems.join("\n")}\n\nNothing was sent: fix the test files above.`);
-  process.exit(1);
+  invalid(`${problems.join("\n")}\n\nNothing was sent: fix the test files above.`);
 }
 
 /** One HEAD request to the agent's URL, which a turn never is: any HTTP answer means it is listening. */
@@ -494,8 +547,7 @@ async function checkAgentReachable(url: string): Promise<void> {
     req.end();
   });
   if (!problem) return;
-  console.error(`Could not reach your agent at ${url}: ${problem}. Start it first, or check --agent-url.`);
-  process.exit(1);
+  invalid(`Could not reach your agent at ${url}: ${problem}. Start it first, or check --agent-url.`);
 }
 
 /** Chinwag runs agents' TypeScript as it is, which needs Node 22.18 or newer. */
