@@ -4,7 +4,7 @@
   "description": "Holds the simulators' tests and typecheck; they ship in the chinwag package as chinwag/simulators.",
   "type": "module",
   "scripts": {
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --test --test-timeout=30000 \"test/**/*.test.ts\"",
     "typecheck": "../node_modules/.bin/tsc --noEmit -p ."
   }
 }

@@ -37,5 +37,5 @@ if (chosen.size === 0) {
   process.exit(0);
 }
 for (const [file, why] of chosen) console.log(`${file}: ${why}`);
-const run = spawnSync(process.execPath, ["--test", ...chosen.keys()], { cwd: root, stdio: "inherit" });
+const run = spawnSync(process.execPath, ["--test", "--test-timeout=30000", ...chosen.keys()], { cwd: root, stdio: "inherit" });
 process.exit(run.status ?? 1);
