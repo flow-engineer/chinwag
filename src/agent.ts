@@ -483,14 +483,30 @@ export class Agent {
     return conversation.receive(message, { channel: name, messageId: options.messageId });
   }
 
-  /** The person reacted to one of the agent's messages; the agent learns it at its next turn. */
+  /**
+   * The person reacted to one of the agent's messages; the agent learns it at its next turn. The
+   * conversation is loaded from the store when it is not in memory (after a restart).
+   */
   reacted(conversationId: string, emoji: string, toText: string): void {
-    this.conversations.get(conversationId)?.reacted(emoji, toText);
+    this.withConversation(conversationId, (c) => c.reacted(emoji, toText));
   }
 
-  /** The channel reports that a message did not reach the person; the agent hears about it. */
+  /** The channel reports that a message did not reach the person; the agent hears about it, also after a restart. */
   undelivered(conversationId: string, text: string, reason: string): void {
-    this.conversations.get(conversationId)?.undelivered(text, reason);
+    this.withConversation(conversationId, (c) => c.undelivered(text, reason));
+  }
+
+  /** Acts on a conversation now when it is in memory, else once it is loaded from the store; never on one the store does not hold. */
+  private withConversation(conversationId: string, act: (conversation: Conversation) => void): void {
+    const resident = this.conversations.get(conversationId);
+    if (resident) return act(resident);
+    void (async () => {
+      await this.settings.ready;
+      const row = this.rows.get(conversationId) ?? (await this.store.conversation(conversationId));
+      if (!row) return;
+      this.rows.set(conversationId, row);
+      act(this.open(conversationId));
+    })().catch((error) => console.warn(`chinwag: conversation ${conversationId} could not be loaded for a report:`, error));
   }
 
   conversation(conversationId: string): Conversation | undefined {

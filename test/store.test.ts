@@ -166,3 +166,22 @@ test("with the provider's own message ids, the transcript keeps the person's sid
   const transcript = await after.agent.transcript(a!.conversationId);
   assert.deepEqual(transcript.filter((l) => l.kind === "in").map((l) => l.kind === "in" && [l.id, l.text]), [["wamid.HBgL1", "is the 10am free?"], ["wamid.HBgL2", "?"]]);
 });
+
+test("a delivery failure or a reaction reported after a restart reaches the agent", async () => {
+  const path = file();
+  const before = multi({ channels: CHANNELS, database: sqlite(path) });
+  await before.agent.resume();
+  const a = await before.message("sms", "+15550100100", "hi");
+  (await before.nextCall(0)).answer(respond(call("send_sms", { text: "Hi Sam!" })));
+  await before.agent.conversation(a!.conversationId)!.whenIdle();
+
+  const after = multi({ channels: CHANNELS, database: sqlite(path), dir: before.dir });
+  await after.agent.resume();
+  assert.equal(after.agent.conversation(a!.conversationId), undefined, "not in memory");
+  after.agent.reacted(a!.conversationId, "👍", "Hi Sam!");
+  after.agent.undelivered(a!.conversationId, "Hi Sam!", "carrier rejected it");
+  const told = await after.nextCall(0);
+  assert.deepEqual(users(told.request.messages).slice(-2), ['[They reacted 👍 to your message: "Hi Sam!"]', '[Not delivered] "Hi Sam!": carrier rejected it']);
+  told.answer(respond());
+  await after.agent.conversation(a!.conversationId)!.whenIdle();
+});
