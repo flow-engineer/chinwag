@@ -510,8 +510,8 @@ test("a cloud that stores keys retries a 503 on events, receipts and outbound, a
   } finally { proxy.close(); upstream.close(); }
 });
 
-test("with keys, an outbound timeout is sent again; a JSON refusal is not", { timeout: 10_000 }, async () => {
-  let outbound = 0;
+test("with keys, an outbound timeout longer than the retry budget is sent again with its key; a JSON refusal is not", { timeout: 10_000 }, async () => {
+  const keys: unknown[] = [];
   let refused = 0;
   let stream: ServerResponse | undefined;
   const cloud = await listen(({ url }, res) => {
@@ -524,8 +524,8 @@ test("with keys, an outbound timeout is sent again; a JSON refusal is not", { ti
       return;
     }
     if (url.endsWith("/outbound")) {
-      outbound++;
-      if (outbound === 1) return;
+      keys.push(res.req.headers["idempotency-key"]);
+      if (keys.length === 1) return;
       res.writeHead(200, { "content-type": "application/json" }).end("{}");
       return;
     }
@@ -538,14 +538,15 @@ test("with keys, an outbound timeout is sent again; a JSON refusal is not", { ti
   });
   try {
     const summary = await runInCloud({
-      cloud: cloud.url, name: "test", tools: [], files: [], log: () => {}, postTimeoutMs: 80, retryBudgetMs: 1_000,
+      // The first try sits its whole 400ms, longer than the 300ms budget; the budget starts at that failure.
+      cloud: cloud.url, name: "test", tools: [], files: [], log: () => {}, postTimeoutMs: 400, retryBudgetMs: 300,
       build: () => ({
         channels: () => [], reacted: () => {},
         receive: (_id, _incoming, deliver) => { void deliver({ type: "message", text: "again" }); return "m"; },
       }),
     });
     assert.equal(summary.sessionId, "s");
-    assert.equal(outbound, 2);
+    assert.deepEqual(keys, ["outbound:c:m1:0", "outbound:c:m1:0"]);
   } finally { cloud.close(); }
 
   const refusing = await listen(({ url }, res) => {

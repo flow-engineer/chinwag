@@ -37,7 +37,7 @@ export interface ConnectOptions {
   postTimeoutMs?: number;
   /** How long the stream may sit with no bytes, including the cloud's 15s ping. Default 45s. */
   streamIdleMs?: number;
-  /** How long to keep retrying one call. Default about 30s. */
+  /** How long one call keeps trying after its first failure. Default 30s. */
   retryBudgetMs?: number;
 }
 
@@ -71,7 +71,7 @@ export class StreamLost extends Error {
 
 const POST_TIMEOUT_MS = 30_000;
 const STREAM_IDLE_MS = 45_000;
-/** Backoff between tries of one call, not the time a single try may sit. */
+/** How long one call keeps trying after its first failure. The first try's own wait does not count, so a timed-out try is still sent again. */
 export const RETRY_BUDGET_MS = 30_000;
 /** The cloud abandons one model attempt at 90s and tries a timeout once more, then this POST has its 30s. */
 export const CLOUD_MODEL_BUDGET_MS = 90_000 * 2 + POST_TIMEOUT_MS;
@@ -222,7 +222,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   let eventSeq = 0;
   const flush = async () => {
     while (queued.length) {
-      let bytes = Buffer.byteLength('{"events":[]}');
+      const seq = ++eventSeq;
+      let bytes = Buffer.byteLength(`{"seq":${seq},"events":[]}`);
       let count = 0;
       while (count < queued.length && count < 500) {
         const next = queued[count].bytes + (count ? 1 : 0);
@@ -232,7 +233,6 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       }
       if (!count) throw new Error("one event exceeds the 5MB upload limit");
       const batch = queued.slice(0, count);
-      const seq = ++eventSeq;
       const started = Date.now();
       const wait = started - batch[0].at;
       let failed = false;
@@ -564,9 +564,10 @@ function retryWaitMs(attempt: number, error: unknown): number {
   return base + Math.random() * base * 0.2;
 }
 
-/** One call, sent again until the budget when that is safe. The same Idempotency-Key goes on every try. */
+/** One call, sent again when that is safe, until the budget has passed since its first failure.
+ * The same Idempotency-Key goes on every try. */
 async function postRetry<T>(url: string, body: unknown, headers: Record<string, string>, signal: AbortSignal | undefined, log: (line: string) => void, timeoutMs: number, options: { mode: RetryMode; key: string; budgetMs: number; what: string; serialized?: string }): Promise<T> {
-  const started = Date.now();
+  let firstFailure: number | undefined;
   let attempt = 0;
   const headersWithKey = { ...headers, "idempotency-key": options.key };
   for (;;) {
@@ -574,9 +575,10 @@ async function postRetry<T>(url: string, body: unknown, headers: Record<string, 
       return await post<T>(url, body, headersWithKey, signal, options.serialized, timeoutMs);
     } catch (error) {
       const again = retryable(error, options.mode);
-      const elapsed = Date.now() - started;
+      firstFailure ??= Date.now();
+      const elapsed = Date.now() - firstFailure;
       const wait = again ? retryWaitMs(attempt, error) : 0;
-      if (!again || elapsed + wait >= options.budgetMs) {
+      if (!again || elapsed + wait > options.budgetMs) {
         if (again) log(`${options.what} failed after ${attempt + 1} tries`);
         else if (options.mode !== "never" && unavailable(error)) log(`${options.what} failed (${retryStatus(error)})`);
         throw error;
