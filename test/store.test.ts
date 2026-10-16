@@ -98,20 +98,22 @@ test("a database that survives restarts must be resumed before the first message
   await assert.rejects(h.message("sms", "+15550100100", "hi"), /call await agent.resume\(\)/);
 });
 
-test("phone keys stored before E.164 are upgraded, so the number's next channel joins them; two already apart stay apart", async () => {
+test("phone keys stored before E.164 are upgraded, so the number's next channel joins them; two already apart (in any two forms) stay apart", async () => {
   const database = sqlite(file());
   const store = new Store(database, "default");
   await store.migrate();
   await store.createConversation("p_wa", "phone:15550100100");
   await store.createConversation("p_both_wa", "phone:15550100200");
   await store.createConversation("p_both_sms", "phone:+15550100200");
+  await store.createConversation("p_old_wa", "phone:15550100300");
+  await store.createConversation("p_old_00", "phone:0015550100300");
   // As if the upgrade had not run yet on this database.
   await database.run("DELETE FROM parley_migrations WHERE version = 4");
   const h = multi({ channels: { sms: { info: SMS, phone: true } }, database });
   await h.agent.resume();
   const a = await h.message("sms", "+15550100100", "hi");
   assert.equal(a!.conversationId, "p_wa");
-  assert.deepEqual((await store.allConversations()).map((c) => c.personKey).sort(), ["phone:+15550100100", "phone:+15550100200", "phone:15550100200"]);
+  assert.deepEqual((await store.allConversations()).map((c) => c.personKey).sort(), ["phone:+15550100100", "phone:+15550100200", "phone:0015550100300", "phone:15550100200", "phone:15550100300"]);
 });
 
 test("a tool gets its call id and a signal, and an idempotency key that is the same when its turn runs again after a restart", async () => {

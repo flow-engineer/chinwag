@@ -66,12 +66,15 @@ const MIGRATIONS: Array<(t: Types) => string> = [
   // A rule from a keyword (STOP): a hard stop, checked without the model, lifted only by START.
   () => `ALTER TABLE no_contact ADD COLUMN hard INTEGER NOT NULL DEFAULT 0`,
   // Phone keys are E.164 now: "phone:15550100100" (as WhatsApp gives it) and "phone:0015550100100"
-  // become "phone:+15550100100", so the same number on SMS joins them. Where both forms are
-  // already two conversations, both are left as they are (merging two histories is the owner's call).
+  // become "phone:+15550100100", so the same number on SMS joins them. Where a number already has
+  // two conversations (under any two of those forms), all are left as they are: merging two
+  // histories is the owner's call. Each look-up is by equality, so it uses the person_key index.
   () => `UPDATE conversations SET person_key = 'phone:+' || substr(person_key, CASE WHEN person_key LIKE 'phone:00%' THEN 9 ELSE 7 END)
      WHERE person_key LIKE 'phone:%' AND person_key NOT LIKE 'phone:+%'
        AND NOT EXISTS (SELECT 1 FROM conversations other WHERE other.agent_id = conversations.agent_id
-         AND other.person_key = 'phone:+' || substr(conversations.person_key, CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 9 ELSE 7 END))`,
+         AND other.person_key = 'phone:+' || substr(conversations.person_key, CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 9 ELSE 7 END))
+       AND NOT EXISTS (SELECT 1 FROM conversations other WHERE other.agent_id = conversations.agent_id
+         AND other.person_key = CASE WHEN conversations.person_key LIKE 'phone:00%' THEN 'phone:' || substr(conversations.person_key, 9) ELSE 'phone:00' || substr(conversations.person_key, 7) END)`,
   // A provider's message ids, so a webhook's retry is taken once; and each conversation's turn count, for tools' idempotency keys.
   (t) => `CREATE TABLE inbound (
      agent_id TEXT NOT NULL, channel TEXT NOT NULL, message_id TEXT NOT NULL, conversation_id TEXT NOT NULL, at ${t.int} NOT NULL,
