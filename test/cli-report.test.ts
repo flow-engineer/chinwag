@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { loadSuite, parseScenario, parseToolFile } from "../testing/src/suite.ts";
 
 const cli = fileURLToPath(new URL("../testing/src/cli.ts", import.meta.url));
 const run = {
@@ -421,6 +422,44 @@ test("--failed with no last session, or with --only, stops before anything is se
   assert.deepEqual(await cliOutput(["test", "--failed", "--only", "hello", "--cloud", "http://127.0.0.1:9"], dir), {
     code: 1,
     out: "--failed picks its scenarios from the last session and does not go with --only: run one or the other.\n",
+  });
+});
+
+test("test files: old ones parse as before, the clock, calls and never parse, and each mistake is named with its file and line", () => {
+  // An old scenario with a stray key, and an old tool file whose {{name}} is not the clock: unchanged.
+  const old = "id: x\nchannels: [sms]\nperson:\n  persona: a\n  goal: b\nopening:\n  - say: hi\nnotes: kept\n";
+  assert.deepEqual(parseScenario({ path: "scenarios/x.yaml", content: old }), {
+    id: "x", channels: ["sms"], person: { persona: "a", goal: "b" }, opening: [{ say: "hi" }], max_turns: 8, expect: {},
+  });
+  const tool = "tool: t\nresponses:\n  - when: Always\n    latency_ms: 5\n    output: { greeting: 'hi {{name}}' }\n";
+  assert.deepEqual(parseToolFile({ path: "tools/t.yaml", content: tool }), { tool: "t", responses: [{ when: "Always", latency_ms: 5, output: { greeting: "hi {{name}}" } }] });
+
+  const scenario = (more: string) => ({ path: "scenarios/x.yaml", content: `${old}${more}` });
+  assert.deepEqual(parseScenario(scenario([
+    "timezone: America/New_York", "now: 2026-10-16T09:00", "world: The class is on {{now + 6d @ 10:00 | weekday}}.",
+    "expect:", "  calls:", "    - cancel_session", "    - tool: move_session", "      args: { slot: { at: '{{now+1w|date}}' } }", "  never: [delete_account]", "",
+  ].join("\n"))), {
+    id: "x", channels: ["sms"], person: { persona: "a", goal: "b" }, opening: [{ say: "hi" }], max_turns: 8,
+    timezone: "America/New_York", now: "2026-10-16T09:00", world: "The class is on {{now + 6d @ 10:00 | weekday}}.",
+    expect: { calls: ["cancel_session", { tool: "move_session", args: { slot: { at: "{{now+1w|date}}" } } }], never: ["delete_account"] },
+  });
+  for (const now of ["2026-10-16T09:00:30Z", "2026-10-16T09:00-04:00"]) assert.equal(parseScenario(scenario(`now: ${now}\n`)).now, now);
+  // The café example, as shipped, is valid.
+  for (const file of loadSuite(fileURLToPath(new URL("../examples/cafe/tests", import.meta.url)))) (file.path.startsWith("scenarios/") ? parseScenario : parseToolFile)(file);
+
+  const placeholder = (text: string) => `unknown placeholder ${text}: write it like {{now + 3d}}, {{now - 2h | time}} or {{now + 1w @ 10:00 | date}}`;
+  const mistakes: Array<[string, string]> = [
+    ["timezone: Mars/Base", "scenarios/x.yaml:9: timezone: not a time zone: use an IANA name such as America/New_York or UTC"],
+    ["now: 2026-02-30T09:00", "scenarios/x.yaml:9: now: not a date and time: write YYYY-MM-DDTHH:MM, with :SS, Z or an offset such as -04:00 if needed"],
+    ["now: 2026-10-16 09:00", "scenarios/x.yaml:9: now: not a date and time: write YYYY-MM-DDTHH:MM, with :SS, Z or an offset such as -04:00 if needed"],
+    ["expect:\n  calls:\n    - tool: move_session\n      arg: {}", "scenarios/x.yaml:11: expect.calls[0]: Unrecognized key: \"arg\""],
+    ["expect:\n  never:\n    - args: { slot: s-2 }", "scenarios/x.yaml:11: expect.never[0]: a tool name, or { tool: <name>, args: { <field>: <value> } }"],
+    ["expect:\n  judge:\n    - It is booked for {{now + 3 days}}.", `scenarios/x.yaml:11: expect.judge[0]: ${placeholder("{{now + 3 days}}")}`],
+    ["expect:\n  calls:\n    - tool: t\n      args:\n        at: '{{now @ 9:00}}'", `scenarios/x.yaml:13: expect.calls[0].args.at: ${placeholder("{{now @ 9:00}}")}`],
+  ];
+  for (const [more, error] of mistakes) assert.throws(() => parseScenario(scenario(`${more}\n`)), { message: error });
+  assert.throws(() => parseToolFile({ path: "tools/t.yaml", content: `${tool}    input:\n      days: ['{{now + 1d | year}}']\n` }), {
+    message: `tools/t.yaml:7: responses[0].input.days[0]: ${placeholder("{{now + 1d | year}}")}`,
   });
 });
 
