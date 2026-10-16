@@ -1,8 +1,9 @@
 // Nudges are messages the business starts: sent as written (text), written by the agent (prompt),
 // or a template the owner already set up with the channel. What a person asked not to be messaged
-// about is the agent's judgement, kept as rules it adds and removes, not a hard stop: a nudge the
-// rules cover is not sent. The rules cover only what the business starts, never what the person
-// asks for themselves.
+// about is the agent's judgement, kept as rules it adds and removes: a message the business starts
+// that the rules cover is not sent. The rules cover only what the business starts, never what the
+// person asks for themselves. A channel's STOP keyword is different: a hard rule, written without
+// the model, that stops everything the business starts until they text START (channels.ts).
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -41,7 +42,11 @@ export function noContactTools(scope: NoContactScope): Tool[] {
       name: "remove_no_contact",
       description: "Remove one of their no-contact rules, by id, when they want those messages again.",
       input: z.object({ id: z.string() }),
-      run: async ({ id }) => ({ removed: await scope.store.removeNoContact(scope.conversationId, id) }),
+      run: async ({ id }) => {
+        const rule = (await scope.store.noContact(scope.conversationId, scope.now())).find((r) => r.id === id);
+        if (rule?.hard) return { error: "That is their STOP: it ends only when they text START." };
+        return { removed: await scope.store.removeNoContact(scope.conversationId, id) };
+      },
     }),
   ];
 }

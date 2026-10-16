@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAgent, tool, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
-import type { ChannelInfo, ChannelKind, ChatMessage, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
+import type { ChannelInfo, ChannelKind, ChatMessage, Keywords, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
 
 /**
  * A model the test drives: each call waits for the test to answer it. The step Chinwag adds after a
@@ -97,7 +97,7 @@ export const WEB_APP: ChannelInfo = { reactions: true, status: true, formatting:
 /** An agent with real channels (by name), for one person across several of them. */
 export function multi(options: {
   /** Each channel is custom unless it names its kind. */
-  channels: Record<string, { info: ChannelInfo; phone?: boolean; kind?: ChannelKind }>;
+  channels: Record<string, { info: ChannelInfo; phone?: boolean; kind?: ChannelKind; keywords?: Keywords }>;
   tools?: ReturnType<typeof tool>[];
   database?: Database;
   resolve?: (identity: { channel: string; address: string }) => string | null;

@@ -63,6 +63,8 @@ const MIGRATIONS: Array<(t: Types) => string> = [
      PRIMARY KEY (agent_id, id));`,
   // Where an identity's latest message came from: the channel's provider, or the playground.
   () => `ALTER TABLE identities ADD COLUMN via TEXT NOT NULL DEFAULT 'provider'`,
+  // A rule from a keyword (STOP): a hard stop, checked without the model, lifted only by START.
+  () => `ALTER TABLE no_contact ADD COLUMN hard INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export interface ConversationRow {
@@ -126,6 +128,8 @@ export interface NoContactRow {
   id: string;
   rule: string;
   until: number | null;
+  /** They texted STOP: nothing the business starts goes to them, with no model call, until START. */
+  hard: boolean;
 }
 
 const json = (value: unknown) => JSON.stringify(value);
@@ -397,18 +401,24 @@ export class Store {
 
   // What a person asked not to be messaged about.
 
-  async addNoContact(conversationId: string, id: string, rule: string, until: number | null): Promise<void> {
-    await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, created_at) VALUES (?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, Date.now()]);
+  async addNoContact(conversationId: string, id: string, rule: string, until: number | null, hard = false): Promise<void> {
+    await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, hard, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, hard ? 1 : 0, Date.now()]);
   }
 
+  /** Removes one of the agent's rules; a STOP is not one of them (only START lifts it). */
   async removeNoContact(conversationId: string, id: string): Promise<boolean> {
-    return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND id = ?", [this.agentId, conversationId, id])) > 0;
+    return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND id = ? AND hard = 0", [this.agentId, conversationId, id])) > 0;
+  }
+
+  /** They texted START: their STOP is lifted. */
+  async removeHardNoContact(conversationId: string): Promise<boolean> {
+    return (await this.db.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId])) > 0;
   }
 
   /** The rules still in force at `now` (a rule with an `until` in the past has ended). */
   async noContact(conversationId: string, now: number): Promise<NoContactRow[]> {
-    const rows = await this.db.query("SELECT id, rule, until FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND (until IS NULL OR until > ?) ORDER BY created_at", [this.agentId, conversationId, now]);
-    return rows.map((r) => ({ id: String(r.id), rule: String(r.rule), until: num(r.until) }));
+    const rows = await this.db.query("SELECT id, rule, until, hard FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND (until IS NULL OR until > ?) ORDER BY created_at", [this.agentId, conversationId, now]);
+    return rows.map((r) => ({ id: String(r.id), rule: String(r.rule), until: num(r.until), hard: Number(r.hard) === 1 }));
   }
 }
 

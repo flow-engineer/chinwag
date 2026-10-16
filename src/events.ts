@@ -26,7 +26,8 @@ export interface ChinwagEvent {
     | "status"
     | "message.undelivered"
     | "reaction.in"
-    | "attachment.failed";
+    | "attachment.failed"
+    | "keyword";
   conversationId: string;
   at: number;
   [detail: string]: unknown;

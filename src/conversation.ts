@@ -34,12 +34,13 @@
 //   few are shown, and their bytes are never stored: after a restart they are named, not shown.
 
 import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
 import type { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
-import type { ConversationRow, InboxRow, StoreApi } from "./store.ts";
+import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
 import { render, toSpec, type Tool } from "./tools.ts";
 import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
@@ -218,6 +219,8 @@ export class Conversation {
   private resumeTurn = false;
   /** Forgotten: nothing more runs, is sent or is kept. */
   private closed = false;
+  /** They texted STOP (as of the latest look): what the business starts is dropped, with no model call. */
+  private stop: NoContactRow | null = null;
 
   constructor(id: string, personKey: string, settings: ConversationSettings, existing: ConversationRow | null = null) {
     this.id = id;
@@ -415,6 +418,26 @@ export class Conversation {
     this.note(`[Not delivered] "${text}": ${reason}`);
   }
 
+  /**
+   * They texted a STOP or START keyword: their STOP is kept (or lifted) with no model call, and
+   * the agent learns it at its next turn. Resolves once it is stored.
+   */
+  keyword(kind: "stop" | "start", text: string, channel: string): Promise<void> {
+    const { store } = this.settings;
+    this.settings.emit(this.id, "keyword", { keyword: kind, text, channel });
+    if (kind === "stop") {
+      const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true };
+      this.stop = rule;
+      this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: nothing the business starts (nudges, scheduled messages) reaches them until they text START. Answer them when they write.`, true);
+      return this.persist(async () => {
+        if (!(await store.noContact(this.id, this.settings.now())).some((r) => r.hard)) await store.addNoContact(this.id, rule.id, rule.rule, null, true);
+      });
+    }
+    this.stop = null;
+    this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: messages the business starts may reach them again.`, true);
+    return this.persist(() => store.removeHardNoContact(this.id));
+  }
+
   get busy(): boolean {
     return this.running || this.timer !== null || this.tasks.size > 0 || this.preparing !== null;
   }
@@ -523,7 +546,6 @@ export class Conversation {
       for (;;) {
         if (this.closed) break;
         if (this.pending.length || this.notes.some((n) => !n.wait) || this.resumeTurn) {
-          this.resumeTurn = false;
           await this.turn();
           continue;
         }
@@ -564,6 +586,12 @@ export class Conversation {
     if (!this.pending.length && !this.notes.length) return false;
     const items: Array<{ inbox?: number }> = [];
     for (const note of this.notes.splice(0)) {
+      if (note.owed && this.stop) {
+        // They texted STOP: what the business started never reaches the model.
+        this.settle(note.owed, "dropped", `no-contact rule ${this.stop.id}: ${this.stop.rule}`);
+        items.push(note);
+        continue;
+      }
       this.history.push({ role: "user", content: note.text });
       if (note.text.startsWith("[Background result:")) this.resultUnsent = "background";
       if (note.owed) this.owed.push(note.owed);
@@ -609,6 +637,14 @@ export class Conversation {
   private async turn(): Promise<void> {
     const started = Date.now();
     const { store } = this.settings;
+    const noContact = await store.noContact(this.id, this.settings.now());
+    this.stop = noContact.find((r) => r.hard) ?? null;
+    if (this.stop && !this.resumeTurn && !this.pending.length && !this.notes.some((n) => !n.wait && !n.owed)) {
+      // Only what the business started is waiting, and they texted STOP: it is dropped, no turn runs.
+      this.absorb();
+      return;
+    }
+    this.resumeTurn = false;
     this.settings.emit(this.id, "turn.start", {});
     this.persist(() => store.updateConversation(this.id, { turnOpen: true }));
     this.absorb();
@@ -631,7 +667,7 @@ export class Conversation {
         }
       }
     }
-    const rules = rulesSection(await store.noContact(this.id, this.settings.now()), this.timeZone ?? this.settings.timeZone ?? "UTC");
+    const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC");
     // A message that came while those loaded had no step to restart: it joins the first one.
     this.absorb();
     let restarts = 0;
@@ -910,11 +946,10 @@ export class Conversation {
     const link = this.channels.get(d.channel);
     if (!link) return settle("failed", `no way to reach them on ${d.channel} right now`);
     if (!d.template && windowClosed(link, this.settings.now())) return settle("refused", "outside_window");
-    if (d.nudge) {
-      const rules = await this.settings.store.noContact(this.id, this.settings.now());
-      const covered = rules.length ? await coveredBy(this.settings.model, rules, d.text ?? `the template "${d.template?.name}"`) : null;
-      if (covered) return settle("dropped", `no-contact rule ${covered.id}: ${covered.rule}`);
-    }
+    // Every direct send is one the business starts (a nudge, or its scheduled text): the person's rules apply.
+    const rules = await this.settings.store.noContact(this.id, this.settings.now());
+    const covered = rules.find((r) => r.hard) ?? (rules.length ? await coveredBy(this.settings.model, rules, d.text ?? `the template "${d.template?.name}"`) : null);
+    if (covered) return settle("dropped", `no-contact rule ${covered.id}: ${covered.rule}`);
     const outbound: Outbound = d.template ? { type: "template", ...d.template } : { type: "message", text: d.text ?? "" };
     const failure = await this.send(d.channel, outbound);
     if (failure) return settle("failed", failure);

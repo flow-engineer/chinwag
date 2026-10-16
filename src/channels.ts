@@ -26,7 +26,47 @@ export interface Channel {
   params?: Record<string, z.ZodType>;
   /** Your own guidance for the agent on this channel, added to its prompt while the person uses it. */
   instructions?: string;
+  /** Opt-out keywords this channel honours (SMS and WhatsApp have them by default). */
+  keywords?: Keywords;
   send(address: string, outbound: Outbound): Promise<void> | void;
+}
+
+/**
+ * Keywords a person texts on their own (the whole message, any case, punctuation and spaces
+ * ignored), answered with no model call. `stop` records a hard no-contact rule: nothing the
+ * business starts (nudges, scheduled messages, their own reminders) goes to them on any channel
+ * until they text a `start` word. `help` sends `replies.help`; without one the agent answers it.
+ * A reply left out sends nothing (the provider may send its own).
+ */
+export interface Keywords {
+  stop: string[];
+  start: string[];
+  help: string[];
+  replies?: { stop?: string; start?: string; help?: string };
+}
+
+/** The words carriers treat as opt-out, opt-in and help on SMS. */
+export const SMS_KEYWORDS: Keywords = {
+  stop: ["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "REVOKE", "OPTOUT"],
+  start: ["START", "UNSTOP"],
+  help: ["HELP", "INFO"],
+};
+
+/** WhatsApp has no carrier keywords; a business honours a plain STOP all the same. */
+export const WHATSAPP_KEYWORDS: Keywords = { stop: ["STOP", "UNSUBSCRIBE"], start: ["START"], help: [] };
+
+/** Which keyword a message is, if it is one. */
+export function keywordOf(keywords: Keywords | undefined, text: string): "stop" | "start" | "help" | null {
+  if (!keywords) return null;
+  const word = text.toUpperCase().replace(/[^A-Z]/g, "");
+  if (!word || word.length > 12) return null;
+  for (const kind of ["stop", "start", "help"] as const) if (keywords[kind].some((k) => k.toUpperCase().replace(/[^A-Z]/g, "") === word)) return kind;
+  return null;
+}
+
+/** A channel factory's `keywords` option: false for none, or changes to the defaults. */
+function keywordsFrom(defaults: Keywords, option: false | Partial<Keywords> | undefined): Keywords | undefined {
+  return option === false ? undefined : { ...defaults, ...option };
 }
 
 /** A channel without its send: what the simulators and the test cloud need to play it. */
@@ -100,7 +140,7 @@ export const SMS: ChannelInfo = { reactions: false, status: false, formatting: "
 
 export type WhatsAppFeature = "buttons" | "lists" | "links" | "images" | "replies" | "reactions" | "typing" | "readReceipts" | "templates";
 
-export function whatsapp(provider: WhatsAppProvider, options: { name?: string; disable?: WhatsAppFeature[]; instructions?: string } = {}): Channel {
+export function whatsapp(provider: WhatsAppProvider, options: { name?: string; disable?: WhatsAppFeature[]; instructions?: string; keywords?: false | Partial<Keywords> } = {}): Channel {
   const off = new Set(options.disable ?? []);
   const has = (feature: WhatsAppFeature, available: boolean) => available && !off.has(feature);
   const f = provider.features ?? {};
@@ -119,6 +159,7 @@ export function whatsapp(provider: WhatsAppProvider, options: { name?: string; d
     kind: "whatsapp",
     info,
     instructions: options.instructions,
+    keywords: keywordsFrom(WHATSAPP_KEYWORDS, options.keywords),
     phone: true,
     send: (to, outbound) => {
       switch (outbound.type) {
@@ -142,12 +183,13 @@ export function whatsapp(provider: WhatsAppProvider, options: { name?: string; d
   };
 }
 
-export function sms(provider: SmsProvider, options: { name?: string; instructions?: string } = {}): Channel {
+export function sms(provider: SmsProvider, options: { name?: string; instructions?: string; keywords?: false | Partial<Keywords> } = {}): Channel {
   return {
     name: options.name ?? "sms",
     kind: "sms",
     info: SMS,
     instructions: options.instructions,
+    keywords: keywordsFrom(SMS_KEYWORDS, options.keywords),
     phone: true,
     send: (to, outbound) => {
       if (outbound.type === "message") return provider.sendMessage(to, { text: outbound.text });

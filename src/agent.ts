@@ -14,7 +14,7 @@
 // every send to it (replies, scheduled messages, nudges) goes back the same way.
 
 import { randomUUID } from "node:crypto";
-import { declaredTemplate, fillTemplate, summarize, type Channel, type ChannelSummary } from "./channels.ts";
+import { declaredTemplate, fillTemplate, keywordOf, summarize, type Channel, type ChannelSummary, type Keywords } from "./channels.ts";
 import { Conversation, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type TranscriptEntry } from "./conversation.ts";
 import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
@@ -340,12 +340,33 @@ export class Agent {
     const deliver = this.deliverer(adapter, input.from, conversationId);
     conversation.link({ name: input.channel, info: adapter.info, params: adapter.params, instructions: adapter.instructions, address: input.from, deliver, lastMessageAt: null });
     const text = typeof input.message === "string" ? input.message : input.message.text;
+    const answer = this.keyword(conversation, adapter.keywords, input.message, input.channel);
+    if (answer) {
+      await answer.stored;
+      if (answer.reply) await deliver({ type: "message", text: answer.reply });
+      return null;
+    }
     const fixed = this.options.intercept?.(conversationId, text) ?? null;
     if (fixed !== null) {
       if (fixed) await deliver({ type: "message", text: fixed });
       return null;
     }
     return { conversationId, messageId: conversation.receive(input.message, { channel: input.channel, messageId: input.messageId }) };
+  }
+
+  /**
+   * A STOP, START or HELP keyword on a channel that has them, answered with no model call: what
+   * to send back (if anything), once it is stored. Null for any other message, and for HELP when
+   * the channel has no reply for it (the agent answers).
+   */
+  private keyword(conversation: Conversation, keywords: Keywords | undefined, message: string | Incoming, channel: string): { reply?: string; stored: Promise<void> } | null {
+    if (typeof message !== "string" && (message.attachments?.length || message.choice)) return null;
+    const text = typeof message === "string" ? message : message.text;
+    const kind = keywordOf(keywords, text);
+    if (!kind) return null;
+    const reply = keywords!.replies?.[kind];
+    if (kind === "help") return reply ? { reply, stored: Promise.resolve() } : null;
+    return { reply, stored: conversation.keyword(kind, text, channel) };
   }
 
   /** The identity a message comes from, made (and linked to its person's conversation) the first time it writes. */
@@ -427,6 +448,11 @@ export class Agent {
     const conversation = this.open(conversationId, `${name}:${conversationId}`);
     if (isNew) conversation.persist(() => this.store.addIdentity(conversationId, name, conversationId, "channel"));
     conversation.link({ name, info: defined?.info ?? options.channel ?? NO_EXTRAS, params: defined?.params, instructions: defined?.instructions, address: conversationId, deliver, lastMessageAt: null });
+    const answer = this.keyword(conversation, defined?.keywords, message, name);
+    if (answer) {
+      if (answer.reply) void answer.stored.then(() => deliver({ type: "message", text: answer.reply! }));
+      return null;
+    }
     return conversation.receive(message, { channel: name, messageId: options.messageId });
   }
 
@@ -465,6 +491,12 @@ export class Agent {
     const id = `n_${randomUUID().slice(0, 8)}`;
     const conversationId = identity.conversationId;
     const record = { id, conversationId, channel: input.to.channel, idempotencyKey: input.idempotencyKey ?? null, reason: null };
+    const stop = input.at === undefined ? await this.stopOf(conversationId) : null;
+    if (stop) {
+      const reason = `no-contact rule ${stop.id}: ${stop.rule}`;
+      await this.store.addNudge({ ...record, body: input.template ? { template: input.template } : { text: input.text, prompt: input.prompt }, status: "dropped", reason });
+      return { id, status: "dropped", reason };
+    }
     if (input.at !== undefined) {
       if (input.template) throw new Error("chinwag: a template nudge cannot be scheduled yet");
       const zone = (await this.store.conversation(conversationId))?.timeZone ?? this.options.timeZone ?? "UTC";
@@ -489,6 +521,8 @@ export class Agent {
     if (this.store.durable && !this.resumed) return 0;
     const now = this.now();
     const queued = await claimDue(this.store, now, async (s) => {
+      const stop = await this.stopOf(s.conversationId);
+      if (stop) return `no-contact rule ${stop.id}: ${stop.rule}`;
       const identity = (await this.store.identities(s.conversationId)).find((i) => i.channel === s.channel);
       if (!identity) return `no way to reach them on ${s.channel}`;
       return windowClosed({ info: this.infoOf(s.channel, s.conversationId), lastMessageAt: identity.lastMessageAt }, now) ? "outside_window" : null;
@@ -565,6 +599,11 @@ export class Agent {
       this.nudgeWaiters.get(target.nudge)?.(this.result(target.nudge, status, reason));
       this.nudgeWaiters.delete(target.nudge);
     }
+  }
+
+  /** Their STOP, if they texted one. */
+  private async stopOf(conversationId: string) {
+    return (await this.store.noContact(conversationId, this.now())).find((r) => r.hard) ?? null;
   }
 
   private result(id: string, status: string, reason?: string | null): NudgeResult {
