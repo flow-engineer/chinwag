@@ -205,6 +205,37 @@ await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt
 
 `text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped, and outside WhatsApp's 24-hour window only templates go out. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
 
+### Nudges over HTTP
+
+When the system that decides to nudge is a separate service, mount `nudgeHandler` in the agent's server and call it over HTTP. It is a plain `(req, res)` handler; hand it the requests under its `base` (`/nudges` by default; anything else gets 404). It needs a token of at least 32 characters, from a secret, or it throws at setup:
+
+```ts
+import { createServer } from "node:http";
+import { nudgeHandler } from "chinwag";
+
+const nudges = nudgeHandler(agent, { token: process.env.NUDGE_TOKEN! });
+createServer((req, res) => {
+  if (req.url?.startsWith("/nudges")) return nudges(req, res);
+  // ... your webhooks
+}).listen(3000);
+```
+
+- `POST /nudges` with `{ to: { channel, address }, text | prompt | template, at?, idempotency_key? }`: exactly one of `text`, `prompt` or `template`, as in `agent.nudge()`; `at` is milliseconds since the epoch; unknown fields are refused; at most 16 KB. It answers `202 { id, status, reason? }` as soon as the nudge is recorded, without waiting for the send or the agent's turn: usually `queued`. What is decided as it is recorded is in that answer too, still a 202, since it is the nudge's state and not an error: `refused` (`unknown_person`, with `id` `""` since nothing is recorded; `outside_window`), `dropped` (they texted STOP) or `scheduled`. A bad body, a channel the agent does not have, or a declared template's wrong values get `400 { error }`.
+- `GET /nudges/<id>`: `200 { id, status, reason? }`, its state now: `queued`, `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled`. An id it never recorded gets 404.
+- The same `idempotency_key` returns the first nudge's id and its state now, and sends once.
+- Every request needs `Authorization: Bearer <token>`, compared in constant time; wrong tokens are limited per address (10 in 15 minutes, then 429), as on the playground. Answers are JSON with `cache-control: no-store`. Each accepted nudge is logged (id, status, channel, kind, time and the caller's IP address), never its text or the token.
+
+```sh
+curl -s -X POST https://agent.example.com/nudges \
+  -H "Authorization: Bearer $NUDGE_TOKEN" -H "content-type: application/json" \
+  -d '{"to":{"channel":"whatsapp","address":"+15550100100"},"prompt":"Their order is ready for pickup.","idempotency_key":"order-1042-ready"}'
+# {"id":"n_3f9c2a1b","status":"queued"}
+curl -s https://agent.example.com/nudges/n_3f9c2a1b -H "Authorization: Bearer $NUDGE_TOKEN"
+# {"id":"n_3f9c2a1b","status":"sent"}
+```
+
+The contract is [`spec/nudges.openapi.yaml`](spec/nudges.openapi.yaml). In code, `agent.recordNudge(input)` is the same early answer and `agent.nudgeState(id)` the same read.
+
 ## State, restarts and hosting
 
 - Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). Postgres: `postgres(pool)` over your own node-postgres pool. Any other engine: implement the three-method `Database` interface, or pass a whole `store` of your own.

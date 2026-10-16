@@ -185,6 +185,13 @@ export interface NudgeResult {
 
 export type NudgeStatus = "sent" | "silent" | "dropped" | "refused" | "failed" | "scheduled";
 
+/** A nudge as it stands now: `queued` until it is sent or settled, else how it settled. */
+export interface NudgeState {
+  id: string;
+  status: NudgeStatus | "queued";
+  reason?: string;
+}
+
 const NO_EXTRAS: ChannelInfo = { reactions: false, status: false };
 const HOUR_MS = 3_600_000;
 /** Provider ids deleted per statement, so each one holds its locks briefly. */
@@ -201,7 +208,7 @@ export class Agent {
   private resumed = false;
   private readonly arriving = new Map<string, Promise<unknown>>();
   /** Callers waiting for a queued nudge to settle: its first call, and any with the same key. */
-  private readonly nudgeWaiters = new Map<string, Array<(result: NudgeResult) => void>>();
+  private readonly nudgeWaiters = new Map<string, Array<(result: NudgeState) => void>>();
   private readonly now: () => number;
   private readonly channelsByName: Map<string, Channel>;
   /** Where each identity (channel, address) last wrote from; sends go back the same way. */
@@ -558,6 +565,16 @@ export class Agent {
    * unknown_person) or failed; or scheduled, for one with `at`.
    */
   async nudge(input: NudgeInput): Promise<NudgeResult> {
+    // outcome() waits while it is queued, so what it resolves is settled.
+    return (await this.outcome(await this.recordNudge(input))) as NudgeResult;
+  }
+
+  /**
+   * Records a nudge and resolves at once, without waiting for its send or turn: `queued`, or what
+   * was decided as it was recorded (dropped, refused, scheduled). The same idempotency key gets the
+   * first nudge's state now. `nudgeState(id)` reads it later.
+   */
+  async recordNudge(input: NudgeInput): Promise<NudgeState> {
     await this.settings.ready;
     const kinds = [input.text, input.prompt, input.template].filter((v) => v !== undefined).length;
     if (kinds !== 1) throw new Error("chinwag: a nudge has exactly one of text, prompt or template");
@@ -566,7 +583,7 @@ export class Agent {
     if (declared) fillTemplate(declared, input.template!);
     if (input.idempotencyKey) {
       const earlier = await this.store.nudgeByKey(input.idempotencyKey);
-      if (earlier) return this.outcome(earlier);
+      if (earlier) return this.result(earlier.id, earlier.status, earlier.reason);
     }
     const identity = await this.store.identity(input.to.channel, input.to.address);
     if (!identity) return { id: "", status: "refused", reason: "unknown_person" };
@@ -575,12 +592,13 @@ export class Agent {
     const record = { id, conversationId, channel: input.to.channel, idempotencyKey: input.idempotencyKey ?? null, reason: null };
     const stop = input.at === undefined ? await this.stopOf(conversationId) : null;
     // Written once per key: a call that loses the insert to one with the same key gets that one's result.
-    const add = async (row: NudgeRow, schedule?: Parameters<StoreApi["addNudge"]>[1]): Promise<NudgeResult | number> => {
+    const add = async (row: NudgeRow, schedule?: Parameters<StoreApi["addNudge"]>[1]): Promise<NudgeState | number> => {
       const inbox = await this.store.addNudge(row, schedule);
       if (inbox !== null) return inbox;
-      return this.outcome((await this.store.nudgeByKey(input.idempotencyKey!))!);
+      const first = (await this.store.nudgeByKey(input.idempotencyKey!))!;
+      return this.result(first.id, first.status, first.reason);
     };
-    const settledAs = async (row: NudgeRow): Promise<NudgeResult> => {
+    const settledAs = async (row: NudgeRow): Promise<NudgeState> => {
       const added = await add(row);
       return typeof added === "number" ? this.result(row.id, row.status, row.reason) : added;
     };
@@ -599,31 +617,34 @@ export class Agent {
     if (!input.template && windowClosed({ info: this.infoOf(input.to.channel, conversationId), lastMessageAt: identity.lastMessageAt }, this.now())) {
       return settledAs({ ...record, body, status: "refused", reason: "outside_window" });
     }
-    const settled = this.waitFor(id);
     const added = await add({ ...record, body, status: "queued" });
-    if (typeof added !== "number") {
-      this.nudgeWaiters.delete(id);
-      return added;
-    }
+    if (typeof added !== "number") return added;
     this.wake(conversationId, added);
-    return settled;
+    return { id, status: "queued" };
   }
 
-  /** A nudge already recorded, as its caller sees it: settled, or (still queued) once it settles. */
-  private async outcome(row: NudgeRow): Promise<NudgeResult> {
-    if (row.status !== "queued") return this.result(row.id, row.status, row.reason);
-    const settled = this.waitFor(row.id);
+  /** A nudge's state now, or null for an id the store does not hold. */
+  async nudgeState(id: string): Promise<NudgeState | null> {
+    await this.settings.ready;
+    const row = await this.store.nudge(id);
+    return row && this.result(row.id, row.status, row.reason);
+  }
+
+  /** A recorded nudge as `nudge()` returns it: settled, or (still queued) once it settles. */
+  private async outcome(state: NudgeState): Promise<NudgeState> {
+    if (state.status !== "queued") return state;
+    const settled = this.waitFor(state.id);
     // It may have settled between the read and the wait.
-    const now = await this.store.nudge(row.id);
-    if (now && now.status !== "queued") this.release(row.id, this.result(row.id, now.status, now.reason));
+    const now = await this.store.nudge(state.id);
+    if (now && now.status !== "queued") this.release(state.id, this.result(state.id, now.status, now.reason));
     return settled;
   }
 
-  private waitFor(id: string): Promise<NudgeResult> {
+  private waitFor(id: string): Promise<NudgeState> {
     return new Promise((resolve) => this.nudgeWaiters.set(id, [...(this.nudgeWaiters.get(id) ?? []), resolve]));
   }
 
-  private release(id: string, result: NudgeResult): void {
+  private release(id: string, result: NudgeState): void {
     for (const resolve of this.nudgeWaiters.get(id) ?? []) resolve(result);
     this.nudgeWaiters.delete(id);
   }
@@ -731,8 +752,8 @@ export class Agent {
     return (await this.store.noContact(conversationId, this.now())).find((r) => r.hard) ?? null;
   }
 
-  private result(id: string, status: string, reason?: string | null): NudgeResult {
-    return reason ? { id, status: status as NudgeStatus, reason } : { id, status: status as NudgeStatus };
+  private result(id: string, status: string, reason?: string | null): NudgeState {
+    return reason ? { id, status: status as NudgeState["status"], reason } : { id, status: status as NudgeState["status"] };
   }
 
   private mustBeResumed(): void {

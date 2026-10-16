@@ -1,4 +1,4 @@
-// covers: simulators/src/server.ts simulators/src/platforms.ts src/agent.ts src/conversation.ts src/channels.ts
+// covers: simulators/src/server.ts simulators/src/platforms.ts src/agent.ts src/conversation.ts src/channels.ts src/http.ts
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, request } from "node:http";

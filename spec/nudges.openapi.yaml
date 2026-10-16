@@ -1,0 +1,164 @@
+openapi: 3.1.0
+info:
+  title: Chinwag nudges over HTTP
+  version: 0.1.0
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    The endpoint `nudgeHandler(agent, { token, base })` serves in the agent's own server, so a
+    backend that is a separate service can send nudges (messages the business starts) without a
+    route of its own. Paths are under `base`, `/nudges` by default; anything outside it gets 404.
+
+    - A POST answers as soon as the nudge is recorded, before it is sent or the agent's turn for it
+      runs: usually `queued`. Read how it ended with the GET.
+    - What is decided as it is recorded is in the POST's answer, still a 202: it is the nudge's
+      state, not an HTTP error. `refused` with `unknown_person` (they never wrote on that channel;
+      nothing is recorded, so `id` is "" and there is nothing to GET) or `outside_window` (past
+      WhatsApp's 24-hour window, for text and prompt nudges); `dropped` (they texted STOP);
+      `scheduled` (it has `at`).
+    - Every request needs `Authorization: Bearer <token>`. Wrong tokens are limited per address:
+      after 10 in 15 minutes the address gets 429 for the rest of that window, the right token too.
+    - Answers are JSON with `cache-control: no-store`.
+servers:
+  - url: http://localhost:3000
+    description: Wherever the agent's server listens.
+security:
+  - bearer: []
+paths:
+  /nudges:
+    post:
+      operationId: recordNudge
+      summary: Record a nudge; answers at once with its id and state.
+      requestBody:
+        required: true
+        description: At most 16,384 bytes of JSON. Unknown fields are refused.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NudgeRequest"
+            examples:
+              prompt:
+                summary: The agent writes it, in the context of the chat
+                value:
+                  to: { channel: whatsapp, address: "+15550100100" }
+                  prompt: Their order is ready for pickup.
+                  idempotency_key: order-1042-ready
+              text:
+                summary: Sent as written, later
+                value:
+                  to: { channel: sms, address: "+15550100100" }
+                  text: Your table is booked for 7pm.
+                  at: 1792335600000
+      responses:
+        "202":
+          description: Recorded (or, for an `idempotency_key` already used, the first nudge with that key).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NudgeState"
+              examples:
+                queued:
+                  value: { id: n_3f9c2a1b, status: queued }
+                unknownPerson:
+                  value: { id: "", status: refused, reason: unknown_person }
+        "400":
+          description: The body is not JSON, too large, or does not fit; the channel is not one of the agent's; a declared template's values do not fit it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: No token, or a wrong one.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many wrong tokens from this address.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /nudges/{id}:
+    get:
+      operationId: nudgeState
+      summary: A nudge's state now.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Its state now.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NudgeState"
+              example: { id: n_3f9c2a1b, status: sent }
+        "401":
+          description: No token, or a wrong one.
+        "404":
+          description: The agent never recorded a nudge with this id.
+        "429":
+          description: Too many wrong tokens from this address.
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: The token given to `nudgeHandler`, at least 32 characters.
+  schemas:
+    NudgeRequest:
+      type: object
+      additionalProperties: false
+      required: [to]
+      description: Exactly one of `text`, `prompt` or `template`.
+      properties:
+        to:
+          type: object
+          additionalProperties: false
+          required: [channel, address]
+          description: The person, by a channel identity they have written from.
+          properties:
+            channel: { type: string, description: One of the agent's channels, by name. }
+            address: { type: string, description: "Their address on it: a phone number, or the custom UI's user id." }
+        text: { type: string, minLength: 1, description: Sent as written, with no model call. }
+        prompt: { type: string, minLength: 1, description: The agent gets a turn with this note and writes the message itself, or sends nothing. }
+        template:
+          type: object
+          additionalProperties: false
+          required: [name]
+          description: A WhatsApp template the owner set up with Meta, as `Template` in src/types.ts. Cannot be combined with `at` yet.
+          properties:
+            name: { type: string }
+            language: { type: string }
+            header:
+              oneOf:
+                - { type: object, additionalProperties: false, required: [kind, text], properties: { kind: { const: text }, text: { type: string } } }
+                - { type: object, additionalProperties: false, required: [kind], properties: { kind: { enum: [image, video, document] }, url: { type: string }, fileId: { type: string } } }
+            body: { type: array, items: { type: string } }
+            buttons:
+              type: array
+              items: { type: object, additionalProperties: false, required: [index, value], properties: { index: { type: integer, minimum: 0 }, value: { type: string } } }
+            variables: { type: object, additionalProperties: { type: string } }
+        at: { type: integer, minimum: 0, description: Send it later, at this time, in milliseconds since the epoch. }
+        idempotency_key: { type: string, minLength: 1, maxLength: 200, description: The same key twice sends once; the second call gets the first nudge's id and state. }
+    NudgeState:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string }
+        status:
+          enum: [queued, sent, silent, dropped, refused, failed, scheduled]
+          description: |
+            queued (waiting for its send or turn); sent; silent (the agent chose to send nothing);
+            dropped (a no-contact rule covers it, or their STOP); refused (outside_window,
+            unknown_person); failed (it could not be sent, or the model failed); scheduled.
+        reason: { type: string, description: Why, for dropped, refused and failed. }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
