@@ -8,8 +8,8 @@ import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { basename, relative, resolve } from "node:path";
 import { toSpec, type Agent, type Incoming, type EventSink, type Outbound, type ChinwagEvent, type Tool } from "../../src/index.ts";
-import type { Command, Opened, WireIncoming, OpenSession, Receipt, RunSummary, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
-import { mimeOf, parseToolFile, suiteHash, type SuiteFile } from "./suite.ts";
+import type { Command, Opened, WireIncoming, OpenSession, Receipt, RunKey, RunSummary, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
+import { mimeOf, parseScenario, parseToolFile, suiteHash, type SuiteFile } from "./suite.ts";
 
 export interface ConnectOptions {
   /** The cloud's address, such as http://127.0.0.1:8900. */
@@ -56,6 +56,18 @@ export class SessionStopped extends Error {
     this.dashboard = dashboard;
   }
 }
+
+/** The cloud said session_gone, and its open said it can re-open: runInCloud plays the unfinished runs once more. */
+class SessionGone extends SessionStopped {
+  readonly sessionId: string;
+  constructor(reason: string, runs: RunSummary[], dashboard: string, sessionId: string) {
+    super(reason, runs, dashboard);
+    this.sessionId = sessionId;
+  }
+}
+
+/** What runInCloud answers. When the cloud lost the session and a second one played the runs it had not finished, `runs` holds both sessions' runs and `lost` names the first. */
+export type CloudSummary = SessionSummary & { lost?: { sessionId: string; dashboard: string } };
 
 /** A POST that sat until its own deadline. It fails that one call. Only a cloud that stores keys sends it again. The session abort is not one of these. */
 export class TimeoutError extends Error {
@@ -168,7 +180,47 @@ function isLoopback(cloud: string): boolean {
   return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
-export async function runInCloud(options: ConnectOptions): Promise<SessionSummary> {
+/** Plays the suite in the cloud. If the cloud loses the session (session_gone, on a cloud whose open said
+ * reopen), one new session plays only the runs that have no result yet, and the two reports are merged. */
+export async function runInCloud(options: ConnectOptions): Promise<CloudSummary> {
+  try {
+    return await playSession(options);
+  } catch (error) {
+    if (!(error instanceof SessionGone)) throw error;
+    const log = options.log ?? ((line: string) => console.log(line));
+    const unfinished = unfinishedRuns(options.files, options.runs ?? 1, error.runs);
+    if (!unfinished.length) throw new SessionStopped(error.message, error.runs, error.dashboard);
+    const which = unfinished.map((r) => `${r.scenario} on ${r.channel} #${r.run}`).join(", ");
+    log(`The cloud lost session ${error.sessionId} (${error.message}). Opening a new session to play the ${unfinished.length} run${unfinished.length === 1 ? "" : "s"} with no result, at the cloud's cost again: ${which}`);
+    let second: SessionSummary;
+    try {
+      second = await playSession(options, unfinished);
+    } catch (again) {
+      // Never a third session: a second loss stops with what both sessions finished.
+      if (again instanceof SessionStopped) throw new SessionStopped(again.message, [...error.runs, ...again.runs], again.dashboard);
+      throw new SessionStopped(`the cloud lost the session, and a new one did not open: ${again instanceof Error ? again.message : String(again)}`, error.runs, error.dashboard);
+    }
+    return { ...second, runs: [...error.runs, ...second.runs], lost: { sessionId: error.sessionId, dashboard: error.dashboard } };
+  }
+}
+
+/** The runs the suite plays (each scenario on each of its channels, `runs` times) that have no summary in `done`. */
+function unfinishedRuns(files: SuiteFile[], runs: number, done: RunSummary[]): RunKey[] {
+  const have = new Set(done.map((r) => `${r.scenario}\n${r.channel}\n${r.run}`));
+  const out: RunKey[] = [];
+  for (const file of files) {
+    if (!file.path.startsWith("scenarios/")) continue;
+    let scenario;
+    try { scenario = parseScenario(file); } catch { continue; /* the cloud would have refused the session */ }
+    for (const channel of scenario.channels) {
+      for (let run = 1; run <= runs; run++) if (!have.has(`${scenario.id}\n${channel}\n${run}`)) out.push({ scenario: scenario.id, channel, run });
+    }
+  }
+  return out;
+}
+
+/** One session, start to finish. `only`: the runs a re-open plays. */
+async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<SessionSummary> {
   const log = options.log ?? ((line: string) => console.log(line));
   const postTimeoutMs = options.postTimeoutMs ?? POST_TIMEOUT_MS;
   const streamIdleMs = options.streamIdleMs ?? STREAM_IDLE_MS;
@@ -186,6 +238,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   let stopped = false;
   let failure: Error | undefined;
   let dashboard = "";
+  let openedId = "";
+  let reopenable = false;
   const runs: RunSummary[] = [];
   let idle: ReturnType<typeof setTimeout> | undefined;
   let refresh: ReturnType<typeof setTimeout> | undefined;
@@ -298,9 +352,13 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     deliveryReceipts: true,
     retries: true,
     resume: true,
+    reopen: true,
+    ...(only ? { only } : {}),
   };
   const opened = await post<Opened>(`${base}/api/sessions`, open, options.openHeaders, controller.signal, undefined, postTimeoutMs);
   idempotent = opened.idempotency === true;
+  openedId = opened.sessionId;
+  reopenable = opened.reopen === true;
   const tunnel = tunnelBase(base, opened);
   auth = { authorization: `Bearer ${opened.token}` };
   const missing = new Set(opened.missing);
@@ -528,7 +586,10 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     const reason = failure ?? (error instanceof Error ? error : new Error(String(error)));
     // Exit 2 is a transport failure after the session exists. A refusal, or anything
     // before the open answers, is the error itself (the CLI exits 1 and prints it alone).
-    if (dashboard && isTransportFailure(reason)) throw new SessionStopped(reason.message, runs, dashboard);
+    if (dashboard && isTransportFailure(reason)) {
+      if (reopenable && saysGone(reason)) throw new SessionGone(reason.message, runs, dashboard, openedId);
+      throw new SessionStopped(reason.message, runs, dashboard);
+    }
     throw reason;
   } finally {
     stopped = true;
@@ -596,10 +657,20 @@ function isTransportFailure(error: unknown): boolean {
   let current: unknown = error;
   for (let guard = 0; current instanceof Error && guard < 6; guard++) {
     if (current instanceof TimeoutError || current instanceof StreamLost) return true;
-    if (current instanceof PostError) return !current.code && (current.status === 502 || current.status === 503 || current.status === 504);
+    if (current instanceof PostError) return current.code === "session_gone" || (!current.code && (current.status === 502 || current.status === 503 || current.status === 504));
     if (/^could not open the stream \((502|503|504)\)$/.test(current.message)) return true;
     const code = (current as NodeJS.ErrnoException).code;
     if (code === "ECONNRESET" || code === "ECONNREFUSED" || code === "EPIPE" || code === "ETIMEDOUT" || code === "EAI_AGAIN" || code === "ENOTFOUND" || current.message === "socket hang up") return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+/** The cloud no longer has the session: a tunnel call or the stream answered session_gone. */
+function saysGone(error: unknown): boolean {
+  let current: unknown = error;
+  for (let guard = 0; current instanceof Error && guard < 6; guard++) {
+    if (current instanceof PostError && current.code === "session_gone") return true;
     current = current.cause;
   }
   return false;

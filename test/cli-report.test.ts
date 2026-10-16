@@ -58,11 +58,11 @@ function cloud(hold: boolean) {
   });
 }
 
-function runCli(url: string, dir: string) {
+function runCli(url: string, dir: string, extra: string[] = []) {
   const env = { ...process.env };
   delete env.CHINWAG_CLOUD;
   delete env.CHINWAG_CLOUD_KEY;
-  return spawn(process.execPath, [cli, "test", "--cloud", url], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
+  return spawn(process.execPath, [cli, "test", "--cloud", url, ...extra], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
 }
 
 test("a stream that dies prints the runs already in and exits 2", { timeout: 15_000 }, async () => {
@@ -142,4 +142,42 @@ test("an agent that fails to build exits 1 and prints only the message", { timeo
     assert.match(out, /agent broke/);
     assert.ok(!out.includes("runs finished before"));
   } finally { child.kill(); }
+});
+
+test("a session the cloud lost and a second one played prints both dashboards", { timeout: 15_000 }, async () => {
+  let opens = 0;
+  const second = { ...run, run: { ...run.run, runId: "r2", run: 2 } };
+  const server = createServer((req, res) => {
+    req.resume();
+    const reply = (status: number, value: unknown) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
+    if (req.url === "/api/sessions") {
+      opens++;
+      return reply(200, { sessionId: `s${opens}`, token: `t${opens}`, missing: [], dashboard: `http://dash/s${opens}`, reopen: true });
+    }
+    if (req.url?.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (req.url.includes("/s1/")) return void res.write(`data: ${JSON.stringify(run)}\n\ndata: ${JSON.stringify({ type: "drain" })}\n\n`);
+      const finished = { type: "finished", summary: { sessionId: "s2", suiteHash: "h", testModel: "fake", runs: [second.run], dashboard: "http://dash/s2" } };
+      return void res.end(`data: ${JSON.stringify(second)}\n\ndata: ${JSON.stringify(finished)}\n\n`);
+    }
+    if (req.url?.endsWith("/drained")) return reply(410, { error: "session_gone" });
+    reply(200, {});
+  });
+  const local = await new Promise<{ url: string; close: () => void }>((done) => {
+    server.listen(0, "127.0.0.1", () => done({
+      url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      close: () => { server.closeAllConnections(); server.close(); },
+    }));
+  });
+  const child = runCli(local.url, agentDir(), ["--runs", "2"]);
+  let out = "";
+  child.stdout.on("data", (chunk) => { out += chunk; });
+  child.stderr.on("data", (chunk) => { out += chunk; });
+  try {
+    const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+    assert.equal(code, 1, out);
+    assert.match(out, /0 of 2 runs passed/);
+    assert.match(out, /The cloud lost session s1 part way; a second session played its unfinished runs\. The first: http:\/\/dash\/s1/);
+    assert.match(out, /http:\/\/dash\/s2/);
+  } finally { child.kill(); local.close(); }
 });

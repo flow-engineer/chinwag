@@ -244,6 +244,7 @@ for (const channel of [...new Set(summary.runs.map((r) => r.channel))]) {
   const runs = summary.runs.filter((r) => r.channel === channel);
   console.log(`  ${channel}: ${runs.filter((r) => r.passed).length} of ${runs.length} passed`);
 }
+if (summary.lost) console.log(`The cloud lost session ${summary.lost.sessionId} part way; a second session played its unfinished runs. The first: ${summary.lost.dashboard}`);
 console.log(`Cost: ${usd(total((r) => r.agentUsage.costUsd))} agent (${total((r) => r.agentUsage.input).toLocaleString()} in, ${total((r) => r.agentUsage.output).toLocaleString()} out) + ${usd(total((r) => r.testUsage.costUsd))} test models.\n${summary.dashboard}`);
 process.exit(passed === summary.runs.length ? 0 : 1);
 
