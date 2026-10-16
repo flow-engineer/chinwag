@@ -87,6 +87,11 @@ test("a person resolve does not know is keyed by their verified phone, with no k
   assert.deepEqual(seen, [{ person: "phone:+15550100300", key: null }]);
 });
 
+test("a channel may not be named key or phone, so a channel identity never reads as a resolve key or a phone", () => {
+  assert.throws(() => multi({ channels: { key: { info: WEB_APP } } }), /"key" is reserved/);
+  assert.throws(() => multi({ channels: { phone: { info: SMS, phone: true } } }), /"phone" is reserved/);
+});
+
 test("each channel's send tool is named for it from the first message; a second channel adds one and changes nothing", async () => {
   const h = multi({ channels: { sms: { info: SMS, phone: true }, web: { info: WEB_APP } }, resolve: () => "customer-7" });
   await h.message("sms", "+15550100100", "hi");
