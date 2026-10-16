@@ -20,8 +20,8 @@ import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
 import { businessSchedule, claimDue } from "./schedules.ts";
 import { loadInstructions, loadSkills, readAgentFolder, skillTool, type AgentFiles } from "./skills.ts";
-import { Store, type ConversationRow, type IdentityRow, type NudgeRow, type StoreApi, type Via } from "./store.ts";
-import { validZone } from "./time.ts";
+import { Store, type ConversationRow, type IdentityRow, type NudgeRow, type QuietHours, type StoreApi, type TimeZoneSource, type Via } from "./store.ts";
+import { clock, quietUntil, validZone } from "./time.ts";
 import { STAND_IN, toSpec, type Tool } from "./tools.ts";
 import { traces, tracesFromEnv, type Traces, type TracesOptions } from "./traces.ts";
 import type { ChannelInfo, Deliver, Incoming, Model, Outbound, Template, TemplateDefinition, Transcribe } from "./types.ts";
@@ -114,6 +114,13 @@ export interface AgentOptions {
    */
   defaultCountryCode?: string;
   /**
+   * Quiet hours in each person's own time ("22:00" to "07:00", the default), when what the business
+   * starts waits: a nudge is held until they end (or the person writes), then the agent writes one
+   * message for everything held. A person may set their own; `false` turns them off. They apply only
+   * where the person's time zone is known: without it nothing is held.
+   */
+  quietHours?: QuietHours | false;
+  /**
    * The business's time zone (IANA): the time the agent is told when the person's zone is not known,
    * and the time a business-started schedule is shown in. Never taken as the person's own: set
    * theirs with setTimeZone, or the agent asks them.
@@ -187,6 +194,10 @@ export interface NudgeInput {
   at?: number;
   /** The same key twice sends once, also when both calls come at once: the second gets the first's result. */
   idempotencyKey?: string;
+  /** Wait for the end of their quiet hours (default true); false sends it now, quiet hours or not. */
+  respectQuietHours?: boolean;
+  /** A nudge held for quiet hours past this (ms since the epoch; default 24 hours on) is dropped as expired. */
+  expiresAt?: number;
 }
 
 export interface NudgeResult {
@@ -194,13 +205,29 @@ export interface NudgeResult {
   /**
    * sent; silent (the agent chose not to); dropped (a no-contact rule, or their STOP); refused
    * (outside_window, unknown_person); failed (it could not be sent, or the model failed: `reason`
-   * says why, and the person was sent nothing about it); or scheduled.
+   * says why, and the person was sent nothing about it); scheduled; held (for their quiet hours,
+   * until they end or the person writes); or expired (held past its expiresAt, never sent).
    */
   status: NudgeStatus;
   reason?: string;
 }
 
-export type NudgeStatus = "sent" | "silent" | "dropped" | "refused" | "failed" | "scheduled";
+export type NudgeStatus = "sent" | "silent" | "dropped" | "refused" | "failed" | "scheduled" | "held" | "expired";
+
+/** What the business and the person set for someone, as the agent goes by it. */
+export interface Contact {
+  timeZone: string | null;
+  timeZoneSource: TimeZoneSource | null;
+  /** The quiet hours that apply to them: their own, the agent's, or none ("off", or no time zone known). */
+  quietHours: QuietHours | null;
+  quietHoursSource: "person" | "agent" | "off" | "no_time_zone";
+  /** They texted STOP. */
+  stop: boolean;
+  /** Nothing the business starts until each of these (ms since the epoch). */
+  pauses: Array<{ id: string; until: number | null }>;
+  /** What they asked not to be messaged about, in their words. */
+  topics: Array<{ id: string; rule: string; until: number | null }>;
+}
 
 /** A nudge as it stands now: `queued` until it is sent or settled, else how it settled. */
 export interface NudgeState {
@@ -242,6 +269,7 @@ export class Agent {
     this.channelsByName = new Map((options.channels ?? []).map((c) => [c.name, c]));
     if (this.channelsByName.size !== (options.channels ?? []).length) throw new Error("chinwag: two channels have the same name");
     this.now = options.now ?? Date.now;
+    if (options.quietHours && !validQuietHours(options.quietHours)) throw new Error('chinwag: quietHours is { from: "HH:MM", to: "HH:MM" }');
     if (options.defaultCountryCode !== undefined && !/^\+?[1-9]\d{0,2}$/.test(options.defaultCountryCode.trim())) throw new Error(`chinwag: defaultCountryCode is a calling code such as "+91", not "${options.defaultCountryCode}"`);
     this.countryCode = options.defaultCountryCode?.trim().replace(/^\+/, "");
     const tracing = options.traces ?? tracesFromEnv();
@@ -281,6 +309,7 @@ export class Agent {
       ready: this.store.migrate(),
       now: this.now,
       timeZone: options.timeZone,
+      quietHours: options.quietHours,
       templates: options.templates ?? [],
       tagChannels: (options.channels ?? []).length > 1,
       links: (id) => this.links(id),
@@ -308,7 +337,7 @@ export class Agent {
    * provider's own `messageId`: the same one again (a webhook retried) is not taken twice.
    */
   async message(input: { channel: string; from: string; message: string | Incoming; messageId?: string }): Promise<{ conversationId: string; messageId: string } | null> {
-    return this.take(this.channelOf(input.channel), { ...input, via: "provider" });
+    return this.released(await this.take(this.channelOf(input.channel), { ...input, via: "provider" }));
   }
 
   /**
@@ -320,7 +349,30 @@ export class Agent {
     const person = this.testPerson(input.person);
     if (!person) throw new Error("chinwag: only the agent's testPeople can be simulated");
     const adapter = this.channelOf(input.channel);
-    return this.take(adapter, { channel: input.channel, from: this.testAddress(adapter, person), message: input.message, messageId: input.messageId, via: "playground", person });
+    return this.released(await this.take(adapter, { channel: input.channel, from: this.testAddress(adapter, person), message: input.message, messageId: input.messageId, via: "playground", person }));
+  }
+
+  /** They wrote, so they are there: what was held for their quiet hours goes now, in this turn. */
+  private async released<T extends { conversationId: string } | null>(taken: T): Promise<T> {
+    if (taken) await this.releaseHeld(this.now(), taken.conversationId);
+    return taken;
+  }
+
+  /**
+   * Held nudges whose quiet hours are over (or every one of a conversation whose person just wrote)
+   * go on; ones past their expiresAt are settled as expired. Released together, they reach one turn.
+   */
+  private async releaseHeld(now: number, writer?: string): Promise<void> {
+    for (const n of await this.store.heldNudges(writer)) {
+      const body = n.body as { holdUntil?: number; expiresAt?: number };
+      if ((body.expiresAt ?? Infinity) <= now) {
+        await this.settle({ nudge: n.id }, "expired", "held past its expiresAt for their quiet hours");
+        continue;
+      }
+      if (!writer && (body.holdUntil ?? 0) > now) continue;
+      const inbox = await this.store.releaseNudge(n);
+      if (inbox !== null) this.wake(n.conversationId, inbox);
+    }
   }
 
   /** Sends the traces of finished turns still waiting for the traces endpoint; call it before the process exits. */
@@ -595,13 +647,49 @@ export class Agent {
     if (!identity) return { status: "refused", reason: "unknown_person" };
     const id = identity.conversationId;
     const resident = this.conversations.get(id);
-    if (resident) await resident.setTimeZone(input.timeZone);
+    if (resident) await resident.setTimeZone(input.timeZone, "business");
     else {
-      await this.store.updateConversation(id, { timeZone: input.timeZone });
+      await this.store.updateConversation(id, { timeZone: input.timeZone, timeZoneSource: "business" });
       const row = this.rows.get(id);
-      if (row) this.rows.set(id, { ...row, timeZone: input.timeZone });
+      if (row) this.rows.set(id, { ...row, timeZone: input.timeZone, timeZoneSource: "business" });
     }
     return { status: "set" };
+  }
+
+  /**
+   * Their own quiet hours, as the business knows them: `{ from, to }`, "off" for none, or null to go
+   * back to the agent's. Refused (unknown_person) for someone who never wrote.
+   */
+  async setQuietHours(input: { to: { channel: string; address: string }; quietHours: QuietHours | "off" | null }): Promise<{ status: "set" } | { status: "refused"; reason: "unknown_person" }> {
+    const q = input.quietHours;
+    if (q !== null && q !== "off" && !validQuietHours(q)) throw new Error('chinwag: quietHours is { from: "HH:MM", to: "HH:MM" }, "off" or null');
+    await this.settings.ready;
+    const identity = await this.store.identity(input.to.channel, input.to.address);
+    if (!identity) return { status: "refused", reason: "unknown_person" };
+    const resident = this.conversations.get(identity.conversationId);
+    if (resident) await resident.setQuietHours(q);
+    else await this.store.updateConversation(identity.conversationId, { quietHours: q });
+    return { status: "set" };
+  }
+
+  /** What the business and the person set for someone, by a channel identity they wrote from; null for someone who never wrote. */
+  async contact(to: { channel: string; address: string }): Promise<Contact | null> {
+    await this.settings.ready;
+    const identity = await this.store.identity(to.channel, to.address);
+    const row = identity && (await this.store.conversation(identity.conversationId));
+    if (!row) return null;
+    const rules = await this.store.noContact(row.id, this.now());
+    const own = row.quietHours;
+    const hours = quietHoursOf(row, this.options.quietHours);
+    return {
+      timeZone: row.timeZone,
+      timeZoneSource: row.timeZoneSource,
+      quietHours: row.timeZone ? hours : null,
+      quietHoursSource: !hours ? "off" : !row.timeZone ? "no_time_zone" : own && own !== "off" ? "person" : "agent",
+      stop: rules.some((r) => r.kind === "stop"),
+      pauses: rules.filter((r) => r.kind === "pause").map((r) => ({ id: r.id, until: r.until })),
+      topics: rules.filter((r) => r.kind === "topic").map((r) => ({ id: r.id, rule: r.rule, until: r.until })),
+    };
   }
 
   /** Whether the agent has a profile (get_user_profile), so the test cloud knows to play it. */
@@ -635,7 +723,7 @@ export class Agent {
     const id = `n_${randomUUID().slice(0, 8)}`;
     const conversationId = identity.conversationId;
     const record = { id, conversationId, channel: input.to.channel, idempotencyKey: input.idempotencyKey ?? null, reason: null };
-    const stop = input.at === undefined ? await this.stopOf(conversationId) : null;
+    const stop = input.at === undefined ? await this.blockOf(conversationId) : null;
     // Written once per key: a call that loses the insert to one with the same key gets that one's result.
     const add = async (row: NudgeRow, schedule?: Parameters<StoreApi["addNudge"]>[1]): Promise<NudgeState | number> => {
       const inbox = await this.store.addNudge(row, schedule);
@@ -654,11 +742,18 @@ export class Agent {
     if (input.at !== undefined) {
       if (input.template) throw new Error("chinwag: a template nudge cannot be scheduled yet");
       const zone = (await this.store.conversation(conversationId))?.timeZone ?? this.options.timeZone ?? "UTC";
-      const schedule = businessSchedule(conversationId, input.to.channel, input.at, zone, { text: input.text, prompt: input.prompt });
+      const schedule = businessSchedule(conversationId, input.to.channel, input.at, zone, { text: input.text, prompt: input.prompt }, input.respectQuietHours !== false);
       const added = await add({ ...record, body: { text: input.text, prompt: input.prompt, at: input.at }, status: "scheduled" }, schedule);
       return typeof added === "number" ? { id, status: "scheduled" } : added;
     }
     const body = input.template ? { template: input.template } : input.text !== undefined ? { text: input.text } : { prompt: input.prompt };
+    const now = this.now();
+    const quietEnds = input.respectQuietHours === false ? null : await this.quietEnd(conversationId, now);
+    if (quietEnds !== null) {
+      const held = { ...body, heldAt: now, holdUntil: quietEnds, expiresAt: input.expiresAt ?? now + DAY_MS };
+      const added = await add({ ...record, body: held, status: "held", reason: "quiet_hours" });
+      return typeof added === "number" ? { id, status: "held", reason: "quiet_hours" } : added;
+    }
     if (!input.template && windowClosed({ info: this.infoOf(input.to.channel, conversationId), lastMessageAt: identity.lastMessageAt }, this.now())) {
       return settledAs({ ...record, body, status: "refused", reason: "outside_window" });
     }
@@ -702,14 +797,15 @@ export class Agent {
     await this.settings.ready;
     if (this.store.durable && !this.resumed) return 0;
     const now = this.now();
-    const queued = await claimDue(this.store, now, async (s) => {
-      const stop = await this.stopOf(s.conversationId);
+    const queued = await claimDue(this.store, now, (s) => this.quietEnd(s.conversationId, now), async (s) => {
+      const stop = s.origin === "person" ? await this.stopOf(s.conversationId) : await this.blockOf(s.conversationId);
       if (stop) return `no-contact rule ${stop.id}: ${stop.rule}`;
       const identity = (await this.store.identities(s.conversationId)).find((i) => i.channel === s.channel);
       if (!identity) return `no way to reach them on ${s.channel}`;
       return windowClosed({ info: this.infoOf(s.channel, s.conversationId), lastMessageAt: identity.lastMessageAt }, now) ? "outside_window" : null;
     });
     for (const q of queued) this.wake(q.conversationId, q.inbox);
+    await this.releaseHeld(now);
     await this.pruneMessageIds(now).catch((error) => console.warn("chinwag: pruning message ids:", error));
     return queued.length;
   }
@@ -797,6 +893,18 @@ export class Agent {
     return (await this.store.noContact(conversationId, this.now())).find((r) => r.hard) ?? null;
   }
 
+  /** Their STOP, or a pause in force: either way nothing the business starts goes now. */
+  private async blockOf(conversationId: string) {
+    return (await this.store.noContact(conversationId, this.now())).find((r) => r.hard || r.kind === "pause") ?? null;
+  }
+
+  /** When their quiet hours end, if they are in them now; null when not, or when their time zone is not known. */
+  private async quietEnd(conversationId: string, now: number): Promise<number | null> {
+    const row = await this.store.conversation(conversationId);
+    const hours = row && quietHoursOf(row, this.options.quietHours);
+    return row?.timeZone && hours ? quietUntil(now, row.timeZone, hours) : null;
+  }
+
   private result(id: string, status: string, reason?: string | null): NudgeState {
     return reason ? { id, status: status as NudgeState["status"], reason } : { id, status: status as NudgeState["status"] };
   }
@@ -843,3 +951,19 @@ export function normalizePhone(address: string, countryCode?: string): string {
 export function createAgent(options: AgentOptions): Agent {
   return new Agent(options);
 }
+
+const DAY_MS = 24 * 60 * 60_000;
+export const DEFAULT_QUIET_HOURS: QuietHours = { from: "22:00", to: "07:00" };
+
+function validQuietHours(q: unknown): q is QuietHours {
+  const v = q as QuietHours;
+  return typeof v === "object" && v !== null && typeof v.from === "string" && typeof v.to === "string" && !!clock(v.from) && !!clock(v.to);
+}
+
+/** The quiet hours that apply to a person: their own, else the agent's (the default unless it turned them off). */
+export function quietHoursOf(row: Pick<ConversationRow, "quietHours">, agent: QuietHours | false | undefined): QuietHours | null {
+  if (row.quietHours === "off") return null;
+  if (row.quietHours) return row.quietHours;
+  return agent === false ? null : (agent ?? DEFAULT_QUIET_HOURS);
+}
+

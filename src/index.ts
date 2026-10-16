@@ -1,4 +1,4 @@
-export { Agent, createAgent, type AgentOptions, type AgentStatus, type NudgeInput, type NudgeResult, type NudgeState, type NudgeStatus, type PlaygroundSink, type ReceiveOptions, type TestPerson } from "./agent.ts";
+export { Agent, createAgent, type AgentOptions, type AgentStatus, type Contact, type NudgeInput, type NudgeResult, type NudgeState, type NudgeStatus, type PlaygroundSink, type ReceiveOptions, type TestPerson } from "./agent.ts";
 export {
   customUI,
   declaredTemplate,
@@ -23,7 +23,7 @@ export {
   type WhatsAppProvider,
 } from "./channels.ts";
 export { Conversation, type Profile, type TranscriptEntry } from "./conversation.ts";
-export { nudgeHandler, timeZoneHandler, type NudgeHandlerOptions, type TimeZoneHandlerOptions } from "./http.ts";
+export { nudgeHandler, peopleHandler, type NudgeHandlerOptions, type PeopleHandlerOptions } from "./http.ts";
 export { sqlite, type Database } from "./db.ts";
 export { postgres, type PostgresPool } from "./postgres.ts";
 export { jsonlSink, type EventSink, type ChinwagEvent } from "./events.ts";

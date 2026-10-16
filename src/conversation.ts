@@ -40,7 +40,7 @@ import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
-import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
+import type { ConversationRow, InboxRow, NoContactRow, QuietHours, StoreApi, TimeZoneSource } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
 import { formatLocal } from "./time.ts";
 import { render, tool, toSpec, type Tool } from "./tools.ts";
@@ -75,8 +75,10 @@ export interface ConversationSettings {
   /** Resolves once the store's tables exist. */
   ready: Promise<void>;
   now: () => number;
-  /** The agent's own time zone (the business's), for schedules when the person's is not known. */
+  /** The agent's own time zone (the business's): the time it is told when the person's is not known. */
   timeZone?: string;
+  /** The agent's quiet hours for everyone (false: none), unless a person set their own. */
+  quietHours?: QuietHours | false;
   /** The WhatsApp templates the owner declared: a sent one's text goes in the history. */
   templates: TemplateDefinition[];
   /** Tag every message with its channel (the agent has several), even for a person on one so far. */
@@ -206,6 +208,8 @@ export class Conversation {
   private readonly lifetime = new AbortController();
   private recentChannels: string[] = [];
   private timeZone: string | null = null;
+  /** Their own quiet hours ("off": none), or null for the agent's. */
+  private quietHours: QuietHours | "off" | null = null;
   private running = false;
   /** Messages whose files are still being read (downloaded, transcribed); later ones wait behind them. */
   private preparing: Promise<void> | null = null;
@@ -250,6 +254,7 @@ export class Conversation {
       this.turns = existing.turns;
       this.recentChannels = existing.recentChannels;
       this.timeZone = existing.timeZone;
+      this.quietHours = existing.quietHours;
     }
     const builtins = [
       ...scheduleTools({
@@ -258,13 +263,10 @@ export class Conversation {
         channel: () => this.currentChannel(),
         now: settings.now,
         personZone: () => this.timeZone,
-        setPersonZone: (zone) => {
-          this.timeZone = zone;
-          return this.persist(() => settings.store.updateConversation(id, { timeZone: zone }));
-        },
+        setPersonZone: (zone) => this.setTimeZone(zone, "person"),
         agentZone: settings.timeZone,
       }),
-      ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone }),
+      ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone, setQuietHours: (q) => this.setQuietHours(q) }),
     ];
     this.builtins = new Map(builtins.map((t) => [t.name, t]));
     this.builtinSpecs = builtins.map(toSpec);
@@ -272,10 +274,16 @@ export class Conversation {
     this.writes = this.loaded.catch((error) => console.warn(`chinwag: conversation ${id} did not load:`, error));
   }
 
-  /** Their time zone, as the business knows it (agent.setTimeZone): schedules and the time line use it from now on. */
-  setTimeZone(zone: string): Promise<void> {
+  /** Their time zone, as the business set it or they said it: schedules, quiet hours and the time line use it from now on. */
+  setTimeZone(zone: string, source: TimeZoneSource): Promise<void> {
     this.timeZone = zone;
-    return this.persist(() => this.settings.store.updateConversation(this.id, { timeZone: zone }));
+    return this.persist(() => this.settings.store.updateConversation(this.id, { timeZone: zone, timeZoneSource: source }));
+  }
+
+  /** Their own quiet hours ("off": none; null: back to the agent's). */
+  setQuietHours(hours: QuietHours | "off" | null): Promise<void> {
+    this.quietHours = hours;
+    return this.persist(() => this.settings.store.updateConversation(this.id, { quietHours: hours }));
   }
 
   /** What a channel of this conversation can show, if the person has written on it. */
@@ -435,7 +443,10 @@ export class Conversation {
       else this.notes.push({ text: p.text, inbox: row.id, owed: { run: p.run, mode: p.mode, channel: p.channel } });
     } else if (row.kind === "nudge") {
       if (p.prompt !== undefined) {
-        const text = `[Nudge from the business, not from the person: ${p.prompt}] Write it to them now in your own words, or send nothing if it does not fit what they asked not to be messaged about.`;
+        const held = typeof p.heldAt === "number" ? `held for their quiet hours since ${formatLocal(this.timeZone ?? this.settings.timeZone ?? "UTC", p.heldAt)}; ` : "";
+        const text = held
+          ? `[Nudge from the business, not from the person, ${held}${p.prompt}] Tell them now in your own words. Others held with it come in this turn too: cover them all in one short message, not a text each, and answer anything they just asked first.`
+          : `[Nudge from the business, not from the person: ${p.prompt}] Write it to them now in your own words, or send nothing if it does not fit what they asked not to be messaged about.`;
         this.notes.push({ text, inbox: row.id, owed: { nudge: p.nudge, mode: "prompt", channel: p.channel } });
       } else this.direct.push({ inbox: row.id, channel: p.channel, text: p.text, template: p.template, nudge: p.nudge });
     }
@@ -466,7 +477,7 @@ export class Conversation {
     const inbound = messageId === undefined ? undefined : { channel, messageId };
     this.settings.emit(this.id, "keyword", { keyword: kind, text, channel });
     if (kind === "stop") {
-      const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true };
+      const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true, kind: "stop" };
       this.stop = rule;
       this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: nothing the business starts (nudges, scheduled messages) reaches them until they text START. Answer them when they write.`, true);
       return this.persist(() => store.setStop(this.id, rule, inbound));
@@ -734,7 +745,8 @@ export class Conversation {
         }
       }
     }
-    const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC");
+    const quiet = this.quietHours === "off" ? null : (this.quietHours ?? (this.settings.quietHours === false ? null : (this.settings.quietHours ?? { from: "22:00", to: "07:00" })));
+    const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC", this.timeZone ? quiet : null);
     // A message that came while those loaded had no step to restart: it joins the first one.
     this.absorb();
     let restarts = 0;

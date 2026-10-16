@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, tool, type AgentOptions, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
+import { createAgent, sqlite, tool, type AgentOptions, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
 import type { ChannelInfo, ChannelKind, ChatMessage, Keywords, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
 
 /**
@@ -114,6 +114,7 @@ export function multi(options: {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
   const scripted = scriptedModel();
+  const database = options.database ?? sqlite();
   const events: ChinwagEvent[] = [];
   const out: Array<{ channel: string; address: string; outbound: Outbound }> = [];
   const channels = Object.entries(options.channels).map(([name, c]) => ({
@@ -130,7 +131,7 @@ export function multi(options: {
     debounceMs: 0,
     events: [(e) => events.push(e)],
     channels,
-    database: options.database,
+    database,
     resolve: options.resolve,
     now: options.now,
     timeZone: options.timeZone,
@@ -152,5 +153,5 @@ export function multi(options: {
       if (test(c)) return { call: c, index: i };
     }
   }
-  return { agent, out, texts, message, events, callWith, dir, ...scripted };
+  return { agent, out, texts, message, events, callWith, dir, database, ...scripted };
 }

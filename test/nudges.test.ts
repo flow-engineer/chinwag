@@ -83,7 +83,7 @@ test("a nudge a no-contact rule covers is dropped, and the rules are in the agen
 
   await h.message("sms", SAM.address, "thanks");
   const next = await h.nextCall(4);
-  assert.match(next.request.system, /What they asked not to be messaged about[\s\S]*no reminders about the specials/);
+  assert.match(next.request.system, /When and what not to message them[\s\S]*no reminders about the specials/);
   next.answer(respond(call("send_sms", { text: "Anytime." })));
   await h.conversation.whenIdle();
 });
@@ -329,4 +329,113 @@ test("two calls with one idempotency key at once send once, and both get its res
   assert.deepEqual(c, d);
   h.clock.now += 120_000;
   assert.equal(await h.agent.runDue(), 1, "one schedule, so it goes out once");
+});
+
+// --- Quiet hours ---
+
+const ELEVEN_PM_NY = Date.UTC(2026, 9, 13, 3);
+const SEVEN_AM_NY = Date.UTC(2026, 9, 13, 11);
+
+/** Sam in New York (the business set it), at 11pm their time: inside the default quiet hours, 22:00 to 07:00. */
+async function samAtNight() {
+  const h = await withSam(undefined, { now: ELEVEN_PM_NY });
+  assert.deepEqual(await h.agent.setTimeZone({ to: h.to, timeZone: "America/New_York" }), { status: "set" });
+  return h;
+}
+
+test("in their quiet hours nudges are held, and when the hours end everything held reaches one turn", async () => {
+  const h = await samAtNight();
+  const shipped = await h.agent.nudge({ to: h.to, prompt: "Their order shipped" });
+  const coupon = await h.agent.nudge({ to: h.to, text: "Your coupon code is SAVE10" });
+  assert.deepEqual([shipped.status, coupon.status], ["held", "held"]);
+  assert.equal(shipped.reason, "quiet_hours");
+  assert.equal(h.calls.length, 1, "no model call while they sleep");
+  assert.deepEqual(h.texts("sms"), ["Hi!"]);
+
+  await h.agent.runDue();
+  assert.equal(h.calls.length, 1, "still their quiet hours: nothing released");
+  h.clock.now = SEVEN_AM_NY;
+  await h.agent.runDue();
+  const turn = await h.nextCall(1);
+  assert.match(last(turn.request.messages).content, /held for their quiet hours since Mon 12 Oct 2026 23:00 \(New York time\); Their order shipped\][\s\S]*cover them all in one short message/);
+  turn.answer(respond(call("send_sms", { text: "Morning! Your order shipped." })));
+  await h.conversation.whenIdle();
+  assert.deepEqual(h.texts("sms").sort(), ["Hi!", "Morning! Your order shipped.", "Your coupon code is SAVE10"], "a text nudge goes as written, a prompt one in the agent's words");
+  assert.equal((await h.agent.nudgeState(shipped.id))?.status, "sent");
+});
+
+test("held nudges go as soon as the person writes, in the turn that answers them", async () => {
+  const h = await samAtNight();
+  await h.agent.nudge({ to: h.to, prompt: "Their order shipped" });
+  await h.message("sms", SAM.address, "can't sleep, what's my order status?");
+  const { call: turn } = await h.callWith(1, (c) => /order shipped/.test(JSON.stringify(c.request.messages)));
+  const seen = JSON.stringify(turn.request.messages);
+  assert.ok(seen.includes("what's my order status") && seen.includes("held for their quiet hours"), "their message and what was held, in one turn");
+  turn.answer(respond(call("send_sms", { text: "It shipped tonight." })));
+  await h.conversation.whenIdle();
+});
+
+test("a held nudge past its expiresAt is dropped as expired; respectQuietHours false sends it now", async () => {
+  const h = await samAtNight();
+  const stale = await h.agent.nudge({ to: h.to, text: "Your table is ready", expiresAt: ELEVEN_PM_NY + 30 * 60_000 });
+  assert.equal(stale.status, "held");
+  h.clock.now = SEVEN_AM_NY;
+  await h.agent.runDue();
+  assert.equal((await h.agent.nudgeState(stale.id))?.status, "expired");
+  assert.deepEqual(h.texts("sms"), ["Hi!"]);
+
+  h.clock.now = ELEVEN_PM_NY;
+  assert.equal((await h.agent.nudge({ to: h.to, text: "Your account was locked", respectQuietHours: false })).status, "sent");
+});
+
+test("without their time zone quiet hours do not apply; a person may set their own, or none", async () => {
+  const h = await withSam(undefined, { now: ELEVEN_PM_NY });
+  assert.equal((await h.agent.nudge({ to: h.to, text: "Order shipped" })).status, "sent", "their zone is not known: nothing is held");
+  assert.equal((await h.agent.contact(h.to))?.quietHoursSource, "no_time_zone");
+
+  await h.agent.setTimeZone({ to: h.to, timeZone: "America/New_York" });
+  assert.deepEqual(await h.agent.setQuietHours({ to: h.to, quietHours: "off" }), { status: "set" });
+  assert.equal((await h.agent.nudge({ to: h.to, text: "Second" })).status, "sent", "they turned quiet hours off");
+
+  await h.message("sms", SAM.address, "please nothing after 9pm or before 9am");
+  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Got it." }), call("set_quiet_hours", { set: "hours", from: "21:00", to: "09:00" })));
+  (await h.nextCall(2)).answer(respond());
+  await h.conversation.whenIdle();
+  const contact = await h.agent.contact(h.to);
+  assert.deepEqual([contact?.quietHours, contact?.quietHoursSource, contact?.timeZoneSource], [{ from: "21:00", to: "09:00" }, "person", "business"]);
+  h.clock.now = Date.UTC(2026, 9, 13, 12, 30); // 8:30am New York: inside their own hours, not the default
+  assert.equal((await h.agent.nudge({ to: h.to, text: "Third" })).status, "held");
+});
+
+test("a pause drops what the business starts with no model call, and the contact record shows it", async () => {
+  const h = await withSam();
+  await h.message("sms", SAM.address, "no messages until the 20th please");
+  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Paused." }), call("pause_messages", { until: "2026-10-20" })));
+  (await h.nextCall(2)).answer(respond());
+  await h.conversation.whenIdle();
+  const result = await h.agent.nudge({ to: h.to, prompt: "Tell them about the sale" });
+  assert.equal(result.status, "dropped");
+  assert.match(result.reason ?? "", /pause/);
+  assert.equal(h.calls.length, 3, "no model call to judge it");
+  const contact = await h.agent.contact(h.to);
+  assert.equal(contact?.pauses.length, 1);
+  assert.deepEqual(contact?.topics, []);
+});
+
+test("a reminder that can wait skips its runs in their quiet hours; a business schedule moves to when they end", async () => {
+  const h = await samAtNight();
+  h.clock.now = Date.UTC(2026, 9, 12, 16); // noon, to schedule
+  await h.message("sms", SAM.address, "check for new listings every night at 11 and let me know");
+  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Will do." }), call("schedule_message", { message: "check listings", repeat: "daily", time: "23:00", mode: "check", respect_quiet_hours: true })));
+  (await h.nextCall(2)).answer(respond());
+  await h.conversation.whenIdle();
+  const later = await h.agent.nudge({ to: h.to, prompt: "Their order shipped", at: ELEVEN_PM_NY });
+  assert.equal(later.status, "scheduled");
+
+  h.clock.now = ELEVEN_PM_NY;
+  await h.agent.runDue();
+  assert.equal(h.calls.length, 3, "nothing ran in their quiet hours");
+  const outcomes = (await h.database.query("SELECT outcome, reason FROM schedule_runs ORDER BY ran_at")).map((r) => `${r.outcome}: ${r.reason}`);
+  assert.ok(outcomes.some((o) => o === "skipped: their quiet hours"), outcomes.join(" | "));
+  assert.ok(outcomes.some((o) => /^held: their quiet hours: moved to Tue 13 Oct 2026 07:00/.test(o)), outcomes.join(" | "));
 });

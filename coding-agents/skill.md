@@ -122,7 +122,7 @@ export const app = customUI("app", {
 createAgent({ ..., channels: [wa, sms(twilioLike), app], database: sqlite("data/chinwag.db"),
   resolve: ({ channel, address }) => members.idFor(channel, address), timeZone: "America/New_York" });
 // A person's time zone is never guessed from timeZone (the business's): set it when you know it,
-// agent.setTimeZone({ to, timeZone }) or timeZoneHandler over HTTP; else the agent asks them.
+// agent.setTimeZone({ to, timeZone }) or peopleHandler over HTTP; else the agent asks them.
 await agent.resume();                     // a durable database: always before the first message
 await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" });
 ```
@@ -167,7 +167,8 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 Built in, so don't build them as tools: what the business knows about the person (`profile`, as
 `get_user_profile`), scheduled messages (`schedule_message`, `list_scheduled`,
 `cancel_scheduled`, in the person's local time), and what a person asked not to be messaged about
-(`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
+(`add_no_contact`, `remove_no_contact`), quiet hours they set (`set_quiet_hours`) and pauses
+(`pause_messages`). STOP, START and HELP are built in on `sms()` and
 `whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
 no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
 `intercept` sees them first, with `message.keyword` `"stop"`, `"start"` or `"help"` (else `null`)
@@ -227,6 +228,18 @@ quick-reply tap comes back as the person's message with `choice: { id: payload, 
 reply button, and the agent is told what the template said. An ordinary message has one kind of
 button: up to 3 reply buttons OR one link button, never both. A template may mix quick replies and
 URL buttons.
+
+## Ask the owner when you set an agent up
+
+Before the agent sends anything people did not ask for (nudges, follow-ups), ask the owner these
+two, with these options, and build what they pick:
+
+1. **Quiet hours** (what the business starts waits for them, in each person's own time):
+   "22:00–07:00 (recommended)", "other hours", or "none" (`quietHours: false`). For US marketing,
+   say that 8am–9pm the recipient's time is, as far as we know, the legal window, and check theirs.
+2. **Where people's time zones come from**, since quiet hours apply only where it is known:
+   "our database" (sync it with `agent.setTimeZone` or `peopleHandler`), or "we don't know" (the
+   agent asks people when it needs it; until then nothing is held for quiet hours).
 
 ## The playground
 

@@ -169,3 +169,23 @@ function list(items: string[]): string {
 }
 
 export const DAY_INDEX: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
+/**
+ * When quiet hours `from`–`to` ("22:00"–"07:00", in `zone`, may wrap midnight) end, if `now` is
+ * inside them; null when it is not, or when from equals to.
+ */
+export function quietUntil(now: number, zone: string, hours: { from: string; to: string }): number | null {
+  const from = clock(hours.from);
+  const to = clock(hours.to);
+  if (!from || !to) return null;
+  const p = parts(zone, now);
+  const minute = p.hour * 60 + p.minute;
+  const start = from.hour * 60 + from.minute;
+  const end = to.hour * 60 + to.minute;
+  if (start === end) return null;
+  const inside = start < end ? minute >= start && minute < end : minute >= start || minute < end;
+  if (!inside) return null;
+  // The end is today, or tomorrow when it wraps past midnight and we are before it.
+  const day = new Date(Date.UTC(p.year, p.month - 1, p.day + (start > end && minute >= start ? 1 : 0)));
+  return localToUtc(zone, day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate(), to.hour, to.minute);
+}

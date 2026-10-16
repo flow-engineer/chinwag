@@ -231,6 +231,20 @@ await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt
 
 `text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped, and outside WhatsApp's 24-hour window only templates go out. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
 
+### Quiet hours
+
+What the business starts waits for each person's quiet hours: 22:00 to 07:00 in their own time by default (`createAgent({ quietHours: { from: "21:00", to: "08:00" } })` to change it, `false` for none). They apply only where the person's time zone is known (see [Time zones](#time-zones)): without it nothing is held.
+
+- **A nudge in their quiet hours is held** (`status: "held"`), and goes when the hours end or as soon as they write, whichever comes first. Everything held reaches one turn: the agent writes one short message for all of it, not a text each, after answering whatever they just asked. A `text` or template nudge goes as written.
+- **It can go stale.** A held nudge past its `expiresAt` (default 24 hours) is dropped as `expired`; give a short one to "your table is ready". `respectQuietHours: false` sends it now, quiet hours or not, for what cannot wait (a security alert).
+- **A scheduled nudge** (`at`) that comes due in their quiet hours moves to when they end.
+- **Their own reminders** go at the time they asked for, quiet hours or not, unless the agent marks one as able to wait (`respect_quiet_hours` on `schedule_message`: "check for new listings and let me know"); a repeat like that skips its runs in their quiet hours.
+- **People set their own.** "Not after 9pm" sets theirs (`set_quiet_hours`, built in), "no messages this week" pauses everything the business starts (`pause_messages`), with no model call to check either. Your backend sets or reads them too: `agent.setQuietHours({ to, quietHours })`, `agent.contact(to)`.
+
+The contact record (`agent.contact(to)`, or `GET /people/contact`) is what the agent goes by for a person: `timeZone` and `timeZoneSource` (`business` or `person`), `quietHours` and `quietHoursSource` (`person`, `agent`, `off`, or `no_time_zone`), `stop`, `pauses` and `topics` (what they asked not to be messaged about, in their words).
+
+Rules on when marketing may be sent differ by country, and by US state: check yours. US telemarketing rules, as far as we know, allow calls and texts only from 8am to 9pm the recipient's time, which is narrower than the default.
+
 ### Nudges over HTTP
 
 When the system that decides to nudge is a separate service, mount `nudgeHandler` in the agent's server and call it over HTTP. It is a plain `(req, res)` handler; hand it the requests under its `base` (`/nudges` by default; anything else gets 404). It needs a token of at least 32 characters, from a secret, or it throws at setup:
@@ -246,8 +260,8 @@ createServer((req, res) => {
 }).listen(3000);
 ```
 
-- `POST /nudges` with `{ to: { channel, address }, text | prompt | template, at?, idempotency_key? }`: exactly one of `text`, `prompt` or `template`, as in `agent.nudge()`; `at` is milliseconds since the epoch; unknown fields are refused; at most 16 KB. It answers `202 { id, status, reason? }` as soon as the nudge is recorded, without waiting for the send or the agent's turn: usually `queued`. What is decided as it is recorded is in that answer too, still a 202, since it is the nudge's state and not an error: `refused` (`unknown_person`, with `id` `""` since nothing is recorded; `outside_window`), `dropped` (they texted STOP) or `scheduled`. A bad body, a channel the agent does not have, or a declared template's wrong values get `400 { error }`.
-- `GET /nudges/<id>`: `200 { id, status, reason? }`, its state now: `queued`, `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled`. An id it never recorded gets 404.
+- `POST /nudges` with `{ to: { channel, address }, text | prompt | template, at?, idempotency_key?, respect_quiet_hours?, expires_at? }`: exactly one of `text`, `prompt` or `template`, as in `agent.nudge()`; `at` is milliseconds since the epoch; unknown fields are refused; at most 16 KB. It answers `202 { id, status, reason? }` as soon as the nudge is recorded, without waiting for the send or the agent's turn: usually `queued`. What is decided as it is recorded is in that answer too, still a 202, since it is the nudge's state and not an error: `refused` (`unknown_person`, with `id` `""` since nothing is recorded; `outside_window`), `dropped` (they texted STOP, or paused messages), `held` (their quiet hours) or `scheduled`. A bad body, a channel the agent does not have, or a declared template's wrong values get `400 { error }`.
+- `GET /nudges/<id>`: `200 { id, status, reason? }`, its state now: `queued`, `sent`, `silent`, `dropped`, `refused`, `failed`, `scheduled`, `held` or `expired`. An id it never recorded gets 404.
 - The same `idempotency_key` returns the first nudge's id and its state now, and sends once.
 - Every request needs `Authorization: Bearer <token>`, compared in constant time; wrong tokens are limited per address (10 in 15 minutes, then 429), as on the playground. Answers are JSON with `cache-control: no-store`. Each accepted nudge is logged (id, status, channel, kind, time and the caller's IP address), never its text or the token.
 
@@ -260,7 +274,13 @@ curl -s https://agent.example.com/nudges/n_3f9c2a1b -H "Authorization: Bearer $N
 # {"id":"n_3f9c2a1b","status":"sent"}
 ```
 
-People's time zones go the same way, for a business that keeps them in its own database: mount `timeZoneHandler(agent, { token })` and `PUT /people/time-zone` with `{ to: { channel, address }, time_zone }`. It answers `200 { status: "set" }`, `404 { status: "refused", reason: "unknown_person" }` for someone who has never written, or `400 { error }` for a name that is not a time zone.
+What you know about people goes the same way, for a business that keeps it in its own database: mount `peopleHandler(agent, { token })` and
+
+- `PUT /people/time-zone` with `{ to: { channel, address }, time_zone }`;
+- `PUT /people/quiet-hours` with `{ to, quiet_hours: { from, to } | "off" | null }` (null: back to the agent's);
+- `GET /people/contact?channel=&address=`: their contact record (below).
+
+Each answers `200`, or `404 { status: "refused", reason: "unknown_person" }` for someone who has never written, or `400 { error }` (a name that is not a time zone, hours that are not `HH:MM`).
 
 ```sh
 curl -s -X PUT https://agent.example.com/people/time-zone \
@@ -472,6 +492,7 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `context` | Small facts added to the system prompt at every turn; it runs before every reply, so keep lookups out of it (see [What the agent knows about the person](#what-the-agent-knows-about-the-person)) |
 | `profile` | What your business knows about the person, as the built-in tool `get_user_profile`, called only when the agent needs it |
 | `intercept` | Answer some messages without the model; `message.channel` is the channel it came in on, and it sees STOP, START and HELP first, marked in `message.keyword` (they are built in on SMS and WhatsApp) |
+| `quietHours` | Each person's quiet hours in their own time (22:00–07:00 by default; `false` for none): what the business starts waits for them (see [Quiet hours](#quiet-hours)) |
 | `timeZone` | The business's time zone: the time the agent is told when a person's is not known (never taken as theirs; see [Time zones](#time-zones)) |
 | `deadlineMs` | The longest a reply waits for a tool (60,000); a tool can set its own |
 | `partialAfterMs` | How long a finished tool's result waits for the others (5,000) |

@@ -84,12 +84,31 @@ const MIGRATIONS: Array<(t: Types) => string> = [
   // Provider ids are deleted once old; upkeep jobs (that pruning) are claimed, so one runner does each.
   (t) => `CREATE INDEX inbound_at ON inbound (agent_id, at);
    CREATE TABLE upkeep (agent_id TEXT NOT NULL, job TEXT NOT NULL, next_at ${t.int} NOT NULL, PRIMARY KEY (agent_id, job))`,
+  // A person's contact settings: their own quiet hours (null: the agent's), where their time zone
+  // came from, and each no-contact rule's kind (stop, pause: checked with no model; topic: judged).
+  () => `ALTER TABLE conversations ADD COLUMN quiet_hours TEXT;
+   ALTER TABLE conversations ADD COLUMN time_zone_source TEXT;
+   ALTER TABLE no_contact ADD COLUMN kind TEXT NOT NULL DEFAULT 'topic';
+   UPDATE no_contact SET kind = 'stop' WHERE hard = 1;
+   CREATE INDEX nudges_status ON nudges (agent_id, status)`,
 ];
+
+/** Quiet hours, "HH:MM" to "HH:MM" in the person's own time; they may wrap midnight. */
+export interface QuietHours {
+  from: string;
+  to: string;
+}
+
+/** Who said where a person is: the business (setTimeZone), or the person (they named a place). */
+export type TimeZoneSource = "business" | "person";
 
 export interface ConversationRow {
   id: string;
   personKey: string;
   timeZone: string | null;
+  timeZoneSource: TimeZoneSource | null;
+  /** Their own quiet hours: "off" for none, null for the agent's. */
+  quietHours: QuietHours | "off" | null;
   turnOpen: boolean;
   messageCount: number;
   recentChannels: string[];
@@ -153,6 +172,8 @@ export interface NoContactRow {
   until: number | null;
   /** They texted STOP: nothing the business starts goes to them, with no model call, until START. */
   hard: boolean;
+  /** stop (their STOP), pause (nothing at all until `until`: no model call), topic (a model judges each message). */
+  kind: "stop" | "pause" | "topic";
 }
 
 const json = (value: unknown) => JSON.stringify(value);
@@ -263,7 +284,7 @@ export class Store {
     });
   }
 
-  async updateConversation(id: string, fields: { turnOpen?: boolean; turns?: number; messageCount?: number; recentChannels?: string[]; timeZone?: string }): Promise<void> {
+  async updateConversation(id: string, fields: { turnOpen?: boolean; turns?: number; messageCount?: number; recentChannels?: string[]; timeZone?: string; timeZoneSource?: TimeZoneSource; quietHours?: QuietHours | "off" | null }): Promise<void> {
     const sets: string[] = [];
     const params: unknown[] = [];
     if (fields.turnOpen !== undefined) sets.push("turn_open = ?"), params.push(fields.turnOpen ? 1 : 0);
@@ -271,6 +292,8 @@ export class Store {
     if (fields.messageCount !== undefined) sets.push("message_count = ?"), params.push(fields.messageCount);
     if (fields.recentChannels !== undefined) sets.push("recent_channels = ?"), params.push(json(fields.recentChannels));
     if (fields.timeZone !== undefined) sets.push("time_zone = ?"), params.push(fields.timeZone);
+    if (fields.timeZoneSource !== undefined) sets.push("time_zone_source = ?"), params.push(fields.timeZoneSource);
+    if (fields.quietHours !== undefined) sets.push("quiet_hours = ?"), params.push(fields.quietHours === null ? null : json(fields.quietHours));
     if (!sets.length) return;
     await this.db.run(`UPDATE conversations SET ${sets.join(", ")} WHERE agent_id = ? AND id = ?`, [...params, this.agentId, id]);
   }
@@ -470,14 +493,34 @@ export class Store {
     });
   }
 
+  /** Nudges held for quiet hours, for one conversation or every one. */
+  async heldNudges(conversationId?: string): Promise<NudgeRow[]> {
+    const rows = conversationId
+      ? await this.db.query("SELECT * FROM nudges WHERE agent_id = ? AND status = 'held' AND conversation_id = ? ORDER BY created_at", [this.agentId, conversationId])
+      : await this.db.query("SELECT * FROM nudges WHERE agent_id = ? AND status = 'held' ORDER BY created_at", [this.agentId]);
+    return rows.map(nudgeOf);
+  }
+
+  /**
+   * A held nudge goes on: queued, with its inbox row, in one transaction. Returns the inbox row's
+   * id, or null when it was no longer held (another runner took it, or it was settled).
+   */
+  async releaseNudge(n: NudgeRow): Promise<number | null> {
+    return this.db.transaction(async (tx) => {
+      const changed = await tx.run("UPDATE nudges SET status = 'queued', reason = NULL WHERE agent_id = ? AND id = ? AND status = 'held'", [this.agentId, n.id]);
+      if (!changed) return null;
+      return this.addInbox(n.conversationId, "nudge", { nudge: n.id, channel: n.channel, ...n.body }, tx);
+    });
+  }
+
   async settleNudge(id: string, status: string, reason?: string): Promise<void> {
     await this.db.run("UPDATE nudges SET status = ?, reason = ? WHERE agent_id = ? AND id = ?", [status, reason ?? null, this.agentId, id]);
   }
 
   // What a person asked not to be messaged about.
 
-  async addNoContact(conversationId: string, id: string, rule: string, until: number | null): Promise<void> {
-    await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, created_at) VALUES (?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, Date.now()]);
+  async addNoContact(conversationId: string, id: string, rule: string, until: number | null, kind: "pause" | "topic" = "topic"): Promise<void> {
+    await this.db.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [this.agentId, id, conversationId, rule, until, kind, Date.now()]);
   }
 
   /** Removes one of the agent's rules; a STOP is not one of them (only START lifts it). */
@@ -495,7 +538,7 @@ export class Store {
       if (inbound && !(await this.inbound(conversationId, inbound.channel, inbound.messageId, tx))) return false;
       if (!stop) await tx.run("DELETE FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId]);
       else if (!(await tx.query("SELECT 1 FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND hard = 1", [this.agentId, conversationId])).length) {
-        await tx.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, hard, created_at) VALUES (?, ?, ?, ?, NULL, 1, ?)", [this.agentId, stop.id, conversationId, stop.rule, Date.now()]);
+        await tx.run("INSERT INTO no_contact (agent_id, id, conversation_id, rule, until, hard, kind, created_at) VALUES (?, ?, ?, ?, NULL, 1, 'stop', ?)", [this.agentId, stop.id, conversationId, stop.rule, Date.now()]);
       }
       return true;
     });
@@ -503,8 +546,8 @@ export class Store {
 
   /** The rules still in force at `now` (a rule with an `until` in the past has ended). */
   async noContact(conversationId: string, now: number): Promise<NoContactRow[]> {
-    const rows = await this.db.query("SELECT id, rule, until, hard FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND (until IS NULL OR until > ?) ORDER BY created_at", [this.agentId, conversationId, now]);
-    return rows.map((r) => ({ id: String(r.id), rule: String(r.rule), until: num(r.until), hard: Number(r.hard) === 1 }));
+    const rows = await this.db.query("SELECT id, rule, until, hard, kind FROM no_contact WHERE agent_id = ? AND conversation_id = ? AND (until IS NULL OR until > ?) ORDER BY created_at", [this.agentId, conversationId, now]);
+    return rows.map((r) => ({ id: String(r.id), rule: String(r.rule), until: num(r.until), hard: Number(r.hard) === 1, kind: (Number(r.hard) === 1 ? "stop" : r.kind === "pause" ? "pause" : "topic") as NoContactRow["kind"] }));
   }
 }
 
@@ -513,6 +556,8 @@ function conversationOf(r: Row): ConversationRow {
     id: String(r.id),
     personKey: String(r.person_key),
     timeZone: (r.time_zone as string | null) ?? null,
+    timeZoneSource: (r.time_zone_source as TimeZoneSource | null) ?? null,
+    quietHours: r.quiet_hours == null ? null : parse<QuietHours | "off" | null>(r.quiet_hours, null),
     turnOpen: Number(r.turn_open) === 1,
     messageCount: Number(r.message_count),
     recentChannels: parse<string[]>(r.recent_channels, []),

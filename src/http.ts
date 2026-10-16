@@ -7,10 +7,8 @@
 //                      → 202 { id, status, reason? } as soon as it is recorded, before any send or turn
 //   GET  {base}/:id    → 200 { id, status, reason? }, its state now; 404 for an id the agent never recorded
 //
-// timeZoneHandler:
-//   PUT  {base}        { to: { channel, address }, time_zone }   the person's zone as the business knows it
-//                      → 200 { status: "set" }; 404 { status: "refused", reason: "unknown_person" } for
-//                      someone who never wrote; 400 for a name that is not a time zone
+// peopleHandler: a person's time zone and quiet hours as the business knows them, and their contact
+// record (see its doc comment below).
 //
 // The token lock (a token of at least 32 characters, compared in constant time, wrong tries limited
 // per address) is shared with the deployed playground.
@@ -86,6 +84,10 @@ const Body = z
     /** Milliseconds since the epoch, as `agent.nudge()` takes it. */
     at: z.number().int().nonnegative().optional(),
     idempotency_key: z.string().min(1).max(200).optional(),
+    /** Wait for the end of their quiet hours (default true). */
+    respect_quiet_hours: z.boolean().optional(),
+    /** Held for quiet hours past this (ms since the epoch), it is dropped as expired. */
+    expires_at: z.number().int().nonnegative().optional(),
   })
   .strict()
   .refine((b) => [b.text, b.prompt, b.template].filter((v) => v !== undefined).length === 1, { message: "give exactly one of text, prompt or template" })
@@ -144,8 +146,13 @@ export function nudgeHandler(agent: NudgeAgent, options: NudgeHandlerOptions): (
       }
     }
 
-    const { idempotency_key, ...rest } = body;
-    const input: NudgeInput = { ...rest, ...(idempotency_key ? { idempotencyKey: idempotency_key } : {}) };
+    const { idempotency_key, respect_quiet_hours, expires_at, ...rest } = body;
+    const input: NudgeInput = {
+      ...rest,
+      ...(idempotency_key ? { idempotencyKey: idempotency_key } : {}),
+      ...(respect_quiet_hours !== undefined ? { respectQuietHours: respect_quiet_hours } : {}),
+      ...(expires_at !== undefined ? { expiresAt: expires_at } : {}),
+    };
     const state: NudgeState = await agent.recordNudge(input);
     const kind = body.text !== undefined ? "text" : body.prompt !== undefined ? "prompt" : "template";
     console.info(JSON.stringify({ chinwag: "nudge", id: state.id, status: state.status, ...(state.reason ? { reason: state.reason } : {}), channel: body.to.channel, kind, at: new Date().toISOString(), ip }));
@@ -173,40 +180,65 @@ function authorized(req: IncomingMessage, res: ServerResponse, ip: string, token
   return refusal === null;
 }
 
-export interface TimeZoneHandlerOptions {
+export interface PeopleHandlerOptions {
   /** At least 32 characters, from a secret; callers send it as `Authorization: Bearer <token>`. */
   token: string;
-  /** The path it answers. Default "/people/time-zone". */
+  /** The path it answers under. Default "/people". */
   base?: string;
 }
 
-const TimeZoneBody = z.object({ to: z.object({ channel: z.string().min(1), address: z.string().min(1) }).strict(), time_zone: z.string().min(1) }).strict();
+const To = z.object({ channel: z.string().min(1), address: z.string().min(1) }).strict();
+const TimeZoneBody = z.object({ to: To, time_zone: z.string().min(1) }).strict();
+const Hours = z.object({ from: z.string(), to: z.string() }).strict();
+const QuietHoursBody = z.object({ to: To, quiet_hours: z.union([Hours, z.literal("off"), z.null()]) }).strict();
 
 /**
- * People's time zones over HTTP, for a business that already knows them: `PUT {base}` with
- * `{ to: { channel, address }, time_zone }`. Requests to any other path get 404 without a token check.
+ * What a business knows about people, over HTTP: their time zone and quiet hours, and their whole
+ * contact record (what they and the business set). Requests outside `base` get 404 without a token check.
+ *
+ *   PUT {base}/time-zone    { to, time_zone }                       → 200 { status: "set" }
+ *   PUT {base}/quiet-hours  { to, quiet_hours: { from, to } | "off" | null }  (null: the agent's)
+ *   GET {base}/contact?channel=&address=                            → 200 the contact record
+ *
+ * Someone who never wrote is 404 `{ status: "refused", reason: "unknown_person" }`.
  */
-export function timeZoneHandler(agent: Pick<Agent, "setTimeZone" | "channels">, options: TimeZoneHandlerOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
-  requireToken(options?.token, "chinwag time zones");
+export function peopleHandler(agent: Pick<Agent, "setTimeZone" | "setQuietHours" | "contact" | "channels">, options: PeopleHandlerOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  requireToken(options?.token, "chinwag people");
   const token = options.token;
-  const base = (options.base ?? "/people/time-zone").replace(/\/+$/, "");
+  const base = (options.base ?? "/people").replace(/\/+$/, "");
   const tries = wrongTries();
+  const routes = new Set(["time-zone", "quiet-hours", "contact"]);
+  const unknown = { status: "refused", reason: "unknown_person" };
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (new URL(req.url ?? "/", "http://localhost").pathname !== base) return json(res, 404, { error: "not found" });
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const route = url.pathname.startsWith(`${base}/`) ? url.pathname.slice(base.length + 1) : "";
+    if (!routes.has(route)) return json(res, 404, { error: "not found" });
     const ip = req.socket.remoteAddress ?? "unknown";
     if (!authorized(req, res, ip, token, tries)) return;
+    const channels = agent.channels().map((c) => c.name);
+    const badChannel = (channel: string) => (channels.includes(channel) ? null : `to.channel must be one of the agent's channels: ${channels.join(", ") || "it has none"}`);
+
+    if (route === "contact") {
+      if (req.method !== "GET") return json(res, 404, { error: "not found" });
+      const to = { channel: url.searchParams.get("channel") ?? "", address: url.searchParams.get("address") ?? "" };
+      if (!to.channel || !to.address) return json(res, 400, { error: "give channel and address as query parameters" });
+      const problem = badChannel(to.channel);
+      if (problem) return json(res, 400, { error: problem });
+      const contact = await agent.contact(to);
+      return contact ? json(res, 200, contact) : json(res, 404, unknown);
+    }
     if (req.method !== "PUT") return json(res, 404, { error: "not found" });
     const raw = await readBody(req);
     if (raw === undefined) return json(res, 400, { error: `the body must be JSON of at most ${MAX_BODY} bytes` });
-    const parsed = TimeZoneBody.safeParse(raw);
+    const parsed = (route === "time-zone" ? TimeZoneBody : QuietHoursBody).safeParse(raw);
     if (!parsed.success) return json(res, 400, { error: parsed.error.issues.map((i) => (i.path.length ? `${i.path.join(".")}: ${i.message}` : i.message)).join("; ") });
-    const { to, time_zone } = parsed.data;
-    const channels = agent.channels().map((c) => c.name);
-    if (!channels.includes(to.channel)) return json(res, 400, { error: `to.channel must be one of the agent's channels: ${channels.join(", ") || "it has none"}` });
+    const body = parsed.data as { to: { channel: string; address: string }; time_zone?: string; quiet_hours?: { from: string; to: string } | "off" | null };
+    const problem = badChannel(body.to.channel);
+    if (problem) return json(res, 400, { error: problem });
     let result;
     try {
-      result = await agent.setTimeZone({ to, timeZone: time_zone });
+      result = route === "time-zone" ? await agent.setTimeZone({ to: body.to, timeZone: body.time_zone! }) : await agent.setQuietHours({ to: body.to, quietHours: body.quiet_hours ?? null });
     } catch (error) {
       return json(res, 400, { error: error instanceof Error ? error.message.replace(/^chinwag: /, "") : String(error) });
     }
@@ -215,8 +247,8 @@ export function timeZoneHandler(agent: Pick<Agent, "setTimeZone" | "channels">, 
 
   return (req, res) =>
     handle(req, res).catch((error) => {
-      console.warn("chinwag time zones:", error);
-      if (!res.headersSent) json(res, 500, { error: "the time zone could not be set" });
+      console.warn("chinwag people:", error);
+      if (!res.headersSent) json(res, 500, { error: "that could not be done" });
     });
 }
 

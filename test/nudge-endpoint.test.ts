@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test, type TestContext } from "node:test";
-import { nudgeHandler, sqlite, Store, timeZoneHandler } from "../src/index.ts";
+import { nudgeHandler, sqlite, Store, peopleHandler } from "../src/index.ts";
 import { SMS, call, multi, respond } from "./helpers.ts";
 
 const SAM = { channel: "sms", address: "+15550100100" };
@@ -116,20 +116,23 @@ test("an unknown id is 404, and paths outside its base are not its own, without 
   }
 });
 
-test("a business sets a person's time zone over HTTP; someone who never wrote is 404, a wrong zone 400", async (t) => {
+test("over HTTP a business sets a person's time zone and quiet hours and reads their contact record", async (t) => {
   const h = await served(t);
-  const server = createServer(timeZoneHandler(h.agent, { token: TOKEN }));
+  const server = createServer(peopleHandler(h.agent, { token: TOKEN }));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
-  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/people/time-zone`;
-  const put = (body: unknown, headers: Record<string, string> = auth) => fetch(url, { method: "PUT", headers, body: JSON.stringify(body) });
-  assert.equal((await put({ to: SAM, time_zone: "Asia/Kolkata" }, { "content-type": "application/json" })).status, 401);
-  const set = await put({ to: SAM, time_zone: "Asia/Kolkata" });
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/people`;
+  const put = (path: string, body: unknown, headers: Record<string, string> = auth) => fetch(`${base}/${path}`, { method: "PUT", headers, body: JSON.stringify(body) });
+  assert.equal((await put("time-zone", { to: SAM, time_zone: "Asia/Kolkata" }, { "content-type": "application/json" })).status, 401);
+  const set = await put("time-zone", { to: SAM, time_zone: "Asia/Kolkata" });
   assert.equal(set.status, 200);
   assert.deepEqual(await set.json(), { status: "set" });
   assert.equal((await new Store(h.database, "default").conversation(h.conversation.id))?.timeZone, "Asia/Kolkata");
-  assert.equal((await put({ to: { channel: "sms", address: "+15550100999" }, time_zone: "Asia/Kolkata" })).status, 404);
-  assert.equal((await put({ to: SAM, time_zone: "Mars/Olympus" })).status, 400);
-  assert.equal((await fetch(url, { headers: auth })).status, 404, "only PUT");
+  assert.equal((await put("time-zone", { to: { channel: "sms", address: "+15550100999" }, time_zone: "Asia/Kolkata" })).status, 404);
+  assert.equal((await put("time-zone", { to: SAM, time_zone: "Mars/Olympus" })).status, 400);
+  assert.equal((await put("quiet-hours", { to: SAM, quiet_hours: { from: "21:00", to: "08:00" } })).status, 200);
+  assert.equal((await put("quiet-hours", { to: SAM, quiet_hours: { from: "9pm", to: "8am" } })).status, 400);
+  const contact = (await (await fetch(`${base}/contact?channel=sms&address=${encodeURIComponent(SAM.address)}`, { headers: auth })).json()) as Record<string, unknown>;
+  assert.deepEqual([contact.timeZone, contact.timeZoneSource, contact.quietHours, contact.quietHoursSource], ["Asia/Kolkata", "business", { from: "21:00", to: "08:00" }, "person"]);
+  assert.equal((await fetch(`${base}/elsewhere`, { headers: auth })).status, 404);
 });
-

@@ -140,7 +140,7 @@ test("a repeat ends after its number of runs, or at its until date", async () =>
   const nineNY = Date.UTC(2026, 9, 13, 13);
   await store.addSchedule({ ...base, id: "twice", nextRunAt: nineNY, maxRuns: 2 });
   await store.addSchedule({ ...base, id: "until", nextRunAt: nineNY, maxRuns: null, endsOn: "2026-10-14" });
-  for (const day of [0, 1, 2]) await claimDue(store, nineNY + day * 86_400_000, async () => null);
+  for (const day of [0, 1, 2]) await claimDue(store, nineNY + day * 86_400_000, async () => null, async () => null);
   const left = await store.db.query("SELECT id, status, run_count FROM schedules ORDER BY id");
   assert.deepEqual(left.map((r) => ({ ...r })), [
     { id: "twice", status: "done", run_count: 2 },
