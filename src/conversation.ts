@@ -43,7 +43,7 @@ import { scheduleTools } from "./schedules.ts";
 import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
 import { render, toSpec, type Tool } from "./tools.ts";
-import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
+import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, PersonMessage, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
   model: Model;
@@ -148,7 +148,11 @@ interface Owed {
 
 interface Pending {
   id: string;
+  /** As the agent reads it, after its id. */
   text: string;
+  /** As the person wrote it (the transcript's). */
+  shown: string;
+  choice?: boolean;
   channel: string;
   media?: Media[];
   inbox?: number;
@@ -315,14 +319,14 @@ export class Conversation {
   /** The message is ready for the agent: it joins the reply in progress, or starts one. */
   private arrive(incoming: Incoming, id: string, channel: string, ownId: boolean, files: Files): void {
     const at = this.settings.now();
-    const item: Pending = { id, text: describe(incoming, files), channel, ...(files.media.length ? { media: files.media } : {}) };
+    const item: Pending = { id, text: describe(incoming, files), shown: shownText(incoming, files), ...(incoming.choice ? { choice: true } : {}), channel, ...(files.media.length ? { media: files.media } : {}) };
     this.pending.push(item);
     this.recentChannels = [...this.recentChannels, channel].slice(-5);
     const link = this.channels.get(channel);
     if (link) link.lastMessageAt = at;
     const fields = { messageCount: this.messageCount, recentChannels: this.recentChannels };
     this.persist(async () => {
-      item.inbox = await this.settings.store.addInbox(this.id, "message", { id, text: item.text, channel, ...(item.media ? { media: item.media.map(stored) } : {}) });
+      item.inbox = await this.settings.store.addInbox(this.id, "message", { id, text: item.text, shown: item.shown, ...(item.choice ? { choice: true } : {}), channel, ...(item.media ? { media: item.media.map(stored) } : {}) });
       this.knownInbox.add(item.inbox);
       await this.settings.store.updateConversation(this.id, fields);
       if (link) await this.settings.store.touchIdentity(channel, link.address, at);
@@ -397,7 +401,7 @@ export class Conversation {
     const p = row.payload as Record<string, any>;
     if (row.kind === "message") {
       // Its photos and PDFs are named, not shown: their bytes were never stored.
-      this.pending.push({ id: p.id, text: p.text, channel: p.channel, inbox: row.id, ...(Array.isArray(p.media) ? { media: p.media } : {}) });
+      this.pending.push({ id: p.id, text: p.text, shown: p.shown ?? p.text, ...(p.choice ? { choice: true } : {}), channel: p.channel, inbox: row.id, ...(Array.isArray(p.media) ? { media: p.media } : {}) });
       this.messageIds.set(p.id, p.channel);
       this.unanswered.add(p.channel);
       this.firstResponse = true;
@@ -511,7 +515,7 @@ export class Conversation {
     const only = [...this.channels.keys()][0] ?? "chat";
     for (const entry of history) {
       if (entry.role !== "user") continue;
-      for (const m of entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)[,\]]/gm)) this.messageIds.set(m[2], m[1] ?? only);
+      for (const m of personMessages(entry, only)) this.messageIds.set(m.id, m.channel);
     }
     // A step cut off while its tools ran: those calls get a result that says so.
     const answered = new Set(history.flatMap((e) => (e.role === "tool" ? [e.toolCallId] : [])));
@@ -638,7 +642,8 @@ export class Conversation {
       this.theirMessages = true;
       const tag = this.settings.tagChannels || this.channels.size > 1;
       const media = messages.flatMap((m) => m.media ?? []);
-      this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n"), ...(media.length ? { media } : {}) });
+      const said: PersonMessage[] = messages.map((m) => ({ id: m.id, channel: m.channel, text: m.shown, ...(m.choice ? { choice: true } : {}) }));
+      this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n"), ...(media.length ? { media } : {}), messages: said });
       if (media.length) this.showLatestMedia();
       items.push(...messages);
       for (const channel of new Set(messages.map((m) => m.channel))) {
@@ -1176,7 +1181,7 @@ export type TranscriptEntry =
 const SEND_KEYS = new Set(["text", "reply_to", "buttons", "list", "link", "image", "confirm"]);
 
 /**
- * The history as the person saw it: their messages (with the ids describe() wrote), what the agent
+ * The history as the person saw it: their messages (with their ids and channels), what the agent
  * delivered with its send tools and reactions, and its other tool calls with their results.
  * Chinwag's notes and the agent's plain text never reached the person and are left out. `only` is
  * the channel of untagged messages (an agent with one channel does not tag them).
@@ -1193,15 +1198,10 @@ export function transcriptOf(history: Array<{ entry: ChatMessage; at: number }>,
         lines.push({ kind: "out", channel: template[2], text: template[3] ?? "", at, template: template[1] });
         continue;
       }
-      const starts = [...entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)(?=[,\]])/gm)];
-      starts.forEach((m, i) => {
-        const channel = m[1] ?? only;
-        const rest = entry.content.slice(m.index! + m[0].length, i + 1 < starts.length ? starts[i + 1].index! - 1 : undefined);
-        const tapped = rest.indexOf(", tapped] ");
-        const text = rest.startsWith("] ") ? rest.slice(2) : tapped >= 0 ? rest.slice(tapped + 10) : rest.slice(rest.indexOf('"] ') + 3);
-        channelOf.set(m[2], channel);
-        lines.push({ kind: "in", channel, id: m[2], text, at, ...(tapped >= 0 ? { choice: true } : {}) });
-      });
+      for (const m of personMessages(entry, only)) {
+        channelOf.set(m.id, m.channel);
+        lines.push({ kind: "in", channel: m.channel, id: m.id, text: m.text, at, ...(m.choice ? { choice: true } : {}) });
+      }
       continue;
     }
     if (entry.role !== "assistant") continue;
@@ -1253,6 +1253,27 @@ function describe(incoming: Incoming, files?: Files): string {
   return `${parts.join("")}] ${body}`;
 }
 
+/** What the person wrote, as the transcript shows it: the tap, or the files' marks and the text. */
+function shownText(incoming: Incoming, files: Files): string {
+  if (incoming.choice) return incoming.choice.title;
+  return [files.marks.join(" "), files.transcript, incoming.text].filter(Boolean).join(" ");
+}
+
+/**
+ * The person's messages in a history entry: kept beside it, or (in entries stored before they
+ * were) read back from the text, where only Chinwag's own m1, m2, ... ids can be told apart.
+ */
+function personMessages(entry: Extract<ChatMessage, { role: "user" }>, only: string): PersonMessage[] {
+  if (entry.messages) return entry.messages;
+  const starts = [...entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)(?=[,\]])/gm)];
+  return starts.map((m, i) => {
+    const rest = entry.content.slice(m.index! + m[0].length, i + 1 < starts.length ? starts[i + 1].index! - 1 : undefined);
+    const tapped = rest.indexOf(", tapped] ");
+    const text = rest.startsWith("] ") ? rest.slice(2) : tapped >= 0 ? rest.slice(tapped + 10) : rest.slice(rest.indexOf('"] ') + 3);
+    return { id: m[2], channel: m[1] ?? only, text, ...(tapped >= 0 ? { choice: true } : {}) };
+  });
+}
+
 /** A photo or PDF as it is stored: named, without its bytes. */
 function stored(media: Media): Media {
   const { data: _bytes, ...rest } = media;
@@ -1261,9 +1282,10 @@ function stored(media: Media): Media {
 
 /** A history entry as the model is sent it: media no longer shown are taken off, and it is told. */
 function forModel(entry: ChatMessage): ChatMessage {
-  if (entry.role !== "user" || !entry.media) return entry;
+  if (entry.role !== "user") return entry;
+  if (!entry.media) return { role: "user", content: entry.content };
   const shown = entry.media.filter((m) => m.data);
-  if (shown.length === entry.media.length) return entry;
+  if (shown.length === entry.media.length) return { role: "user", content: entry.content, media: entry.media };
   return { role: "user", content: `${entry.content}\n${NOT_SHOWN}`, ...(shown.length ? { media: shown } : {}) };
 }
 

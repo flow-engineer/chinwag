@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { z } from "zod";
 import { createAgent, sqlite, Store, tool, type Outbound } from "../src/index.ts";
-import { SMS, call, gate, last, multi, respond, scriptedModel, users } from "./helpers.ts";
+import { SMS, WHATSAPP, call, gate, last, multi, respond, scriptedModel, users } from "./helpers.ts";
 
 const CHANNELS = { sms: { info: SMS, phone: true } };
 const file = () => join(mkdtempSync(join(tmpdir(), "chinwag-db-")), "chinwag.db");
@@ -143,4 +143,26 @@ test("a tool gets its call id and a signal, and an idempotency key that is the s
 
   await before.agent.forgetPerson(a!.conversationId);
   assert.equal(seen[0].signal.aborted, true, "a forgotten person's tools are told to stop");
+});
+
+test("with the provider's own message ids, the transcript keeps the person's side, and replies and reactions work after a restart", async () => {
+  const path = file();
+  const channels = { whatsapp: { info: WHATSAPP, phone: true } };
+  const before = multi({ channels, database: sqlite(path) });
+  await before.agent.resume();
+  const a = await before.agent.message({ channel: "whatsapp", from: "15550100100", message: "is the 10am free?", messageId: "wamid.HBgL1" });
+  (await before.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Let me look." })));
+  await before.agent.conversation(a!.conversationId)!.whenIdle();
+
+  const after = multi({ channels, database: sqlite(path), dir: before.dir });
+  await after.agent.resume();
+  await after.agent.message({ channel: "whatsapp", from: "15550100100", message: "?", messageId: "wamid.HBgL2" });
+  (await after.nextCall(0)).answer(respond(call("react", { message_id: "wamid.HBgL1", emoji: "👍" }), call("send_whatsapp", { text: "Yes, it's free.", reply_to: "wamid.HBgL1" })));
+  await after.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.deepEqual(after.out.map((o) => o.outbound).filter((o) => o.type === "reaction" || o.type === "message"), [
+    { type: "reaction", emoji: "👍", messageId: "wamid.HBgL1" },
+    { type: "message", text: "Yes, it's free.", replyTo: "wamid.HBgL1" },
+  ]);
+  const transcript = await after.agent.transcript(a!.conversationId);
+  assert.deepEqual(transcript.filter((l) => l.kind === "in").map((l) => l.kind === "in" && [l.id, l.text]), [["wamid.HBgL1", "is the 10am free?"], ["wamid.HBgL2", "?"]]);
 });
