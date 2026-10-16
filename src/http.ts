@@ -96,7 +96,7 @@ export type NudgeAgent = Pick<Agent, "recordNudge" | "nudgeState" | "channels" |
 export function nudgeHandler(agent: NudgeAgent, options: NudgeHandlerOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   requireToken(options?.token, "chinwag nudges");
   const token = options.token;
-  const base = (options.base ?? "/nudges").replace(/\/+$/, "");
+  const base = withoutTrailingSlashes(options.base ?? "/nudges");
   const tries = wrongTries();
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -156,6 +156,13 @@ export function nudgeHandler(agent: NudgeAgent, options: NudgeHandlerOptions): (
       console.warn("chinwag nudges:", error);
       if (!res.headersSent) json(res, 500, { error: "the nudge could not be recorded" });
     });
+}
+
+/** A path with its trailing slashes taken off, in one pass (no regular expression to backtrack). */
+export function withoutTrailingSlashes(path: string): string {
+  let end = path.length;
+  while (end > 0 && path[end - 1] === "/") end--;
+  return path.slice(0, end);
 }
 
 /** The parsed JSON body, or undefined when it is too large or not JSON. */
