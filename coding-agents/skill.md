@@ -147,6 +147,8 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   `defaultCountryCode` ("+91") so they match the full number WhatsApp gives.
 - With several channels the agent gets a send tool per channel (`send_sms`, `send_web`) and
   answers each message where it came. Don't add your own.
+- Run exactly one copy of the agent per database (one instance, kept warm, CPU always on): a
+  conversation lives in one process, so two copies would run overlapping turns for it.
 - After a restart, `resume()` carries on: cut-off turns run again, background tools that were
   running are reported as interrupted (never rerun).
 - `agent.receive(conversationId, message, deliver)` still works for one channel at a time (the
