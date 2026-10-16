@@ -11,6 +11,10 @@ try {
   console.error((error as Error).message); // such as no model key in .env
   process.exit(1);
 }
-const { url } = await play.listen(agent, Number(process.env.PORT ?? 8788));
+const port = Number(process.env.PORT ?? 8788);
+const { url } = await play.listen(agent, port).catch((error: Error) => {
+  console.error(`${error.message} Another port: PORT=${port + 1} npm start`); // such as a playground already running
+  process.exit(1);
+});
 console.log(`Pip's playground: ${url}/`);
 console.log(`Every channel side by side: ${url}/person`);
