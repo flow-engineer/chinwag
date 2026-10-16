@@ -179,6 +179,14 @@
   .side { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
   .side > .card:last-child { flex: 1; }
   .backend { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px; }
+  .person { padding: 8px 14px 12px; display: grid; gap: 10px; font-size: 12px; max-height: 46vh; overflow-y: auto; }
+  .person h3 { font-size: 12px; margin: 0 0 4px; color: var(--quiet); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .person .row2 { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .person input, .person select, .person textarea { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+  .person textarea { width: 100%; min-height: 44px; resize: vertical; }
+  .person .ghost { padding: 4px 8px; font-size: 12px; }
+  .person ul { margin: 0; padding-left: 16px; } .person li { margin: 2px 0; }
+  .person .dim { color: var(--quiet); }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
   .card h2 { font-size: 13px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
   .card h2 span { font-weight: 400; color: var(--quiet); }
@@ -224,6 +232,54 @@
     <section class="card" id="backend" style="display: none">
       <h2>Backend <span>what your server does; results show in the trace</span></h2>
       <div class="backend" id="actions"></div>
+    </section>
+    <section class="card" id="personCard" style="display: none">
+      <h2>Person <span id="personNow"></span></h2>
+      <div class="person">
+        <div id="clockBox" style="display: none">
+          <h3>Clock</h3>
+          <div class="row2">
+            <button type="button" class="ghost" data-advance="900000">+15 min</button>
+            <button type="button" class="ghost" data-advance="3600000">+1 hour</button>
+            <button type="button" class="ghost" data-advance="86400000">+1 day</button>
+            <button type="button" class="ghost" id="toQuietEnd" title="Jump to when their quiet hours end">End of quiet hours</button>
+            <input type="datetime-local" id="clockTo" aria-label="Move the clock to"><button type="button" class="ghost" id="clockGo">Go</button>
+          </div>
+        </div>
+        <div>
+          <h3>Contact</h3>
+          <div id="contactLine" class="dim"></div>
+          <div class="row2">
+            <input id="tz" placeholder="Asia/Kolkata" size="16" aria-label="Time zone"><button type="button" class="ghost" id="tzSet">Set time zone</button>
+          </div>
+          <div class="row2">
+            Quiet <input id="qFrom" placeholder="22:00" size="5" aria-label="Quiet hours from"> to <input id="qTo" placeholder="07:00" size="5" aria-label="Quiet hours to">
+            <button type="button" class="ghost" id="qSet">Set</button><button type="button" class="ghost" id="qOff">Off</button><button type="button" class="ghost" id="qDefault">Agent's</button>
+          </div>
+        </div>
+        <div>
+          <h3>Waiting to go</h3>
+          <ul id="waiting"></ul>
+        </div>
+        <div id="nudgeBox" style="display: none">
+          <h3>Nudge (as your backend would)</h3>
+          <div class="row2">
+            <select id="nKind" aria-label="Kind"><option value="prompt">prompt</option><option value="text">text</option><option value="template">template</option></select>
+            <select id="nTemplate" aria-label="Template" style="display: none"></select>
+            <input id="nValues" placeholder="body values, comma separated" style="display: none" aria-label="Template body values">
+          </div>
+          <textarea id="nText" placeholder="What the agent should tell them (prompt), or the exact text"></textarea>
+          <div class="row2">
+            <label title="Wait for their quiet hours to end"><input type="checkbox" id="nQuiet" checked> respect quiet hours</label>
+            <label>expires in <input id="nExpires" size="4" placeholder="1440"> min</label>
+          </div>
+          <div class="row2">
+            <label>send at <input type="datetime-local" id="nAt"></label>
+            <input id="nKey" placeholder="idempotency key" size="14" aria-label="Idempotency key">
+            <button type="button" class="ghost" id="nSend">Send nudge</button>
+          </div>
+        </div>
+      </div>
     </section>
     <section class="card">
       <h2>Per turn <span id="status"></span></h2>
@@ -298,6 +354,7 @@
     }
     const tab = PLAY ? current.channel : current.id;
     for (const b of document.querySelectorAll(".tab")) b.setAttribute("aria-pressed", String(b.dataset.id === tab));
+    void refreshPerson();
     $("phone").className = "phone p-" + current.id;
     $("avatar").textContent = title.trim().charAt(0).toUpperCase();
     $("sub").textContent = subtitle();
@@ -964,9 +1021,78 @@
     document.querySelector("main").innerHTML = `<div class="empty">${html}</div>`;
   }
 
+  // The Person panel: what is set and waiting for this person, the agent's clock, and nudges.
+  let panel = { person: false, nudge: false, clock: false };
+  let templates = [];
+  let quietEndsAt = null;
+  const post = (path, body) => fetch(BASE + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...where(), ...body }) });
+  const local = (ms, zone) => new Date(ms).toLocaleString("en-US", { timeZone: zone || undefined, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+  async function refreshPerson() {
+    if (!PLAY || !panel.person || !current) return;
+    const res = await fetch(BASE + "/api/person" + query());
+    if (!res.ok) return;
+    const { now, contact, outbox } = await res.json();
+    const zone = contact?.timeZone;
+    $("personNow").textContent = `agent time ${local(now)}` + (zone ? ` · theirs ${local(now, zone)}` : "");
+    const parts = [];
+    if (!contact) parts.push("They have not written yet: write to Perry first, or nudges are refused (unknown_person).");
+    else {
+      parts.push(zone ? `Time zone ${zone} (${contact.timeZoneSource})` : "Time zone unknown: quiet hours do not apply");
+      parts.push(contact.quietHours ? `quiet ${contact.quietHours.from}–${contact.quietHours.to} (${contact.quietHoursSource})` : `quiet hours: ${contact.quietHoursSource}`);
+      if (contact.stop) parts.push("texted STOP");
+      for (const p of contact.pauses) parts.push(`paused until ${p.until ? local(p.until - 1, zone) : "?"}`);
+      for (const t of contact.topics) parts.push(`not about: ${t.rule}`);
+    }
+    $("contactLine").textContent = parts.join(" · ");
+    quietEndsAt = null;
+    const items = [];
+    for (const h of outbox.held) {
+      if (h.holdUntil && (!quietEndsAt || h.holdUntil < quietEndsAt)) quietEndsAt = h.holdUntil;
+      items.push(`Held ${h.kind} nudge "${h.what}": ${h.reason === "window_closed" ? "until they reply" : `until ${local(h.holdUntil, zone)}`}${h.expiresAt ? `, expires ${local(h.expiresAt, zone)}` : ""}`);
+    }
+    for (const sc of outbox.schedules) items.push(`${sc.origin === "person" ? "Their reminder" : "Business"}: "${sc.message}", ${sc.summary}${sc.nextRunAt ? `, next ${local(sc.nextRunAt, sc.timeZone)}` : ""}${sc.respectsQuietHours ? " · waits for quiet hours" : ""}`);
+    $("waiting").replaceChildren(...(items.length ? items : ["Nothing scheduled or held."]).map((t) => { const li = document.createElement("li"); li.textContent = t; if (!items.length) li.className = "dim"; return li; }));
+    $("toQuietEnd").disabled = !quietEndsAt;
+  }
+  function setUpPersonPanel() {
+    if (!PLAY || !panel.person) return;
+    $("personCard").style.display = "";
+    if (panel.clock) {
+      $("clockBox").style.display = "";
+      for (const b of document.querySelectorAll("[data-advance]")) b.addEventListener("click", async () => { await post("/api/clock", { advanceMs: Number(b.dataset.advance) }); refreshPerson(); });
+      $("toQuietEnd").addEventListener("click", async () => { if (quietEndsAt) await post("/api/clock", { to: quietEndsAt + 1000 }); refreshPerson(); });
+      $("clockGo").addEventListener("click", async () => { const v = $("clockTo").value; if (v) await post("/api/clock", { to: new Date(v).getTime() }); refreshPerson(); });
+    }
+    $("tzSet").addEventListener("click", async () => { await post("/api/time-zone", { time_zone: $("tz").value.trim() }); refreshPerson(); });
+    $("qSet").addEventListener("click", async () => { await post("/api/quiet-hours", { quiet_hours: { from: $("qFrom").value.trim(), to: $("qTo").value.trim() } }); refreshPerson(); });
+    $("qOff").addEventListener("click", async () => { await post("/api/quiet-hours", { quiet_hours: "off" }); refreshPerson(); });
+    $("qDefault").addEventListener("click", async () => { await post("/api/quiet-hours", { quiet_hours: null }); refreshPerson(); });
+    if (panel.nudge) {
+      $("nudgeBox").style.display = "";
+      for (const t of templates) { const o = document.createElement("option"); o.value = t.name; o.textContent = t.name; o.title = t.body; $("nTemplate").appendChild(o); }
+      $("nKind").addEventListener("change", () => {
+        const tpl = $("nKind").value === "template";
+        $("nTemplate").style.display = tpl ? "" : "none"; $("nValues").style.display = tpl ? "" : "none"; $("nText").style.display = tpl ? "none" : "";
+      });
+      $("nSend").addEventListener("click", async () => {
+        const kind = $("nKind").value;
+        const text = $("nText").value.trim();
+        const body = { kind, ...(kind === "prompt" ? { prompt: text } : kind === "text" ? { text } : { template: $("nTemplate").value, body: $("nValues").value.split(",").map((v) => v.trim()).filter(Boolean) }) };
+        if ($("nAt").value) body.at = new Date($("nAt").value).getTime();
+        if (!$("nQuiet").checked) body.respect_quiet_hours = false;
+        const mins = Number($("nExpires").value);
+        if (mins > 0) body.expires_at = Date.now() + mins * 60_000;
+        if ($("nKey").value.trim()) body.idempotency_key = $("nKey").value.trim();
+        $("nSend").disabled = true;
+        try { await post("/api/nudge", body); } finally { $("nSend").disabled = false; refreshPerson(); }
+      });
+    }
+    setInterval(refreshPerson, 3000);
+  }
+
   (async () => {
     let actions = [];
-    ({ platforms, cards, people = [], channels = [], actions = [] } = await (await fetch(BASE + "/api/platforms")).json());
+    ({ platforms, cards, people = [], channels = [], actions = [], templates = [], panel = panel } = await (await fetch(BASE + "/api/platforms")).json());
     if (PLAY && actions.length && !REPLAY) {
       // The Backend panel: each button runs one of the playground's actions on the server.
       $("backend").style.display = "";
@@ -997,6 +1123,7 @@
       $("who").value = person;
       $("who").addEventListener("change", () => { person = $("who").value; remember("chinwag.person", person); setPlatform(current.channel); });
       for (const c of channels) tabFor(c.name, c.name, c.platform);
+      setUpPersonPanel();
     } else {
       for (const p of platforms) tabFor(p.id, p.name, p);
     }

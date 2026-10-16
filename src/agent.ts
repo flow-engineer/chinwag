@@ -18,7 +18,7 @@ import { declaredTemplate, fillTemplate, keywordOf, summarize, type Channel, typ
 import { Conversation, PROFILE_TOOL, profileTool, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type Profile, type TranscriptEntry } from "./conversation.ts";
 import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
-import { businessSchedule, claimDue } from "./schedules.ts";
+import { businessSchedule, claimDue, summary } from "./schedules.ts";
 import { loadInstructions, loadSkills, readAgentFolder, skillTool, type AgentFiles } from "./skills.ts";
 import { Store, type ConversationRow, type IdentityRow, type NudgeRow, type QuietHours, type StoreApi, type TimeZoneSource, type Via } from "./store.ts";
 import { clock, quietUntil, validZone } from "./time.ts";
@@ -220,6 +220,31 @@ export interface NudgeResult {
 }
 
 export type NudgeStatus = "sent" | "silent" | "dropped" | "refused" | "failed" | "scheduled" | "held" | "expired";
+
+/** A scheduled message, as the playground lists it. */
+export interface ScheduledItem {
+  id: string;
+  message: string;
+  origin: "person" | "business";
+  mode: "message" | "check";
+  nextRunAt: number | null;
+  timeZone: string;
+  respectsQuietHours: boolean;
+  summary: string;
+}
+
+/** A nudge waiting for their quiet hours to end, or for their reply (a closed window). */
+export interface HeldItem {
+  id: string;
+  channel: string;
+  kind: "text" | "prompt" | "template";
+  what: string;
+  reason: string;
+  heldAt: number | null;
+  /** When their quiet hours end; null when it waits for their reply. */
+  holdUntil: number | null;
+  expiresAt: number | null;
+}
 
 /** What the business and the person set for someone, as the agent goes by it. */
 export interface Contact {
@@ -722,6 +747,38 @@ export class Agent {
   private async sendFallback(conversationId: string, to: { channel: string; address: string }, nudge: string, body: Record<string, unknown>): Promise<void> {
     this.settings.emit(conversationId, "template.missing", { nudge, channel: to.channel, ...(body.text !== undefined ? { text: body.text } : { prompt: body.prompt }) });
     await this.recordNudge({ to, template: this.options.fallbackTemplate!, idempotencyKey: `fallback:${nudge}` });
+  }
+
+  /**
+   * What is waiting to go to a person: their scheduled messages (theirs and the business's) and the
+   * nudges held for their quiet hours or a closed window. The playground shows it.
+   */
+  async outbox(conversationId: string): Promise<{ schedules: ScheduledItem[]; held: HeldItem[] }> {
+    await this.settings.ready;
+    const schedules = (await this.store.schedules(conversationId)).map((s) => ({
+      id: s.id,
+      message: s.instruction,
+      origin: s.origin === "person" ? ("person" as const) : ("business" as const),
+      mode: s.mode,
+      nextRunAt: s.nextRunAt,
+      timeZone: s.timeZone,
+      respectsQuietHours: (s.rule as { quiet?: boolean }).quiet === true,
+      summary: summary(s).summary,
+    }));
+    const held = (await this.store.heldNudges(conversationId)).map((n) => {
+      const b = n.body as { text?: string; prompt?: string; template?: Template; heldAt?: number; holdUntil?: number | null; expiresAt?: number };
+      return {
+        id: n.id,
+        channel: n.channel,
+        kind: b.template ? ("template" as const) : b.text !== undefined ? ("text" as const) : ("prompt" as const),
+        what: b.template?.name ?? b.text ?? b.prompt ?? "",
+        reason: n.reason ?? "",
+        heldAt: b.heldAt ?? null,
+        holdUntil: b.holdUntil ?? null,
+        expiresAt: b.expiresAt ?? null,
+      };
+    });
+    return { schedules, held };
   }
 
   /** Whether the agent has a profile (get_user_profile), so the test cloud knows to play it. */
