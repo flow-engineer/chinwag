@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, tool, type AgentOptions, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
+import { createAgent, sqlite, tool, type AgentOptions, type Database, type TemplateDefinition, type TestPerson } from "../src/index.ts";
 import type { ChannelInfo, ChannelKind, ChatMessage, Keywords, Model, ModelRequest, ModelResponse, Outbound, ChinwagEvent, ToolCall } from "../src/index.ts";
 
 /**
@@ -109,18 +109,32 @@ export function multi(options: {
   history?: { maxTokens?: number; toolResultChars?: number };
   defaultCountryCode?: string;
   intercept?: AgentOptions["intercept"];
+  profile?: AgentOptions["profile"];
+  fallbackTemplate?: AgentOptions["fallbackTemplate"];
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
   const scripted = scriptedModel();
+  const database = options.database ?? sqlite();
   const events: ChinwagEvent[] = [];
   const out: Array<{ channel: string; address: string; outbound: Outbound }> = [];
   const channels = Object.entries(options.channels).map(([name, c]) => ({
     name,
     kind: "custom" as const,
     ...c,
-    send: (address: string, outbound: Outbound) => void out.push({ channel: name, address, outbound }),
+    send: (address: string, outbound: Outbound) => {
+      out.push({ channel: name, address, outbound });
+      for (const w of waiting.splice(0)) (w.test() ? w.resolve() : waiting.push(w));
+    },
   }));
+  const waiting: Array<{ test: () => boolean; resolve: () => void }> = [];
+  /** Resolves once something sent so far passes `test` (a gate on the channels' sends). */
+  const sentWhere = (test: (o: (typeof out)[number]) => boolean) =>
+    new Promise<void>((resolve) => {
+      const check = () => out.some(test);
+      if (check()) resolve();
+      else waiting.push({ test: check, resolve });
+    });
   const agent = createAgent({
     dir,
     model: scripted.model,
@@ -129,7 +143,7 @@ export function multi(options: {
     debounceMs: 0,
     events: [(e) => events.push(e)],
     channels,
-    database: options.database,
+    database,
     resolve: options.resolve,
     now: options.now,
     timeZone: options.timeZone,
@@ -138,6 +152,8 @@ export function multi(options: {
     history: options.history,
     defaultCountryCode: options.defaultCountryCode,
     intercept: options.intercept,
+    profile: options.profile,
+    fallbackTemplate: options.fallbackTemplate,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>
@@ -150,5 +166,5 @@ export function multi(options: {
       if (test(c)) return { call: c, index: i };
     }
   }
-  return { agent, out, texts, message, events, callWith, dir, ...scripted };
+  return { agent, out, texts, message, events, callWith, dir, database, sentWhere, ...scripted };
 }

@@ -38,6 +38,12 @@ export interface Tool<Input = any> {
   deadlineMs?: number;
 }
 
+/**
+ * Marks a tool the test cloud plays in place of a built-in (get_user_profile): it is offered only
+ * to an agent that has that built-in, and then instead of it, so a test never runs the real one.
+ */
+export const STAND_IN = Symbol("chinwag.standIn");
+
 export function tool<Input>(definition: Tool<Input>): Tool<Input> {
   return definition;
 }

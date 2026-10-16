@@ -30,7 +30,7 @@ export interface ScheduleScope {
   /** The person's zone, once known. */
   personZone(): string | null;
   setPersonZone(zone: string): Promise<void>;
-  /** The agent's own zone (the business's), if set. */
+  /** The agent's own zone (the business's), if set: only for "in N minutes", which needs no one's clock. */
   agentZone?: string;
 }
 
@@ -48,6 +48,7 @@ const scheduleInput = z.object({
   until: z.string().optional().describe("Repeats: YYYY-MM-DD, the last day it may run"),
   times: z.number().int().min(1).max(1000).optional().describe("Repeats: how many runs in all"),
   timezone: z.string().optional().describe("An IANA zone, only when they named a place; leave it out otherwise"),
+  respect_quiet_hours: z.boolean().optional().describe("true for checks and updates that can wait for the morning (\"check for new listings and let me know\"); leave it out when they asked for that time, or for every hour"),
   mode: z.enum(["message", "check"]).optional().describe("check: at that time, look, and message them only if there is something to tell"),
 });
 
@@ -86,20 +87,24 @@ export function summary(s: ScheduleRow) {
   };
 }
 
-/** The zone a schedule uses: the one named (never a bare UTC), else the person's, else the agent's. */
-async function zoneFor(scope: ScheduleScope, named?: string): Promise<string | { error: string }> {
+/**
+ * The zone a schedule uses: the one named (never a bare UTC), else the person's. Their zone is never
+ * guessed from the business's: only "in N minutes", which is the same in every zone, goes ahead
+ * without it (shown in the business's time).
+ */
+async function zoneFor(scope: ScheduleScope, named?: string, relative = false): Promise<string | { error: string }> {
   if (named && !isBareUtc(named)) {
     if (!validZone(named)) return { error: `${named} is not a time zone. Use an IANA name such as America/New_York.` };
     await scope.setPersonZone(named);
     return named;
   }
-  const known = scope.personZone() ?? scope.agentZone;
+  const known = scope.personZone() ?? (relative ? (scope.agentZone ?? "UTC") : null);
   if (known) return known;
   return { error: "timezone_needed: you do not know their time zone. Ask which city they are in, then schedule again with timezone." };
 }
 
 async function create(scope: ScheduleScope, input: z.infer<typeof scheduleInput>) {
-  const zone = await zoneFor(scope, input.timezone);
+  const zone = await zoneFor(scope, input.timezone, input.repeat === "once" && input.in_minutes !== undefined);
   if (typeof zone !== "string") return zone;
   const now = scope.now();
   const rule = ruleOf(input, zone, now);
@@ -127,7 +132,7 @@ async function create(scope: ScheduleScope, input: z.infer<typeof scheduleInput>
     instruction: input.message,
     fixedText: false,
     mode: input.mode ?? "message",
-    rule,
+    rule: input.respect_quiet_hours ? { ...rule, quiet: true } : rule,
     timeZone: zone,
     nextRunAt: next,
     maxRuns: input.times ?? null,
@@ -176,7 +181,7 @@ function ruleOf(input: z.infer<typeof scheduleInput>, zone: string, now: number)
 }
 
 /** A scheduled message from the business (a nudge with a time): fixed text, or an instruction. */
-export function businessSchedule(conversationId: string, channel: string, at: number, zone: string, body: { text?: string; prompt?: string }): NewSchedule {
+export function businessSchedule(conversationId: string, channel: string, at: number, zone: string, body: { text?: string; prompt?: string }, quiet = true): NewSchedule {
   return {
     id: `s_${randomUUID().slice(0, 8)}`,
     conversationId,
@@ -184,7 +189,7 @@ export function businessSchedule(conversationId: string, channel: string, at: nu
     instruction: body.text ?? body.prompt ?? "",
     fixedText: body.text !== undefined,
     mode: "message",
-    rule: { repeat: "once", at },
+    rule: quiet ? { repeat: "once", at, quiet: true } : { repeat: "once", at },
     timeZone: zone,
     nextRunAt: at,
     maxRuns: null,
@@ -208,7 +213,11 @@ export interface DueRun {
  * now, so nothing floods after downtime), one `blocked` names a reason is skipped, the rest are
  * queued for their conversation. Returns the queued runs with their inbox ids.
  */
-export async function claimDue(store: StoreApi, now: number, blocked: (s: ScheduleRow) => Promise<string | null>): Promise<Array<{ conversationId: string; inbox: number; run: DueRun }>> {
+/**
+ * Claims the schedules due at `now`. One marked `quiet` that comes due in the person's quiet hours
+ * (`quietEnd` says when they end) waits: a once moves to their end, a repeat skips that run.
+ */
+export async function claimDue(store: StoreApi, now: number, quietEnd: (s: ScheduleRow) => Promise<number | null>, blocked: (s: ScheduleRow) => Promise<string | null>): Promise<Array<{ conversationId: string; inbox: number; run: DueRun }>> {
   const queued: Array<{ conversationId: string; inbox: number; run: DueRun }> = [];
   for (const s of await store.dueSchedules(now)) {
     const due = s.nextRunAt!;
@@ -222,6 +231,12 @@ export async function claimDue(store: StoreApi, now: number, blocked: (s: Schedu
     if (late) {
       const minutes = Math.round((now - due) / 60_000);
       await store.claimRun(s, next, { id: runId, outcome: "missed", reason: `found ${minutes} minutes after its time; not sent late`, ranAt: now });
+      continue;
+    }
+    const ends = (s.rule as { quiet?: boolean }).quiet ? await quietEnd(s) : null;
+    if (ends !== null) {
+      const held = rule.repeat === "once";
+      await store.claimRun(s, held ? { nextRunAt: ends, status: "active" } : next, { id: runId, outcome: held ? "held" : "skipped", reason: held ? `their quiet hours: moved to ${formatLocal(s.timeZone, ends)}` : "their quiet hours", ranAt: now });
       continue;
     }
     const reason = await blocked(s);

@@ -23,6 +23,8 @@
   .tab img { width: 16px; height: 16px; }
   .tab small { color: var(--quiet); font-size: 11px; }
   .tab[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .tab { position: relative; }
+  .tab .unread { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: #e5484d; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; }
   .spacer { flex: 1; }
   .ghost { padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); cursor: pointer; }
   select.ghost { max-width: 240px; }
@@ -179,6 +181,46 @@
   .side { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
   .side > .card:last-child { flex: 1; }
   .backend { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px; }
+  [hidden] { display: none !important; }
+  .sidetabs { display: flex; gap: 4px; padding: 2px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; flex: none; }
+  .sidetabs button { flex: 1; border: 0; background: transparent; color: var(--quiet); padding: 7px 10px; border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer; position: relative; }
+  .sidetabs button[aria-selected="true"] { background: var(--bg); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .sidetabs .dot { position: absolute; top: 6px; right: 8px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  .side > .pane { flex: 1; }
+  #pPerson { overflow-y: auto; }
+  .sec { padding: 14px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
+  .sec:last-child { border-bottom: 0; }
+  .sec .label { font-size: 12px; font-weight: 600; color: var(--ink); }
+  .hint { font-weight: 400; color: var(--quiet); font-size: 12px; margin-left: 4px; }
+  .dim { color: var(--quiet); font-size: 13px; }
+  .now { grid-template-columns: 1fr auto; align-items: center; }
+  .big { font-size: 22px; font-weight: 600; letter-spacing: -.01em; margin-top: 2px; }
+  .pill { font-size: 12px; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line); max-width: 220px; text-align: center; }
+  .pill.quiet { background: #fff4e5; border-color: #f5c27a; color: #8a5300; }
+  .pill.open { background: #e9f7ef; border-color: #9fd9b4; color: #1f6b3d; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .pill.quiet { background: #3a2a10; color: #f5c27a; } :root:not([data-theme="light"]) .pill.open { background: #12301e; color: #9fd9b4; } }
+  .row2 { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .sec input, .sec select, .sec textarea { font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); min-width: 0; }
+  .sec textarea { width: 100%; resize: vertical; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .grid2 label { display: grid; gap: 4px; font-size: 12px; color: var(--quiet); }
+  .check { display: flex; gap: 6px; align-items: center; font-size: 13px; }
+  details summary { cursor: pointer; font-size: 12px; color: var(--quiet); margin-bottom: 8px; }
+  details.sec > summary { margin: 0; color: var(--ink); }
+  details.sec:not([open]) { gap: 0; }
+  details.sec:not([open]) > :not(summary) { display: none; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; width: fit-content; }
+  .seg button { border: 0; background: transparent; color: var(--ink); padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .primary { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+  .primary:disabled { opacity: .6; }
+  .items { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .items li { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; display: grid; gap: 3px; font-size: 13px; }
+  .items .tag { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--quiet); }
+  .items .tag.held { color: #b35c00; }
+  .items .what { white-space: pre-wrap; }
+  .items li.empty { border-style: dashed; color: var(--quiet); }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
   .card h2 { font-size: 13px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
   .card h2 span { font-weight: 400; color: var(--quiet); }
@@ -221,11 +263,69 @@
     <div class="screen" id="screen" role="dialog" aria-label="Opened link"></div>
   </section>
   <div class="side">
-    <section class="card" id="backend" style="display: none">
-      <h2>Backend <span>what your server does; results show in the trace</span></h2>
-      <div class="backend" id="actions"></div>
+    <nav class="sidetabs" role="tablist" aria-label="Side panel">
+      <button type="button" role="tab" data-pane="pPerson" id="tabPerson" hidden>Person</button>
+      <button type="button" role="tab" data-pane="pTurns">Turns</button>
+      <button type="button" role="tab" data-pane="pTrace">Trace <span class="dot" id="traceDot" hidden></span></button>
+    </nav>
+    <section class="card pane" id="pPerson" role="tabpanel" hidden>
+      <div class="sec now">
+        <div>
+          <div class="label">Their time</div>
+          <div class="big" id="theirTime">–</div>
+          <div class="dim" id="theirZone"></div>
+        </div>
+        <div class="pill" id="quietPill" hidden></div>
+      </div>
+      <details class="sec" id="clockSec" hidden>
+        <summary class="label">Move the clock <span class="hint">reminders and held nudges come due as it moves</span></summary>
+        <div class="row2">
+          <button type="button" class="ghost" data-advance="900000">+15 min</button>
+          <button type="button" class="ghost" data-advance="3600000">+1 hour</button>
+          <button type="button" class="ghost" data-advance="86400000">+1 day</button>
+          <button type="button" class="ghost" id="toQuietEnd" title="Jump to when their quiet hours end">To end of quiet hours</button>
+        </div>
+        <div class="row2"><input type="datetime-local" id="clockTo" aria-label="Move the clock to (your time)"><button type="button" class="ghost" id="clockGo">Go to this time</button><span class="hint">your time</span></div>
+      </details>
+      <div class="sec">
+        <div class="label">Waiting to go</div>
+        <ul class="items" id="waiting"></ul>
+      </div>
+      <div class="sec" id="nudgeSec" hidden>
+        <div class="label">Send a nudge <span class="hint">as your backend would, through the API</span></div>
+        <div class="seg" role="radiogroup" aria-label="Kind of nudge">
+          <button type="button" data-kind="prompt" aria-pressed="true" title="The agent writes it in its own words">Prompt</button>
+          <button type="button" data-kind="text" aria-pressed="false" title="Sent exactly as written">Exact text</button>
+          <button type="button" data-kind="template" aria-pressed="false" title="A WhatsApp template you set up with Meta">Template</button>
+        </div>
+        <textarea id="nText" rows="3" placeholder="What the agent should tell them, e.g. Their order 1042 shipped"></textarea>
+        <div class="row2" id="nTemplateRow" hidden>
+          <select id="nTemplate" aria-label="Template"></select>
+          <input id="nValues" placeholder="values for {{1}}, {{2}}… comma separated" aria-label="Template body values">
+        </div>
+        <label class="check"><input type="checkbox" id="nQuiet" checked> Wait for their quiet hours to end</label>
+        <details>
+          <summary>More options</summary>
+          <div class="grid2">
+            <label>Send at <span class="hint">your time</span><input type="datetime-local" id="nAt"></label>
+            <label>Drop if still held after <span class="hint">minutes</span><input id="nExpires" inputmode="numeric" placeholder="1440"></label>
+            <label>Idempotency key<input id="nKey" placeholder="order-1042-shipped"></label>
+          </div>
+        </details>
+        <div class="row2"><button type="button" class="primary" id="nSend">Send nudge</button><span class="hint" id="nResult"></span></div>
+      </div>
+      <div class="sec">
+        <div class="label">Contact settings</div>
+        <div class="dim" id="contactLine"></div>
+        <div class="grid2">
+          <label>Time zone<span class="row2"><input id="tz" placeholder="America/New_York" list="zones"><button type="button" class="ghost" id="tzSet">Save</button></span></label>
+          <label>Quiet hours<span class="row2"><input id="qFrom" placeholder="22:00" size="5" aria-label="From"> – <input id="qTo" placeholder="07:00" size="5" aria-label="To"><button type="button" class="ghost" id="qSet">Save</button></span></label>
+        </div>
+        <div class="row2"><button type="button" class="ghost" id="qOff">No quiet hours for them</button><button type="button" class="ghost" id="qDefault">Use the agent's</button></div>
+        <datalist id="zones"><option value="America/New_York"><option value="America/Chicago"><option value="America/Denver"><option value="America/Los_Angeles"><option value="Europe/London"><option value="Asia/Kolkata"><option value="Asia/Singapore"><option value="Australia/Sydney"></datalist>
+      </div>
     </section>
-    <section class="card">
+    <section class="card pane" id="pTurns" role="tabpanel" hidden>
       <h2>Per turn <span id="status"></span></h2>
       <div class="metrics">
         <table>
@@ -234,7 +334,7 @@
         </table>
       </div>
     </section>
-    <section class="card">
+    <section class="card pane" id="pTrace" role="tabpanel" hidden>
       <h2>Trace</h2>
       <div class="log" id="log"></div>
     </section>
@@ -298,6 +398,7 @@
     }
     const tab = PLAY ? current.channel : current.id;
     for (const b of document.querySelectorAll(".tab")) b.setAttribute("aria-pressed", String(b.dataset.id === tab));
+    void refreshPerson();
     $("phone").className = "phone p-" + current.id;
     $("avatar").textContent = title.trim().charAt(0).toUpperCase();
     $("sub").textContent = subtitle();
@@ -769,8 +870,8 @@
 
   // A Backend button's run, on every open page: what it returned, or why it failed.
   function actionDone(d) {
-    if (d.ok) logRow(d.at, "backend", "inline", d.label + (d.result ? ` → ${d.result}` : ""));
-    else logRow(d.at, "backend failed", "bad", `${d.label}: ${d.error}`);
+    if (d.ok) logRow(d.at, "playground", "inline", d.label + (d.result ? ` → ${d.result}` : ""));
+    else logRow(d.at, "playground failed", "bad", `${d.label}: ${d.error}`);
   }
 
   function logRow(at, tag, cls, text) {
@@ -784,6 +885,7 @@
     row.append(ts, what);
     $("log").appendChild(row);
     $("log").scrollTop = $("log").scrollHeight;
+    if ($("pTrace").hidden) $("traceDot").hidden = false;
   }
 
   // The page hears the agent's events on a live stream or, where the stream never arrives (some
@@ -955,6 +1057,7 @@
     img.alt = "";
     b.append(img, document.createTextNode(label));
     if (!p.complete) { const s = document.createElement("small"); s.textContent = "partial"; b.appendChild(s); }
+    const badge = document.createElement("span"); badge.className = "unread"; badge.hidden = true; badge.setAttribute("aria-label", "new message"); b.appendChild(badge);
     b.addEventListener("click", () => setPlatform(id));
     $("tabs").appendChild(b);
   }
@@ -964,25 +1067,141 @@
     document.querySelector("main").innerHTML = `<div class="empty">${html}</div>`;
   }
 
-  (async () => {
-    let actions = [];
-    ({ platforms, cards, people = [], channels = [], actions = [] } = await (await fetch(BASE + "/api/platforms")).json());
-    if (PLAY && actions.length && !REPLAY) {
-      // The Backend panel: each button runs one of the playground's actions on the server.
-      $("backend").style.display = "";
-      actions.forEach((label, index) => {
-        const btn = document.createElement("button");
-        btn.type = "button"; btn.className = "ghost"; btn.textContent = label;
-        btn.addEventListener("click", async () => {
-          btn.disabled = true;
-          try {
-            const res = await fetch(BASE + "/api/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ index }) });
-            if (!res.ok) logRow(Date.now(), "backend failed", "bad", `${label}: ${res.status}`);
-          } finally { btn.disabled = false; }
-        });
-        $("actions").appendChild(btn);
+  // The side panel's tabs: Person (what is set and waiting for this person, the clock, nudges),
+  // the author's Backend buttons, per-turn timings and the trace.
+  function showPane(id) {
+    for (const b of document.querySelectorAll(".sidetabs button")) b.setAttribute("aria-selected", String(b.dataset.pane === id));
+    for (const pane of document.querySelectorAll(".pane")) pane.hidden = pane.id !== id;
+    if (id === "pTrace") $("traceDot").hidden = true;
+    remember("chinwag.pane", id);
+  }
+  for (const b of document.querySelectorAll(".sidetabs button")) b.addEventListener("click", () => showPane(b.dataset.pane));
+
+  let panel = { person: false, nudge: false, clock: false };
+  let templates = [];
+  let quietEndsAt = null;
+  let nudgeKind = "prompt";
+  const post = async (path, body) => {
+    const res = await fetch(BASE + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...where(), ...body }) });
+    return { ok: res.ok, data: await res.json().catch(() => ({})) };
+  };
+  const at = (ms, zone, opts = {}) => new Date(ms).toLocaleString("en-US", { timeZone: zone || undefined, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", ...opts });
+  const city = (zone) => (zone ? zone.split("/").pop().replaceAll("_", " ") : "");
+  const short = (text, n = 140) => (text.length > n ? text.slice(0, n - 1) + "…" : text);
+  function item(tag, cls, what, meta) {
+    const li = document.createElement("li");
+    const t = document.createElement("span"); t.className = "tag" + (cls ? " " + cls : ""); t.textContent = tag;
+    const w = document.createElement("span"); w.className = "what"; w.textContent = short(what); w.title = what;
+    li.append(t, w);
+    if (meta) { const m = document.createElement("span"); m.className = "dim"; m.textContent = meta; li.append(m); }
+    return li;
+  }
+  async function refreshPerson() {
+    if (!PLAY || !panel.person || !current) return;
+    const res = await fetch(BASE + "/api/person" + query());
+    if (!res.ok) return;
+    const { now, contact, outbox, lastOut = {} } = await res.json();
+    markUnread(lastOut);
+    const zone = contact?.timeZone;
+    $("theirTime").textContent = zone ? at(now, zone) : at(now);
+    $("theirZone").textContent = !contact ? "They have not written to the agent yet, so nudges to them are refused (unknown_person)."
+      : zone ? `${city(zone)} time, set by ${contact.timeZoneSource === "person" ? "them" : "the business"}`
+      : "Your time: their time zone is not known, so quiet hours don't apply to them";
+    const pill = $("quietPill");
+    quietEndsAt = null;
+    for (const h of outbox.held) if (h.holdUntil && (!quietEndsAt || h.holdUntil < quietEndsAt)) quietEndsAt = h.holdUntil;
+    if (contact?.quietHours) {
+      pill.hidden = false;
+      const inQuiet = quietEndsAt !== null && quietEndsAt > now;
+      pill.className = "pill " + (inQuiet ? "quiet" : "open");
+      pill.textContent = `Quiet hours ${contact.quietHours.from}–${contact.quietHours.to}` + (inQuiet ? ` · nudges wait until ${at(quietEndsAt, zone, { weekday: undefined, month: undefined, day: undefined })}` : "");
+      pill.title = contact.quietHoursSource === "person" ? "Their own quiet hours" : "The agent's quiet hours";
+    } else pill.hidden = true;
+    const rules = [];
+    if (contact) {
+      rules.push(contact.quietHours ? `Quiet hours ${contact.quietHours.from}–${contact.quietHours.to} (${contact.quietHoursSource === "person" ? "their own" : "the agent's"})` : contact.quietHoursSource === "no_time_zone" ? "Quiet hours don't apply: no time zone" : "No quiet hours");
+      if (contact.stop) rules.push("Texted STOP: nothing the business starts goes");
+      for (const p of contact.pauses) rules.push(`Paused until ${p.until ? at(p.until - 1, zone) : "?"}`);
+      for (const t of contact.topics) rules.push(`Not about: ${t.rule}`);
+    }
+    $("contactLine").textContent = rules.join(" · ");
+    const list = [];
+    for (const h of outbox.held) {
+      const until = h.reason === "window_closed" ? "until they reply (WhatsApp window closed)" : `until ${at(h.holdUntil, zone)}`;
+      list.push(item(`Held ${h.kind} nudge · goes on ${h.channel}`, "held", h.what, `${until}${h.expiresAt ? ` · dropped if still held at ${at(h.expiresAt, zone)}` : ""}`));
+    }
+    for (const sc of outbox.schedules) list.push(item(sc.origin === "person" ? "Their reminder" : "Scheduled by the business", "", sc.message, `${sc.summary}${sc.nextRunAt ? ` · next ${at(sc.nextRunAt, sc.timeZone)}` : ""}${sc.respectsQuietHours ? " · waits for quiet hours" : ""}`));
+    if (!list.length) { const li = document.createElement("li"); li.className = "empty"; li.textContent = "Nothing scheduled or held."; list.push(li); }
+    $("waiting").replaceChildren(...list);
+    $("toQuietEnd").disabled = !quietEndsAt;
+  }
+  // A new message on a channel not shown: a badge on its tab, until it is opened.
+  function markUnread(lastOut) {
+    const key = (ch) => `chinwag.seen.${person}.${ch}`;
+    for (const b of document.querySelectorAll(".tab")) {
+      const ch = b.dataset.id;
+      const times = lastOut[ch] ?? [];
+      const last = times.at(-1) ?? 0;
+      const badge = b.querySelector(".unread");
+      if (!badge) continue;
+      const stored = recall(key(ch));
+      if (ch === current.channel || stored === null) { remember(key(ch), String(last)); badge.hidden = true; continue; }
+      const unread = times.filter((t) => t > Number(stored)).length;
+      badge.hidden = unread === 0;
+      badge.textContent = unread > 9 ? "9+" : String(unread);
+    }
+  }
+
+  function setNudgeKind(kind) {
+    nudgeKind = kind;
+    for (const b of document.querySelectorAll(".seg button")) b.setAttribute("aria-pressed", String(b.dataset.kind === kind));
+    $("nTemplateRow").hidden = kind !== "template";
+    $("nText").hidden = kind === "template";
+    $("nText").placeholder = kind === "text" ? "Sent exactly as written, e.g. Your code is 4417" : "What the agent should tell them, e.g. Their order 1042 shipped";
+  }
+  function setUpPersonPanel() {
+    if (!PLAY || !panel.person) return;
+    $("tabPerson").hidden = false;
+    if (panel.clock) {
+      $("clockSec").hidden = false;
+      for (const b of document.querySelectorAll("[data-advance]")) b.addEventListener("click", async () => { await post("/api/clock", { advanceMs: Number(b.dataset.advance) }); refreshPerson(); });
+      $("toQuietEnd").addEventListener("click", async () => { if (quietEndsAt) await post("/api/clock", { to: quietEndsAt + 1000 }); refreshPerson(); });
+      $("clockGo").addEventListener("click", async () => { const v = $("clockTo").value; if (v) await post("/api/clock", { to: new Date(v).getTime() }); refreshPerson(); });
+    }
+    $("tzSet").addEventListener("click", async () => { await post("/api/time-zone", { time_zone: $("tz").value.trim() }); refreshPerson(); });
+    $("qSet").addEventListener("click", async () => { await post("/api/quiet-hours", { quiet_hours: { from: $("qFrom").value.trim(), to: $("qTo").value.trim() } }); refreshPerson(); });
+    $("qOff").addEventListener("click", async () => { await post("/api/quiet-hours", { quiet_hours: "off" }); refreshPerson(); });
+    $("qDefault").addEventListener("click", async () => { await post("/api/quiet-hours", { quiet_hours: null }); refreshPerson(); });
+    if (panel.nudge) {
+      $("nudgeSec").hidden = false;
+      for (const t of templates) { const o = document.createElement("option"); o.value = t.name; o.textContent = t.name; o.title = t.body; $("nTemplate").appendChild(o); }
+      for (const b of document.querySelectorAll(".seg button")) {
+        b.disabled = b.dataset.kind === "template" && !templates.length;
+        if (b.disabled) b.title = "This agent declares no WhatsApp templates";
+        b.addEventListener("click", () => setNudgeKind(b.dataset.kind));
+      }
+      $("nSend").addEventListener("click", async () => {
+        const text = $("nText").value.trim();
+        const body = { kind: nudgeKind, ...(nudgeKind === "prompt" ? { prompt: text } : nudgeKind === "text" ? { text } : { template: $("nTemplate").value, body: $("nValues").value.split(",").map((v) => v.trim()).filter(Boolean) }) };
+        if ($("nAt").value) body.at = new Date($("nAt").value).getTime();
+        if (!$("nQuiet").checked) body.respect_quiet_hours = false;
+        const mins = Number($("nExpires").value);
+        if (mins > 0) body.expires_at = Date.now() + mins * 60_000;
+        if ($("nKey").value.trim()) body.idempotency_key = $("nKey").value.trim();
+        $("nSend").disabled = true;
+        $("nResult").textContent = "";
+        try {
+          const { ok, data } = await post("/api/nudge", body);
+          $("nResult").textContent = ok ? `${data.status}${data.reason ? ` (${data.reason})` : ""}` : (data.error || "failed");
+          if (ok && nudgeKind !== "template") $("nText").value = "";
+        } finally { $("nSend").disabled = false; refreshPerson(); }
       });
     }
+    setInterval(refreshPerson, 3000);
+  }
+
+  (async () => {
+    ({ platforms, cards, people = [], channels = [], templates = [], panel = panel } = await (await fetch(BASE + "/api/platforms")).json());
     if (PLAY) {
       if (!channels.length) return empty("This agent has no channels. Declare them in <code>createAgent({ channels: [...] })</code> (whatsapp(), sms(), customUI()) to test it here.");
       if (!people.length) return empty("This agent has no test people. Declare who may be played here in <code>createAgent({ testPeople: [{ name, phone }] })</code>.");
@@ -997,8 +1216,12 @@
       $("who").value = person;
       $("who").addEventListener("change", () => { person = $("who").value; remember("chinwag.person", person); setPlatform(current.channel); });
       for (const c of channels) tabFor(c.name, c.name, c.platform);
+      setUpPersonPanel();
+      const saved = recall("chinwag.pane");
+      showPane(saved && !document.querySelector(`[data-pane="${saved}"]`)?.hidden ? saved : panel.person ? "pPerson" : "pTrace");
     } else {
       for (const p of platforms) tabFor(p.id, p.name, p);
+      showPane("pTrace");
     }
     let debug = params.get("debug") === "1";
     if (!params.has("debug")) { try { debug = localStorage.getItem("chinwag.debug") === "1"; } catch {} }

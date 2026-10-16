@@ -38,14 +38,15 @@
 
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import type { z } from "zod";
+import { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
-import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
+import type { ConversationRow, InboxRow, NoContactRow, QuietHours, StoreApi, TimeZoneSource } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
-import { render, toSpec, type Tool } from "./tools.ts";
+import { formatLocal } from "./time.ts";
+import { render, tool, toSpec, type Tool } from "./tools.ts";
 import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, PersonMessage, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
@@ -77,16 +78,22 @@ export interface ConversationSettings {
   /** Resolves once the store's tables exist. */
   ready: Promise<void>;
   now: () => number;
-  /** The agent's own time zone (the business's), for schedules when the person's is not known. */
+  /** The agent's own time zone (the business's): the time it is told when the person's is not known. */
   timeZone?: string;
+  /** The agent's quiet hours for everyone (false: none), unless a person set their own. */
+  quietHours?: QuietHours | false;
   /** The WhatsApp templates the owner declared: a sent one's text goes in the history. */
   templates: TemplateDefinition[];
+  /** The declared template Chinwag sends when no other one fits a closed window (createAgent's fallbackTemplate). */
+  fallbackTemplate?: string;
   /** Tag every message with its channel (the agent has several), even for a person on one so far. */
   tagChannels: boolean;
   /** How the channels of a conversation loaded from the store are reached again. */
   links(conversationId: string): Promise<ChannelLink[]>;
   /** Records how a scheduled run or a nudge ended. */
   settle(target: { run?: string; nudge?: string }, status: string, reason?: string): Promise<void>;
+  /** A window-closed prompt nudge the agent sent no template for: held until they reply, and the fallback goes. */
+  windowClosed(nudge: string, to: { channel: string; address: string }): Promise<void>;
 }
 
 /** One channel this person writes on, and how to reach them there. */
@@ -152,6 +159,8 @@ interface Owed {
   nudge?: string;
   mode: "message" | "check" | "prompt";
   channel: string;
+  /** A prompt nudge to someone whose WhatsApp window is closed: only a template reaches them. */
+  windowClosed?: boolean;
 }
 
 interface Pending {
@@ -186,6 +195,8 @@ interface Note {
 interface Direct {
   inbox?: number;
   channel: string;
+  /** A held nudge released because they just wrote: their window is open. */
+  theyWrote?: boolean;
   text?: string;
   template?: Template;
   run?: string;
@@ -216,6 +227,8 @@ export class Conversation {
   private readonly lifetime = new AbortController();
   private recentChannels: string[] = [];
   private timeZone: string | null = null;
+  /** Their own quiet hours ("off": none), or null for the agent's. */
+  private quietHours: QuietHours | "off" | null = null;
   private running = false;
   /** Messages whose files are still being read (downloaded, transcribed); later ones wait behind them. */
   private preparing: Promise<void> | null = null;
@@ -260,6 +273,7 @@ export class Conversation {
       this.turns = existing.turns;
       this.recentChannels = existing.recentChannels;
       this.timeZone = existing.timeZone;
+      this.quietHours = existing.quietHours;
     }
     const builtins = [
       ...scheduleTools({
@@ -268,18 +282,64 @@ export class Conversation {
         channel: () => this.currentChannel(),
         now: settings.now,
         personZone: () => this.timeZone,
-        setPersonZone: (zone) => {
-          this.timeZone = zone;
-          return this.persist(() => settings.store.updateConversation(id, { timeZone: zone }));
-        },
+        setPersonZone: (zone) => this.setTimeZone(zone, "person"),
         agentZone: settings.timeZone,
       }),
-      ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone ?? settings.timeZone ?? "UTC" }),
+      ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone, setQuietHours: (q) => this.setQuietHours(q) }),
     ];
+    const fallback = settings.fallbackTemplate;
+    const offered = settings.templates.filter((t) => t.name !== fallback);
+    if (offered.length) builtins.push(this.templateTool(offered));
     this.builtins = new Map(builtins.map((t) => [t.name, t]));
     this.builtinSpecs = builtins.map(toSpec);
     this.loaded = settings.ready.then(() => (existing ? this.load() : settings.store.createConversation(id, personKey)));
     this.writes = this.loaded.catch((error) => console.warn(`chinwag: conversation ${id} did not load:`, error));
+  }
+
+  /** Their time zone, as the business set it or they said it: schedules, quiet hours and the time line use it from now on. */
+  setTimeZone(zone: string, source: TimeZoneSource): Promise<void> {
+    this.timeZone = zone;
+    return this.persist(() => this.settings.store.updateConversation(this.id, { timeZone: zone, timeZoneSource: source }));
+  }
+
+  /** Their own quiet hours ("off": none; null: back to the agent's). */
+  setQuietHours(hours: QuietHours | "off" | null): Promise<void> {
+    this.quietHours = hours;
+    return this.persist(() => this.settings.store.updateConversation(this.id, { quietHours: hours }));
+  }
+
+  /**
+   * send_template: the agent sends one of the business's WhatsApp templates, its values filled, when
+   * Chinwag tells it their 24-hour window is closed. The fallback template is Chinwag's to send.
+   */
+  private templateTool(offered: TemplateDefinition[]): Tool {
+    const names = offered.map((t) => t.name) as [string, ...string[]];
+    return tool({
+      name: "send_template",
+      description: `Send one of the business's WhatsApp templates, only when Chinwag says their 24-hour window is closed. Templates: ${offered.map((t) => `${t.name}: "${t.body}"`).join("; ")}. body: the {{1}}, {{2}}... values in order.`,
+      input: z.object({
+        name: z.enum(names),
+        body: z.array(z.string()).optional(),
+        header: z.string().optional().describe("The header's {{1}}, when its header is text with a value"),
+      }),
+      run: async ({ name, body, header }, context) => {
+        const template: Template = { name, ...(body?.length ? { body } : {}), ...(header ? { header: { kind: "text", text: header } } : {}) };
+        const declared = declaredTemplate(this.settings.templates, template);
+        let reads = "";
+        try {
+          if (declared) reads = fillTemplate(declared, template).body;
+        } catch (error) {
+          return { error: error instanceof Error ? error.message.replace(/^chinwag: /, "") : String(error) };
+        }
+        const channel = this.owed.find((o) => o.windowClosed)?.channel ?? context.channel;
+        const failure = await this.send(channel, { type: "template", ...template });
+        if (failure) return { error: failure };
+        this.settings.emit(this.id, "message.out", { text: name, channel, template: true });
+        this.history.push({ role: "user", content: `[Chinwag] You sent them the template "${name}" on ${channel}. It reads:\n${reads}` });
+        this.sent();
+        return { delivered: true, channel };
+      },
+    });
   }
 
   /** What a channel of this conversation can show, if the person has written on it. */
@@ -507,9 +567,18 @@ export class Conversation {
       else this.notes.push({ text: p.text, inbox: row.id, owed: { run: p.run, mode: p.mode, channel: p.channel } });
     } else if (row.kind === "nudge") {
       if (p.prompt !== undefined) {
-        const text = `[Nudge from the business, not from the person: ${p.prompt}] Write it to them now in your own words, or send nothing if it does not fit what they asked not to be messaged about.`;
+        if (p.windowClosed) {
+          const text = `[Nudge from the business, not from the person: ${p.prompt}] Their WhatsApp 24-hour window is closed: no ordinary message reaches them. If one of the business's templates says this, send it with send_template, its values filled in. If none fits, send nothing: Chinwag sends them a "you have a new message" template and gives you this again when they reply.`;
+          this.notes.push({ text, inbox: row.id, owed: { nudge: p.nudge, mode: "prompt", channel: p.channel, windowClosed: true } });
+          if (!this.running && this.hasWork()) this.schedule(0);
+          return;
+        }
+        const held = typeof p.heldAt === "number" ? `held for their quiet hours since ${formatLocal(this.timeZone ?? this.settings.timeZone ?? "UTC", p.heldAt)}; ` : "";
+        const text = held
+          ? `[Nudge from the business, not from the person, ${held}${p.prompt}] Tell them now in your own words. Others held with it come in this turn too: cover them all in one short message, not a text each, and answer anything they just asked first.`
+          : `[Nudge from the business, not from the person: ${p.prompt}] Write it to them now in your own words, or send nothing if it does not fit what they asked not to be messaged about.`;
         this.notes.push({ text, inbox: row.id, owed: { nudge: p.nudge, mode: "prompt", channel: p.channel } });
-      } else this.direct.push({ inbox: row.id, channel: p.channel, text: p.text, template: p.template, nudge: p.nudge });
+      } else this.direct.push({ inbox: row.id, channel: p.channel, text: p.text, template: p.template, nudge: p.nudge, ...(p.theyWrote ? { theyWrote: true } : {}) });
     }
     if (!this.running && this.hasWork()) this.schedule(0);
   }
@@ -541,7 +610,7 @@ export class Conversation {
     let taken = true;
     const keep = (rule: NoContactRow | null) => this.persist(async () => void (taken = await store.setStop(this.id, rule, inbound))).then(() => taken);
     if (kind === "stop") {
-      const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true };
+      const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true, kind: "stop" };
       this.stop = rule;
       return { note: `[Chinwag] They texted "${clip(text.trim())}" on ${channel}: nothing the business starts (nudges, scheduled messages) reaches them until they text START. Answer them when they write.`, stored: keep(rule) };
     }
@@ -842,7 +911,8 @@ export class Conversation {
         }
       }
     }
-    const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC");
+    const quiet = this.quietHours === "off" ? null : (this.quietHours ?? (this.settings.quietHours === false ? null : (this.settings.quietHours ?? { from: "22:00", to: "07:00" })));
+    const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC", this.timeZone ? quiet : null);
     // A message that came while those loaded had no step to restart: it joins the first one.
     this.absorb();
     let restarts = 0;
@@ -857,7 +927,7 @@ export class Conversation {
       const views = this.views();
       const several = views.length > 1;
       this.sendTools = new Map(views.map((v) => [sendToolName(v.name), v.name]));
-      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, context].filter(Boolean).join("\n\n");
+      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, nowLine(this.settings.now(), this.timeZone, this.settings.timeZone), context].filter(Boolean).join("\n\n");
       const specs = [...this.settings.specs, ...this.builtinSpecs, ...talkSpecs(views, this.settings.talk)];
       const abort = new AbortController();
       if (restarts < this.settings.maxRestarts) this.stepAbort = abort;
@@ -963,6 +1033,12 @@ export class Conversation {
       this.absorb();
     }
     for (const o of this.owed.splice(0)) {
+      const link = o.windowClosed && o.nudge ? this.channels.get(o.channel) : undefined;
+      if (link) {
+        const { nudge } = o;
+        this.persist(() => this.settings.windowClosed(nudge!, { channel: o.channel, address: link.address }));
+        continue;
+      }
       if (o.mode === "message") this.settle(o, "failed", "the agent sent nothing");
       else this.settle(o, o.mode === "check" ? "quiet" : "silent");
     }
@@ -1120,7 +1196,7 @@ export class Conversation {
     };
     const link = this.channels.get(d.channel);
     if (!link) return settle("failed", `no way to reach them on ${d.channel} right now`);
-    if (!d.template && windowClosed(link, this.settings.now())) return settle("refused", "outside_window");
+    if (!d.template && !d.theyWrote && windowClosed(link, this.settings.now())) return settle("refused", "outside_window");
     // Every direct send is one the business starts (a nudge, or its scheduled text): the person's rules apply.
     const rules = await this.settings.store.noContact(this.id, this.settings.now());
     let covered = rules.find((r) => r.hard) ?? null;
@@ -1484,3 +1560,28 @@ function ago(ms: number): string {
 function stableJson(value: unknown): string {
   return JSON.stringify(value, (_key, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v));
 }
+
+/**
+ * The time, for every turn: in their zone when the business or the person gave it, else in the
+ * business's, saying theirs is not known (never guessed from the business's).
+ */
+export function nowLine(now: number, personZone: string | null, agentZone: string | undefined): string {
+  if (personZone) return `[Chinwag] It is now ${formatLocal(personZone, now)}, their time.`;
+  return `[Chinwag] It is now ${formatLocal(agentZone ?? "UTC", now)}, the business's time. Their time zone is not known: ask where they are before anything that depends on their local time.`;
+}
+
+export const PROFILE_TOOL = "get_user_profile";
+
+/** The built-in tool over createAgent's `profile`: no input, so it is always about the person in this conversation. */
+export function profileTool(profile: Profile): Tool {
+  return tool({
+    name: PROFILE_TOOL,
+    description: "This person's profile from the business: who they are and what the business knows about them. Call it when you need it; it is always about the person you are talking to.",
+    input: z.object({}),
+    run: (_input, context) => profile({ conversationId: context.conversationId, person: context.person, channel: context.channel }),
+  });
+}
+
+/** createAgent's `profile`: what the business knows about the person, fetched only when the agent asks. */
+export type Profile = (who: { conversationId: string; person: string; channel: string }) => Promise<unknown> | unknown;
+

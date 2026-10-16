@@ -115,12 +115,13 @@ test("the scheduling tool refuses what would go wrong, with a reason the agent c
   const store = new Store(sqlite(), "default");
   await store.migrate();
   let zone: string | null = null;
-  const scope = { store, conversationId: "c1", channel: () => "sms", now: () => NOON_NY, personZone: () => zone, setPersonZone: async (z: string) => void (zone = z) };
+  const scope = { store, conversationId: "c1", channel: () => "sms", now: () => NOON_NY, personZone: () => zone, setPersonZone: async (z: string) => void (zone = z), agentZone: "America/New_York" };
   const [schedule] = scheduleTools(scope);
   const run = (input: Record<string, unknown>) => Promise.resolve(schedule.run(schedule.input.parse(input), { conversationId: "c1", person: "p", key: null, channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal })) as Promise<Record<string, any>>;
   const daily = { message: "check in", repeat: "daily", time: "09:00" };
 
-  assert.match((await run(daily)).error, /^timezone_needed/, "no zone known: ask their city");
+  assert.match((await run(daily)).error, /^timezone_needed/, "no zone known: ask their city, never take the business's");
+  assert.ok((await run({ message: "call mum", repeat: "once", in_minutes: 30 })).scheduled, "in 30 minutes is the same in every zone");
   assert.match((await run({ ...daily, timezone: "UTC" })).error, /^timezone_needed/, "a bare UTC says nothing about where they are");
   assert.match((await run({ ...daily, timezone: "Mars/Olympus" })).error, /not a time zone/);
   zone = "America/New_York";
@@ -139,10 +140,27 @@ test("a repeat ends after its number of runs, or at its until date", async () =>
   const nineNY = Date.UTC(2026, 9, 13, 13);
   await store.addSchedule({ ...base, id: "twice", nextRunAt: nineNY, maxRuns: 2 });
   await store.addSchedule({ ...base, id: "until", nextRunAt: nineNY, maxRuns: null, endsOn: "2026-10-14" });
-  for (const day of [0, 1, 2]) await claimDue(store, nineNY + day * 86_400_000, async () => null);
+  for (const day of [0, 1, 2]) await claimDue(store, nineNY + day * 86_400_000, async () => null, async () => null);
   const left = await store.db.query("SELECT id, status, run_count FROM schedules ORDER BY id");
   assert.deepEqual(left.map((r) => ({ ...r })), [
     { id: "twice", status: "done", run_count: 2 },
     { id: "until", status: "done", run_count: 2 },
   ]);
 });
+
+test("the agent is told the time each turn: theirs once the business sets their zone, else the business's, saying theirs is unknown", async () => {
+  const h = await withSam();
+  assert.match(h.calls[0].request.system, /It is now Mon 12 Oct 2026 12:00 \(New York time\), the business's time\. Their time zone is not known/);
+  assert.deepEqual(await h.agent.setTimeZone({ to: { channel: "sms", address: SAM }, timeZone: "Asia/Kolkata" }), { status: "set" });
+  assert.deepEqual(await h.agent.setTimeZone({ to: { channel: "sms", address: "+15550100999" }, timeZone: "Asia/Kolkata" }), { status: "refused", reason: "unknown_person" });
+  await assert.rejects(h.agent.setTimeZone({ to: { channel: "sms", address: SAM }, timeZone: "Mars/Olympus" }), /not a time zone/);
+  await h.message("sms", SAM, "remind me at 9 tomorrow");
+  const next = await h.nextCall(1);
+  assert.match(next.request.system, /It is now Mon 12 Oct 2026 21:30 \(Kolkata time\), their time\./);
+  next.answer(respond(call("send_sms", { text: "Sure." }), call("schedule_message", { message: "remind", repeat: "once", time: "09:00" })));
+  (await h.nextCall(2)).answer(respond());
+  await h.conversation.whenIdle();
+  const [row] = await h.store.schedules(h.conversationId);
+  assert.equal(row.timeZone, "Asia/Kolkata", "a schedule uses the zone the business set");
+});
+

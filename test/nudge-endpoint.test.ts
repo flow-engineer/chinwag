@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test, type TestContext } from "node:test";
-import { nudgeHandler } from "../src/index.ts";
+import { nudgeHandler, sqlite, Store, peopleHandler } from "../src/index.ts";
 import { SMS, call, multi, respond } from "./helpers.ts";
 
 const SAM = { channel: "sms", address: "+15550100100" };
@@ -11,7 +11,8 @@ const auth = { authorization: `Bearer ${TOKEN}`, "content-type": "application/js
 
 /** Sam has written once and been answered; the nudge endpoint is served under /nudges. */
 async function served(t: TestContext) {
-  const h = multi({ channels: { sms: { info: SMS, phone: true } } });
+  const database = sqlite();
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, database });
   const first = await h.message("sms", SAM.address, "hi");
   (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Hi!" })));
   const conversation = h.agent.conversation(first!.conversationId)!;
@@ -24,7 +25,7 @@ async function served(t: TestContext) {
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   const post = (body: unknown, headers: Record<string, string> = auth) => fetch(`${url}/nudges`, { method: "POST", headers, body: typeof body === "string" ? body : JSON.stringify(body) });
   const get = (id: string) => fetch(`${url}/nudges/${id}`, { headers: auth });
-  return { ...h, conversation, logged, url, post, get };
+  return { ...h, database, conversation, logged, url, post, get };
 }
 
 test("a short token throws at setup", () => {
@@ -113,4 +114,25 @@ test("an unknown id is 404, and paths outside its base are not its own, without 
   for (const path of ["/", "/other", "/nudgesx", "/nudges/a/b"]) {
     assert.equal((await fetch(`${h.url}${path}`)).status, 404, path);
   }
+});
+
+test("over HTTP a business sets a person's time zone and quiet hours and reads their contact record", async (t) => {
+  const h = await served(t);
+  const server = createServer(peopleHandler(h.agent, { token: TOKEN }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/people`;
+  const put = (path: string, body: unknown, headers: Record<string, string> = auth) => fetch(`${base}/${path}`, { method: "PUT", headers, body: JSON.stringify(body) });
+  assert.equal((await put("time-zone", { to: SAM, time_zone: "Asia/Kolkata" }, { "content-type": "application/json" })).status, 401);
+  const set = await put("time-zone", { to: SAM, time_zone: "Asia/Kolkata" });
+  assert.equal(set.status, 200);
+  assert.deepEqual(await set.json(), { status: "set" });
+  assert.equal((await new Store(h.database, "default").conversation(h.conversation.id))?.timeZone, "Asia/Kolkata");
+  assert.equal((await put("time-zone", { to: { channel: "sms", address: "+15550100999" }, time_zone: "Asia/Kolkata" })).status, 404);
+  assert.equal((await put("time-zone", { to: SAM, time_zone: "Mars/Olympus" })).status, 400);
+  assert.equal((await put("quiet-hours", { to: SAM, quiet_hours: { from: "21:00", to: "08:00" } })).status, 200);
+  assert.equal((await put("quiet-hours", { to: SAM, quiet_hours: { from: "9pm", to: "8am" } })).status, 400);
+  const contact = (await (await fetch(`${base}/contact?channel=sms&address=${encodeURIComponent(SAM.address)}`, { headers: auth })).json()) as Record<string, unknown>;
+  assert.deepEqual([contact.timeZone, contact.timeZoneSource, contact.quietHours, contact.quietHoursSource], ["Asia/Kolkata", "business", { from: "21:00", to: "08:00" }, "person"]);
+  assert.equal((await fetch(`${base}/elsewhere`, { headers: auth })).status, 404);
 });

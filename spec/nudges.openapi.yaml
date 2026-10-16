@@ -145,17 +145,20 @@ components:
             variables: { type: object, additionalProperties: { type: string } }
         at: { type: integer, minimum: 0, description: Send it later, at this time, in milliseconds since the epoch. }
         idempotency_key: { type: string, minLength: 1, maxLength: 200, description: The same key twice sends once; the second call gets the first nudge's id and state. }
+        respect_quiet_hours: { type: boolean, description: "Wait for the end of the person's quiet hours (default true); false sends it now." }
+        expires_at: { type: integer, minimum: 0, description: "Milliseconds since the epoch: held for quiet hours past this, it is dropped as expired (default 24 hours on)." }
     NudgeState:
       type: object
       required: [id, status]
       properties:
         id: { type: string }
         status:
-          enum: [queued, sent, silent, dropped, refused, failed, scheduled]
+          enum: [queued, sent, silent, dropped, refused, failed, scheduled, held, expired]
           description: |
             queued (waiting for its send or turn); sent; silent (the agent chose to send nothing);
             dropped (a no-contact rule covers it, or their STOP); refused (outside_window,
-            unknown_person); failed (it could not be sent, or the model failed); scheduled.
+            unknown_person); failed (it could not be sent, or the model failed); scheduled; held (their
+            quiet hours, until they end or the person writes); expired (held past expires_at).
         reason: { type: string, description: Why, for dropped, refused and failed. }
     Error:
       type: object

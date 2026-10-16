@@ -139,7 +139,7 @@ const play = simulators({ title: "My agent" });
 await play.listen(buildAgent({ events: [play.events] }), 8788);
 ```
 
-The playground plays only the test people you declare (`testPeople: [{ name, phone }]`) on the agent's own channels. A test person is a real person to the agent: the same identity, `resolve` and history as if they wrote from their phone, one conversation on every channel, and "Clear history" to start again. Replies go back where the person last wrote from, the playground or the real channel. `simulators({ actions: [{ label, run }] })` adds a Backend panel: each button runs your function on the server (an order ships, a price drops) and its result shows in the trace, so a demo shows the agent reacting to your backend. Locally it answers only on localhost, and its API only its own page, so a site you visit cannot send it messages. On a deployed agent, mount `play.handler(agent, { token })`: it refuses requests without the token (at least 32 characters), swaps `?token=` for a cookie on the playground's path, and limits wrong tries.
+The playground plays only the test people you declare (`testPeople: [{ name, phone }]`) on the agent's own channels. A test person is a real person to the agent: the same identity, `resolve` and history as if they wrote from their phone, one conversation on every channel, and "Clear history" to start again. Replies go back where the person last wrote from, the playground or the real channel. The playground's Person tab moves the agent's clock (`simulators({ clock: playgroundClock() })`, with `createAgent({ now: clock.now })`), lists what is scheduled or held for them, sets their time zone and quiet hours, and sends nudges with every field the API takes. Locally it answers only on localhost, and its API only its own page, so a site you visit cannot send it messages. On a deployed agent, mount `play.handler(agent, { token })`: it refuses requests without the token (at least 32 characters), swaps `?token=` for a cookie on the playground's path, and limits wrong tries.
 
 `AGENTS.md` says what the agent is for and what it may and may not do. Leave messaging out of it: Chinwag adds how to talk on each channel (its send tool, reactions, formatting, acknowledging first). A skill's `SKILL.md` starts with a `name` and `description`; the agent sees every description and loads a skill when it needs it (`inlineSkills: true` puts them all in the prompt instead).
 
@@ -176,6 +176,31 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 - **One person, one conversation.** The same number on SMS and WhatsApp is one person, however each provider writes it (`+1 555 010 0100`, `15550100100`: both are `+15550100100`), also when their first messages on both arrive at once. If your SMS provider gives national numbers (`098765 43210`), set `createAgent({ defaultCountryCode: "+91" })`: on every phone channel but WhatsApp, a number with no `+` or `00` is then read as that country's (its trunk 0 dropped), so it joins `919876543210` on WhatsApp; without it, bare digits are taken as international. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses. A tool sees who the person is as `context.person`, the stable id to key their data by: `key:<your resolve's value>`, else `phone:<E.164>` (`phone:+15550100100`), else `<channel>:<address>`. `context.key` is your `resolve`'s value as it returned it (`customer-7`), or null when the person is known only by phone or channel, so `members.get(context.key)` finds them.
 - **The agent gets one send tool per channel** (`send_sms`, `send_whatsapp`, `send_app`) and answers each message where it came in. `instructions` guide the agent on that channel only.
 
+## What the agent knows about the person
+
+Give the agent what your business knows about someone (their account, plan, orders, preferences) with `profile`. Chinwag offers it as a built-in tool, `get_user_profile`, which the agent calls when it needs it; it has no input, so it is always about the person in this conversation:
+
+```ts
+createAgent({
+  // ...
+  resolve: ({ channel, address }) => members.idFor(channel, address),
+  profile: async ({ person }) => members.profile(person), // person: what tools get as context.person
+});
+```
+
+A tool of yours named `get_user_profile` is used instead. In `chinwag test` runs the profile is played by the test cloud from the scenario's `world`, like your tools, so a test never reads a real one.
+
+`context(conversationId)` is still there for small facts at hand, added to the system prompt at the start of every turn. It runs before every reply, so a lookup in it (an API call, a slow query) delays every reply: put those in `profile` or a tool. What is the same for everyone (opening hours, policies) belongs in the agent's `AGENTS.md`.
+
+## Time zones
+
+Chinwag tells the agent the time at every turn: in the person's time zone when it is known, else in the business's (`timeZone`), saying theirs is not known. A person's zone is never guessed from the business's. It is known when:
+
+- **You set it.** Many businesses already know it: `await agent.setTimeZone({ to: { channel: "sms", address: "+15550100100" }, timeZone: "Asia/Kolkata" })`, or over HTTP (below). It answers `{ status: "set" }`, or `{ status: "refused", reason: "unknown_person" }` for someone who has never written; a name that is not an IANA zone throws.
+- **They say it.** When they name a place for a reminder, the agent keeps their zone.
+
+Without it, a reminder at a clock time ("at 9 tomorrow") makes the agent ask where they are first; one "in 30 minutes" needs no zone. A no-contact rule that lasts "until Friday" ends where Friday ends last (UTC-12), so it never lifts early.
+
 ## Reminders and nudges
 
 Built in, so you don't write them as tools:
@@ -204,7 +229,44 @@ Built in, so you don't write them as tools:
 await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt: "Their order is ready for pickup." });
 ```
 
-`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped, and outside WhatsApp's 24-hour window only templates go out. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
+`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed`, `scheduled`, `held` or `expired` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
+
+Prefer `prompt`: the agent writes it in the context of the chat, in their language, and may hold back what no longer fits. Use `text` only where the wording must be exact (a code, a legal notice), and `template` for campaigns and notifications you set up with Meta, which go as they are.
+
+### WhatsApp's 24-hour window
+
+Outside it, WhatsApp delivers only templates. Declare a fallback, a template with no values that says something is waiting ("You have a new message. Reply to see it."), and a nudge still reaches the person:
+
+```ts
+createAgent({
+  // ...
+  templates: [
+    { name: "message_waiting", language: "en", category: "utility", body: "You have a new message. Reply to see it." },
+    { name: "order_shipped", language: "en", category: "utility", body: "Hi {{1}}, your order {{2}} has shipped." },
+  ],
+  fallbackTemplate: { name: "message_waiting" },
+});
+```
+
+- **A `prompt` nudge**: the agent is told the window is closed and may send one of your templates that says the same thing, its values filled in (`send_template`, built in).
+- **When none fits** (or for a `text` nudge), Chinwag sends the fallback, and the nudge is held (`held`, `window_closed`) until they reply, when the agent tells them (or the text goes as written). Past its `expiresAt` (24 hours by default) it expires.
+- **Each fallback emits a `template.missing` event** with what the nudge said: the messages worth a template of their own.
+
+Without a fallback, a `text` or `prompt` nudge outside the window is refused (`outside_window`). A template nudge always goes as it is. Meta decides each template's category from its text and may charge or limit it as marketing: check yours.
+
+### Quiet hours
+
+What the business starts waits for each person's quiet hours: 22:00 to 07:00 in their own time by default (`createAgent({ quietHours: { from: "21:00", to: "08:00" } })` to change it, `false` for none). They apply only where the person's time zone is known (see [Time zones](#time-zones)): without it nothing is held.
+
+- **A nudge in their quiet hours is held** (`status: "held"`), and goes when the hours end or as soon as they write, whichever comes first. Everything held reaches one turn: the agent writes one short message for all of it, not a text each, after answering whatever they just asked. A `text` or template nudge goes as written.
+- **It can go stale.** A held nudge past its `expiresAt` (default 24 hours) is dropped as `expired`; give a short one to "your table is ready". `respectQuietHours: false` sends it now, quiet hours or not, for what cannot wait (a security alert).
+- **A scheduled nudge** (`at`) that comes due in their quiet hours moves to when they end.
+- **Their own reminders** go at the time they asked for, quiet hours or not, unless the agent marks one as able to wait (`respect_quiet_hours` on `schedule_message`: "check for new listings and let me know"); a repeat like that skips its runs in their quiet hours.
+- **People set their own.** "Not after 9pm" sets theirs (`set_quiet_hours`, built in), "no messages this week" pauses everything the business starts (`pause_messages`), with no model call to check either. Your backend sets or reads them too: `agent.setQuietHours({ to, quietHours })`, `agent.contact(to)`.
+
+The contact record (`agent.contact(to)`, or `GET /people/contact`) is what the agent goes by for a person: `timeZone` and `timeZoneSource` (`business` or `person`), `quietHours` and `quietHoursSource` (`person`, `agent`, `off`, or `no_time_zone`), `stop`, `pauses` and `topics` (what they asked not to be messaged about, in their words).
+
+Rules on when marketing may be sent differ by country, and by US state: check yours. US telemarketing rules, as far as we know, allow calls and texts only from 8am to 9pm the recipient's time, which is narrower than the default.
 
 ### Nudges over HTTP
 
@@ -221,8 +283,8 @@ createServer((req, res) => {
 }).listen(3000);
 ```
 
-- `POST /nudges` with `{ to: { channel, address }, text | prompt | template, at?, idempotency_key? }`: exactly one of `text`, `prompt` or `template`, as in `agent.nudge()`; `at` is milliseconds since the epoch; unknown fields are refused; at most 16 KB. It answers `202 { id, status, reason? }` as soon as the nudge is recorded, without waiting for the send or the agent's turn: usually `queued`. What is decided as it is recorded is in that answer too, still a 202, since it is the nudge's state and not an error: `refused` (`unknown_person`, with `id` `""` since nothing is recorded; `outside_window`), `dropped` (they texted STOP) or `scheduled`. A bad body, a channel the agent does not have, or a declared template's wrong values get `400 { error }`.
-- `GET /nudges/<id>`: `200 { id, status, reason? }`, its state now: `queued`, `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled`. An id it never recorded gets 404.
+- `POST /nudges` with `{ to: { channel, address }, text | prompt | template, at?, idempotency_key?, respect_quiet_hours?, expires_at? }`: exactly one of `text`, `prompt` or `template`, as in `agent.nudge()`; `at` is milliseconds since the epoch; unknown fields are refused; at most 16 KB. It answers `202 { id, status, reason? }` as soon as the nudge is recorded, without waiting for the send or the agent's turn: usually `queued`. What is decided as it is recorded is in that answer too, still a 202, since it is the nudge's state and not an error: `refused` (`unknown_person`, with `id` `""` since nothing is recorded; `outside_window`), `dropped` (they texted STOP, or paused messages), `held` (their quiet hours) or `scheduled`. A bad body, a channel the agent does not have, or a declared template's wrong values get `400 { error }`.
+- `GET /nudges/<id>`: `200 { id, status, reason? }`, its state now: `queued`, `sent`, `silent`, `dropped`, `refused`, `failed`, `scheduled`, `held` or `expired`. An id it never recorded gets 404.
 - The same `idempotency_key` returns the first nudge's id and its state now, and sends once.
 - Every request needs `Authorization: Bearer <token>`, compared in constant time; wrong tokens are limited per address (10 in 15 minutes, then 429), as on the playground. Answers are JSON with `cache-control: no-store`. Each accepted nudge is logged (id, status, channel, kind, time and the caller's IP address), never its text or the token.
 
@@ -233,6 +295,21 @@ curl -s -X POST https://agent.example.com/nudges \
 # {"id":"n_3f9c2a1b","status":"queued"}
 curl -s https://agent.example.com/nudges/n_3f9c2a1b -H "Authorization: Bearer $NUDGE_TOKEN"
 # {"id":"n_3f9c2a1b","status":"sent"}
+```
+
+What you know about people goes the same way, for a business that keeps it in its own database: mount `peopleHandler(agent, { token })` and
+
+- `PUT /people/time-zone` with `{ to: { channel, address }, time_zone }`;
+- `PUT /people/quiet-hours` with `{ to, quiet_hours: { from, to } | "off" | null }` (null: back to the agent's);
+- `GET /people/contact?channel=&address=`: their contact record (below).
+
+Each answers `200`, or `404 { status: "refused", reason: "unknown_person" }` for someone who has never written, or `400 { error }` (a name that is not a time zone, hours that are not `HH:MM`).
+
+```sh
+curl -s -X PUT https://agent.example.com/people/time-zone \
+  -H "Authorization: Bearer $NUDGE_TOKEN" -H "content-type: application/json" \
+  -d '{"to":{"channel":"sms","address":"+15550100100"},"time_zone":"Asia/Kolkata"}'
+# {"status":"set"}
 ```
 
 The contract is [`spec/nudges.openapi.yaml`](spec/nudges.openapi.yaml). In code, `agent.recordNudge(input)` is the same early answer and `agent.nudgeState(id)` the same read.
@@ -434,11 +511,14 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `database` | Where state lives (`sqlite()` in memory by default) |
 | `store` | Instead of `database`: a store of your own that keeps the state elsewhere |
 | `testPeople` | Who the playground may play: `[{ name, phone }]` |
+| `fallbackTemplate` | The declared template sent when a nudge meets a closed WhatsApp window and no other fits; the nudge then waits for their reply (see [WhatsApp's 24-hour window](#whatsapps-24-hour-window)) |
 | `templates` | The WhatsApp templates you set up with Meta (header, body, footer, buttons): each send is checked against its declaration, and the playground shows it as WhatsApp does |
 | `transcribe` | Speech to text for voice notes, with the provider you choose |
-| `context` | Text added to every turn: who this person is, the time |
+| `context` | Small facts added to the system prompt at every turn; it runs before every reply, so keep lookups out of it (see [What the agent knows about the person](#what-the-agent-knows-about-the-person)) |
+| `profile` | What your business knows about the person, as the built-in tool `get_user_profile`, called only when the agent needs it |
 | `intercept` | Answer some messages without the model; `message.channel` is the channel it came in on, and it sees STOP, START and HELP first, marked in `message.keyword` (they are built in on SMS and WhatsApp). The message and the reply are kept in the history (the agent reads them at its next turn) and the transcript, and are `message.in` and `message.out` events marked `answered: true` |
-| `timeZone` | The business's time zone, for schedules when a person's is unknown |
+| `quietHours` | Each person's quiet hours in their own time (22:00–07:00 by default; `false` for none): what the business starts waits for them (see [Quiet hours](#quiet-hours)) |
+| `timeZone` | The business's time zone: the time the agent is told when a person's is not known (never taken as theirs; see [Time zones](#time-zones)) |
 | `deadlineMs` | The longest a reply waits for a tool (60,000); a tool can set its own |
 | `partialAfterMs` | How long a finished tool's result waits for the others (5,000) |
 | `debounceMs` | Quiet time after a message before the reply starts (300) |

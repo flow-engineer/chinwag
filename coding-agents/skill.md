@@ -76,8 +76,10 @@ export function buildAgent(options: { model?: Model; events?: EventSink[]; tools
 ```
 
 Other `createAgent` options: `files` replaces `dir` on hosts with no file system (the folder's
-text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `context(conversationId)` adds who the person is and the time to
-every turn (cheaper than a lookup tool); `intercept(conversationId, text, message)` answers a
+text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `profile({ conversationId, person, channel })` is what the business knows about
+the person, offered as the built-in tool `get_user_profile` and run only when the agent calls it (put
+lookups here, not in `context`); `context(conversationId)` adds small facts to the system prompt at
+every turn, before every reply, so it must not call APIs; Chinwag already tells the agent the time; `intercept(conversationId, text, message)` answers a
 message without the model (return the reply, `""` for silence, or `null` to let the agent answer;
 the message and the reply are kept in the history, so the next turn knows, and in the transcript,
 and are `message.in`/`message.out` events marked `answered: true`);
@@ -121,6 +123,8 @@ export const app = customUI("app", {
 
 createAgent({ ..., channels: [wa, sms(twilioLike), app], database: sqlite("data/chinwag.db"),
   resolve: ({ channel, address }) => members.idFor(channel, address), timeZone: "America/New_York" });
+// A person's time zone is never guessed from timeZone (the business's): set it when you know it,
+// agent.setTimeZone({ to, timeZone }) or peopleHandler over HTTP; else the agent asks them.
 await agent.resume();                     // a durable database: always before the first message
 await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" });
 ```
@@ -167,9 +171,11 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   picks; Chinwag has none. Anything the agent can't read reaches it named, with why, so it asks
   for text. The latest 3 photos and PDFs stay shown; their bytes are never stored.
 
-Built in, so don't build them as tools: scheduled messages (`schedule_message`, `list_scheduled`,
+Built in, so don't build them as tools: what the business knows about the person (`profile`, as
+`get_user_profile`), scheduled messages (`schedule_message`, `list_scheduled`,
 `cancel_scheduled`, in the person's local time), and what a person asked not to be messaged about
-(`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
+(`add_no_contact`, `remove_no_contact`), quiet hours they set (`set_quiet_hours`) and pauses
+(`pause_messages`). STOP, START and HELP are built in on `sms()` and
 `whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
 no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
 `intercept` sees them first, with `message.keyword` `"stop"`, `"start"` or `"help"` (else `null`)
@@ -185,7 +191,11 @@ and QUIT, as some US carrier rules expect; `keywords: { stop: [...] }` sets your
 Messages the business starts are nudges: `agent.nudge({ to: { channel, address }, text })` sends
 as written; `prompt` instead lets the agent write it (or decide not to); `template` sends a
 WhatsApp template you already set up. Pass `idempotencyKey` when your system may retry, and `at`
-to send later. Outside WhatsApp's 24-hour window only templates go out (`outside_window`).
+to send later. Prefer `prompt`; use `text` only when the wording must be exact. Outside WhatsApp's
+24-hour window only templates go out: declare a `fallbackTemplate` ("You have a new message. Reply to
+see it.", no values) so a nudge is held until they reply instead of refused (`outside_window`); the
+agent may send a fitting template itself (`send_template`), and `template.missing` events say which
+messages want one. Held nudges (quiet hours, a closed window) settle as `held`, then `sent` or `expired`.
 
 When the owner's backend is a separate service, mount `nudgeHandler(agent, { token })` (from
 `chinwag`; a token of at least 32 characters, from a secret; `base` is `/nudges` by default) in the
@@ -230,6 +240,18 @@ reply button, and the agent is told what the template said. An ordinary message 
 button: up to 3 reply buttons OR one link button, never both. A template may mix quick replies and
 URL buttons.
 
+## Ask the owner when you set an agent up
+
+Before the agent sends anything people did not ask for (nudges, follow-ups), ask the owner these
+two, with these options, and build what they pick:
+
+1. **Quiet hours** (what the business starts waits for them, in each person's own time):
+   "22:00–07:00 (recommended)", "other hours", or "none" (`quietHours: false`). For US marketing,
+   say that 8am–9pm the recipient's time is, as far as we know, the legal window, and check theirs.
+2. **Where people's time zones come from**, since quiet hours apply only where it is known:
+   "our database" (sync it with `agent.setTimeZone` or `peopleHandler`), or "we don't know" (the
+   agent asks people when it needs it; until then nothing is held for quiet hours).
+
 ## The playground
 
 Every agent ships a test playground: people test it as real users before its numbers are live.
@@ -263,18 +285,11 @@ fast each message was acknowledged and a trace of every model call and tool. `ca
 custom UI shows a link in its params: `{ match: "/video/", label: "Start video call", kind: "call" }`;
 any other link is "Open in app".
 
-To demo what your backend does (an order ships, a price drops) without a page of your own, give the
-playground `actions`: each is a button in its Backend panel that runs your function on the server,
-usually one that calls your backend or `agent.nudge`. What it returns ("sent", "skipped: quiet
-hours") shows in the trace with its label; a throw shows as a failure. Actions exist only in the
-playground, behind its token, never on the agent's channels:
+The Person tab also moves the agent's clock when you give it one (`const clock = playgroundClock()`,
+`simulators({ clock })` and `createAgent({ now: clock.now })`), lists what is scheduled or held for
+the person, sets their time zone and quiet hours, and sends nudges with every field the API takes.
 
-```ts
-const play = simulators({
-  title: "My agent",
-  actions: [{ label: "Order 1042 is ready", run: async () => (await notifyOrderReady("1042")).status }],
-});
-```
+To demo what your backend does (an order ships), send the nudge it would send from the Person tab.
 
 On a deployed agent, mount it in your own server with a token of at least 32 characters, from a
 secret: `const playground = play.handler(agent, { token: process.env.PLAYGROUND_TOKEN!, base: "/playground" })`,

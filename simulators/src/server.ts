@@ -21,8 +21,7 @@
 //   POST /api/clear       ?person           forget the person: history, schedules, everything
 //   GET  /api/status                         busy / idle, background tasks
 //   GET  /api/platforms                      each platform's rules, the agent's channels and test people, link cards,
-//                                            the Backend panel's action labels
-//   POST /api/actions     {index}            runs one of `actions`; its result goes to every open page's trace
+//                                            the action labels (the Person tab's "Their account")
 //
 // The test cloud (`testCloud: true`, for Chinwag's test cloud only): generated people per run, any
 // person id, through AgentConnection.receive; the same API with `platform` for `channel`, `person`
@@ -55,6 +54,7 @@ import {
   type TestPerson,
   type TranscriptEntry,
 } from "../../src/index.ts";
+import type { Agent } from "../../src/agent.ts";
 import { requireToken, sameSecret, wrongTries } from "../../src/http.ts";
 import { PLATFORMS, channelOf, platform as platformOf, smsSegments, type Platform } from "./platforms.ts";
 
@@ -85,6 +85,31 @@ export interface PlaygroundAgent {
   status(): { busy: boolean; idleForMs: number; backgroundTasks: number; conversations: number };
   /** The WhatsApp templates the agent declared, shown as WhatsApp would show them. */
   templates?(): TemplateDefinition[];
+  /** The Person panel (Chinwag's Agent has them all): what is set and waiting for a person, nudges, the clock's due work. */
+  contact?: Agent["contact"];
+  outbox?: Agent["outbox"];
+  recordNudge?: Agent["recordNudge"];
+  setTimeZone?: Agent["setTimeZone"];
+  setQuietHours?: Agent["setQuietHours"];
+  runDue?: Agent["runDue"];
+}
+
+/**
+ * The playground's clock: the agent's `now` (createAgent({ now: clock.now })), which the Person
+ * panel moves forward to bring scheduled and held messages due. Real time plus an offset.
+ */
+export interface PlaygroundClock {
+  now(): number;
+  /** Moves the clock to `at` (ms since the epoch); never backwards. */
+  set(at: number): void;
+}
+
+export function playgroundClock(): PlaygroundClock {
+  let offset = 0;
+  return {
+    now: () => Date.now() + offset,
+    set: (at) => void (offset = Math.max(offset, at - Date.now())),
+  };
 }
 
 export interface SimulatorsOptions {
@@ -96,18 +121,8 @@ export interface SimulatorsOptions {
   cards?: LinkCard[];
   /** The pages' HTML, for a host with no file system (Cloudflare); else read from this folder. */
   pages?: { page: string; person: string };
-}
-
-/**
- * A button in the playground's Backend panel that makes your backend do something (an order ships,
- * a price drops), so a demo shows the agent reacting. Playground only: it runs on this server,
- * behind the playground's token, and never exists on the agent's channels.
- */
-export interface PlaygroundAction {
-  /** The button's label, such as "Order 1042 ships". */
-  label: string;
-  /** Runs when the button is pressed. A string it returns ("sent", "skipped: quiet hours") shows in the trace; a throw shows as a failure. */
-  run: () => Promise<string | void> | string | void;
+  /** The agent's clock (playgroundClock(), passed to createAgent as `now`): the Person panel can move it. */
+  clock?: PlaygroundClock;
 }
 
 export interface LinkCard {
@@ -219,8 +234,8 @@ interface Thread {
 }
 
 export function simulators(options: SimulatorsOptions & { testCloud: true }): TestCloudSimulators;
-export function simulators(options?: SimulatorsOptions & { testCloud?: false; /** The playground's Backend panel: one button per action. */ actions?: PlaygroundAction[] }): Playground;
-export function simulators(options: SimulatorsOptions & { testCloud?: boolean; actions?: PlaygroundAction[] } = {}): Playground | TestCloudSimulators {
+export function simulators(options?: SimulatorsOptions & { testCloud?: false }): Playground;
+export function simulators(options: SimulatorsOptions & { testCloud?: boolean } = {}): Playground | TestCloudSimulators {
   const cloud = options.testCloud === true;
   const playPage = options.pages?.page ?? readFileSync(new URL("./page.html", import.meta.url), "utf8");
   const personPage = options.pages?.person ?? readFileSync(new URL("./person.html", import.meta.url), "utf8");
@@ -617,27 +632,31 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
     if (req.method === "GET" && path === "/api/status") return json(res, 200, agent.status());
     if (req.method === "GET" && path === "/api/platforms") {
       const channels = agent.channels().map((c) => ({ name: c.name, kind: c.kind, platform: platformFor(c) }));
-      return json(res, 200, { platforms: PLATFORMS, channels, people: agent.testPeople(), cards: options.cards ?? [], actions: (options.actions ?? []).map((a) => a.label) });
+      return json(res, 200, {
+        platforms: PLATFORMS, channels, people: agent.testPeople(), cards: options.cards ?? [],
+        templates: (agent.templates?.() ?? []).map((t) => ({ name: t.name, body: t.body })),
+        panel: { person: !!(agent.contact && agent.outbox), nudge: !!agent.recordNudge, clock: !!(options.clock && agent.runDue) },
+      });
     }
 
     const body = req.method === "POST" ? await readBody(req, path === "/api/messages" ? MAX_MESSAGE_BODY : MAX_BODY) : null;
+    /** What the Person panel did (moved the clock, sent a nudge), in every open page's trace. */
+    const announce = (label: string, outcome: { ok: true; result?: string } | { ok: false; error: string }) => {
+      const event = { type: "action", label, at: Date.now(), ...outcome };
+      for (const key of new Set([...clients.keys(), ...recent.keys()])) push(key, event);
+    };
 
-    if (req.method === "POST" && path === "/api/actions") {
-      const action = typeof body?.index === "number" ? options.actions?.[body.index] : undefined;
-      if (!action) return json(res, 400, { error: "index must be one of the playground's actions" });
-      console.info(JSON.stringify({ chinwag: "playground.action", label: action.label, at: new Date().toISOString(), ip: req.socket.remoteAddress ?? null }));
-      let outcome: { ok: true; result?: string } | { ok: false; error: string };
-      try {
-        const result = await action.run();
-        outcome = { ok: true, ...(typeof result === "string" ? { result } : {}) };
-      } catch (error) {
-        outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
-      }
-      // A backend event belongs to no one conversation: every open page shows it, streamed or polled.
-      const event = { type: "action", label: action.label, at: Date.now(), ...outcome };
-      for (const k of new Set([...clients.keys(), ...recent.keys()])) push(k, event);
-      return json(res, 200, outcome);
+    if (req.method === "POST" && path === "/api/clock") {
+      if (!options.clock || !agent.runDue) return json(res, 400, { error: "give simulators({ clock }) the agent's clock (playgroundClock())" });
+      const to = typeof body?.to === "number" ? body.to : typeof body?.advanceMs === "number" ? options.clock.now() + body.advanceMs : NaN;
+      if (!Number.isFinite(to)) return json(res, 400, { error: "give to (ms since the epoch) or advanceMs" });
+      options.clock.set(to);
+      const ran = await agent.runDue();
+      const result = `clock at ${new Date(options.clock.now()).toISOString().replace(".000Z", "Z")}; ${ran} scheduled message${ran === 1 ? "" : "s"} due`;
+      announce("Clock", { ok: true, result });
+      return json(res, 200, { now: options.clock.now(), ran });
     }
+
     const asked = (name: string) => (typeof body?.[name] === "string" ? (body[name] as string) : (url.searchParams.get(name) ?? ""));
     const person = agent.testPeople().find((p) => digits(p.phone) === digits(asked("person")) && digits(p.phone) !== "");
     if (!person) return json(res, 403, { error: "only this agent's test people can be played: declare them in createAgent({ testPeople })" });
@@ -660,6 +679,53 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
     if (!channel) return json(res, 400, { error: "channel must be one of the agent's own channels" });
     const k = threadKey(channel.name, person);
     const p = platformFor(channel);
+
+    // The Person panel: what is set and waiting for this person, and the business's side (nudges).
+    const to = { channel: channel.name, address: channel.kind === "custom" ? `test:${person.phone}` : person.phone };
+    if (req.method === "GET" && path === "/api/person") {
+      if (!agent.contact || !agent.outbox) return json(res, 404, { error: "this agent has no contact record" });
+      const id = await agent.testConversation(person.phone);
+      // One person on every channel: their record from whichever channel they have written on.
+      let contact = await agent.contact(to);
+      for (const c of agent.channels()) contact ??= await agent.contact({ channel: c.name, address: c.kind === "custom" ? `test:${person.phone}` : person.phone });
+      // When the agent wrote on each channel (its latest 20), so the page can flag a channel it is not showing.
+      const lastOut: Record<string, number[]> = {};
+      for (const e of id ? await agent.transcript(id) : []) if (e.kind === "out") lastOut[e.channel] = [...(lastOut[e.channel] ?? []), e.at].slice(-20);
+      return json(res, 200, { now: options.clock?.now() ?? Date.now(), contact, outbox: id ? await agent.outbox(id) : { schedules: [], held: [] }, lastOut });
+    }
+    if (req.method === "POST" && path === "/api/nudge") {
+      if (!agent.recordNudge) return json(res, 404, { error: "this agent takes no nudges" });
+      const kind = body?.kind;
+      const input = {
+        to,
+        ...(kind === "text" ? { text: String(body?.text ?? "") } : kind === "template" ? { template: { name: String(body?.template ?? ""), ...(Array.isArray(body?.body) && body.body.length ? { body: body.body.map(String) } : {}) } } : { prompt: String(body?.prompt ?? "") }),
+        ...(typeof body?.at === "number" ? { at: body.at } : {}),
+        ...(body?.respect_quiet_hours === false ? { respectQuietHours: false } : {}),
+        ...(typeof body?.expires_at === "number" ? { expiresAt: body.expires_at } : {}),
+        ...(typeof body?.idempotency_key === "string" && body.idempotency_key ? { idempotencyKey: body.idempotency_key } : {}),
+      };
+      try {
+        const state = await agent.recordNudge(input);
+        announce(`Nudge (${kind ?? "prompt"}) to ${person.name}`, { ok: true, result: `${state.status}${state.reason ? `: ${state.reason}` : ""}${state.id ? ` (${state.id})` : ""}` });
+        return json(res, 202, state);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        announce(`Nudge to ${person.name}`, { ok: false, error: message });
+        return json(res, 400, { error: message });
+      }
+    }
+    if (req.method === "POST" && (path === "/api/time-zone" || path === "/api/quiet-hours")) {
+      if (!agent.setTimeZone || !agent.setQuietHours) return json(res, 404, { error: "this agent has no contact record" });
+      try {
+        const result = path === "/api/time-zone"
+          ? await agent.setTimeZone({ to, timeZone: String(body?.time_zone ?? "") })
+          : await agent.setQuietHours({ to, quietHours: (body?.quiet_hours ?? null) as never });
+        announce(path === "/api/time-zone" ? `Time zone for ${person.name}` : `Quiet hours for ${person.name}`, { ok: true, result: result.status === "set" ? "set" : "they have not written on this channel yet" });
+        return json(res, result.status === "set" ? 200 : 404, result);
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
 
     if (req.method === "GET" && path === "/api/transcript") {
       const t = await load(agent, person, channel);

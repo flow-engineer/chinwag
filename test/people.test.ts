@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
 import { sqlite, Store, tool } from "../src/index.ts";
+import { STAND_IN } from "../src/tools.ts";
 import { SMS, WEB_APP, WHATSAPP, call, last, multi, respond, users } from "./helpers.ts";
 
 const PHONES = { sms: { info: SMS, phone: true }, whatsapp: { info: WHATSAPP, phone: true } };
@@ -166,3 +167,40 @@ test("with messages waiting on two channels, tool calls wait until both have hea
   assert.equal(ran, 1);
   assert.ok(h.events.some((e) => e.type === "ack.required"));
 });
+
+test("with a profile the agent gets get_user_profile, about the person it is talking to; a tool of the owner's with that name is used instead", async () => {
+  const asked: unknown[] = [];
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, resolve: () => "customer-7", profile: (who) => (asked.push(who), { plan: "monthly" }) });
+  await h.message("sms", "+15550100100", "what plan am I on?");
+  const first = await h.nextCall(0);
+  const spec = first.request.tools.find((t) => t.name === "get_user_profile");
+  assert.deepEqual(spec?.parameters.properties, {}, "it takes no input: whose profile is never the model's choice");
+  first.answer(respond(call("send_sms", { text: "Let me check." }), call("get_user_profile")));
+  const second = await h.nextCall(1);
+  assert.match(last(second.request.messages).content, /"plan":"monthly"/);
+  assert.deepEqual(asked.map((w) => ({ ...(w as object), conversationId: "any" })), [{ conversationId: "any", person: "key:customer-7", channel: "sms" }]);
+  second.answer(respond(call("send_sms", { text: "Monthly." })));
+
+  const none = multi({ channels: { sms: { info: SMS, phone: true } } });
+  await none.message("sms", "+15550100100", "hi");
+  assert.ok(!(await none.nextCall(0)).request.tools.some((t) => t.name === "get_user_profile"), "no profile, no tool");
+
+  const own = tool({ name: "get_user_profile", description: "mine", input: z.object({}), run: () => "own" });
+  const overridden = multi({ channels: { sms: { info: SMS, phone: true } }, tools: [own], profile: () => assert.fail("the owner's tool wins") });
+  await overridden.message("sms", "+15550100100", "hi");
+  assert.deepEqual((await overridden.nextCall(0)).request.tools.filter((t) => t.name === "get_user_profile").map((t) => t.description), ["mine"]);
+});
+
+test("the test cloud's stand-in for get_user_profile replaces the real one, and is dropped for an agent without a profile", async () => {
+  const standIn = Object.assign(tool({ name: "get_user_profile", description: "played", input: z.object({}), run: () => "played" }), { [STAND_IN]: true });
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, tools: [standIn], profile: () => assert.fail("a test never reads a real profile") });
+  await h.message("sms", "+15550100100", "hi");
+  assert.deepEqual((await h.nextCall(0)).request.tools.filter((t) => t.name === "get_user_profile").map((t) => t.description), ["played"]);
+  assert.equal(h.agent.hasProfile(), true);
+
+  const plain = multi({ channels: { sms: { info: SMS, phone: true } }, tools: [standIn] });
+  await plain.message("sms", "+15550100100", "hi");
+  assert.ok(!(await plain.nextCall(0)).request.tools.some((t) => t.name === "get_user_profile"));
+  assert.equal(plain.agent.hasProfile(), false);
+});
+
