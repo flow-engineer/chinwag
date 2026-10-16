@@ -32,8 +32,9 @@ export interface Channel {
 }
 
 /**
- * Keywords a person texts on their own (the whole message, any case, punctuation and spaces
- * ignored), answered with no model call. `stop` records a hard no-contact rule: nothing the
+ * Keywords a person texts on their own (the whole message, in any case, with only spaces,
+ * punctuation or emoji around it: "Stop." is one, "stop by tomorrow" is not), answered with no
+ * model call. `stop` records a hard no-contact rule: nothing the
  * business starts (nudges, scheduled messages, their own reminders) goes to them on any channel
  * until they text a `start` word. `help` sends `replies.help`; without one the agent answers it.
  * A reply left out sends nothing (the provider may send its own).
@@ -55,12 +56,13 @@ export const SMS_KEYWORDS: Keywords = {
 /** WhatsApp has no carrier keywords; a business honours a plain STOP all the same. */
 export const WHATSAPP_KEYWORDS: Keywords = { stop: ["STOP", "UNSUBSCRIBE"], start: ["START"], help: [] };
 
-/** Which keyword a message is, if it is one. */
+/** Which keyword a message is, if it is one: the whole message, with only spaces, punctuation or emoji around it. */
 export function keywordOf(keywords: Keywords | undefined, text: string): "stop" | "start" | "help" | null {
   if (!keywords) return null;
-  const word = text.toUpperCase().replace(/[^A-Z]/g, "");
-  if (!word || word.length > 12) return null;
-  for (const kind of ["stop", "start", "help"] as const) if (keywords[kind].some((k) => k.toUpperCase().replace(/[^A-Z]/g, "") === word)) return kind;
+  const bare = (s: string) => s.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/\s+/g, " ").toUpperCase();
+  const word = bare(text);
+  if (!word) return null;
+  for (const kind of ["stop", "start", "help"] as const) if (keywords[kind].some((k) => bare(k) === word)) return kind;
   return null;
 }
 

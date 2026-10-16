@@ -1,6 +1,7 @@
 // covers: src/conversation.ts src/talk.ts src/channels.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { SMS_KEYWORDS, keywordOf } from "../src/channels.ts";
 import { SMS, WHATSAPP, call, harness, respond, say, users } from "./helpers.ts";
 
 test("a channel without reactions or status offers only its send tool", async () => {
@@ -36,4 +37,13 @@ test("WhatsApp: read receipts when the agent picks a message up, quotes and taps
   first.answer(respond(call("send_chat", { text: "Booked!", reply_to: "m1" })));
   await h.agent.conversation("w3")!.whenIdle();
   assert.deepEqual(h.out.find((o) => o.type === "message"), { type: "message", text: "Booked!", replyTo: "m1" });
+});
+
+test("a keyword is the whole message, in any case, with only spaces, punctuation or emoji around it", () => {
+  for (const [text, kind] of [["STOP", "stop"], [" stop. ", "stop"], ["Stop!! 🙏", "stop"], ["unsubscribe", "stop"], ["Start", "start"], ["help?", "help"]] as const) {
+    assert.equal(keywordOf(SMS_KEYWORDS, text), kind, text);
+  }
+  for (const text of ["stop by tomorrow", "please stop", "stop 2", "st op", "STOPPED", "don't stop", "end of the day", "cancel my order", "🛑", ""]) {
+    assert.equal(keywordOf(SMS_KEYWORDS, text), null, text);
+  }
 });
