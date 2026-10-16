@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { z, type Tool } from "../src/index.ts";
-import { CLOUD_MODEL_BUDGET_MS, postBudgetMs, runInCloud, SessionStopped, TimeoutError, toolTimeoutMs } from "../testing/src/client.ts";
+import { CLOUD_MODEL_BUDGET_MS, postBudgetMs, RETRY_BUDGET_MS, runInCloud, SessionStopped, TimeoutError, toolTimeoutMs } from "../testing/src/client.ts";
 import type { Command } from "../testing/src/protocol.ts";
 import { rollFault, startFaultProxy } from "./fault-proxy.ts";
 
@@ -82,6 +82,7 @@ test("a thrown receive, a bad frame and an unreadable attachment leave the sessi
 test("a tool call waits out the simulator's latency, then the POST budget, and a timeout is a timeout", { timeout: 10_000 }, async () => {
   const slow = "tool: lookup\nresponses:\n  - { when: slow, latency_ms: 11000 }\n  - { when: ok, latency_ms: 400 }\n";
   assert.equal(CLOUD_MODEL_BUDGET_MS, 210_000);
+  assert.equal(RETRY_BUDGET_MS, 30_000);
   assert.equal(toolTimeoutMs([{ path: "tools/lookup.yaml", hash: "h", content: slow }], "lookup"), 11_000 + CLOUD_MODEL_BUDGET_MS);
   assert.equal(toolTimeoutMs([], "lookup"), 60_000 + CLOUD_MODEL_BUDGET_MS);
   assert.equal(postBudgetMs(30_000, 5_000_000), 80_000);
@@ -440,4 +441,140 @@ test("finished posts do not keep their abort listeners", { timeout: 10_000 }, as
     proto.removeEventListener = remove;
     cloud.close();
   }
+});
+
+test("a cloud that stores keys retries a 503 on events, receipts and outbound, and a reset after forward once", { timeout: 10_000 }, async () => {
+  const applied: string[] = [];
+  const seen = new Set<string>();
+  let stream: ServerResponse | undefined;
+  const upstream = await listen(({ url }, res) => {
+    const key = res.req.headers["idempotency-key"];
+    const idem = typeof key === "string" ? key : "";
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "http://dash/s", idempotency: true }));
+    if (url.endsWith("/stream")) {
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(message("m1")));
+      res.write(frame(message("m2")));
+      setTimeout(() => {
+        res.write(frame(run("r1")));
+        res.write(frame(run("r2")));
+        res.write(frame({ type: "drain" }));
+      }, 1500);
+      return;
+    }
+    if (url.endsWith("/drained")) {
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      const kept = (id: string) => { const command = run(id); if (command.type !== "run") throw new Error("run"); return command.run; };
+      stream?.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [kept("r1"), kept("r2")], dashboard: "http://dash/s" } }));
+      return;
+    }
+    if (!seen.has(idem)) {
+      seen.add(idem);
+      applied.push(idem);
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  const counts = new Map<string, number>();
+  const proxy = await startFaultProxy(upstream.url, {
+    seed: 1,
+    fault: ({ kind, path }) => {
+      if (kind === "stream") return "ok";
+      if (!path.endsWith("/events") && !path.endsWith("/receipts") && !path.endsWith("/outbound")) return "ok";
+      const n = counts.get(path) ?? 0;
+      counts.set(path, n + 1);
+      if (n === 0) return "html503";
+      if (path.endsWith("/outbound") && n === 1) return "resetAfter";
+      return "ok";
+    },
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: proxy.url, name: "test", tools: [], files: [], log: () => {}, retryBudgetMs: 5_000,
+      build: ({ events }) => ({
+        channels: () => [], reacted: () => {},
+        receive: (_id, _incoming, deliver, options) => {
+          events[0]?.({ type: "turn.end", conversationId: "c", at: 1, data: { messageId: options?.messageId } });
+          void deliver({ type: "message", text: `reply ${options?.messageId}` });
+          return "m";
+        },
+      }),
+    });
+    assert.deepEqual(summary.runs.map((item) => item.runId), ["r1", "r2"]);
+    const opened = proxy.posts.find((post) => post.path === "/api/sessions");
+    assert.equal(JSON.parse(opened?.body ?? "{}").retries, true);
+    const outboundKeys = applied.filter((key) => key.startsWith("outbound:")).sort();
+    assert.deepEqual(outboundKeys, ["outbound:c:m1:0", "outbound:c:m2:0"]);
+    assert.ok(applied.some((key) => key.startsWith("events:")));
+    assert.ok(applied.some((key) => key.startsWith("receipt:")));
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test("with keys, an outbound timeout longer than the retry budget is sent again with its key; a JSON refusal is not", { timeout: 10_000 }, async () => {
+  const keys: unknown[] = [];
+  let refused = 0;
+  let stream: ServerResponse | undefined;
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d", idempotency: true }));
+    if (url.endsWith("/stream")) {
+      stream = res;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(message("m1")));
+      res.write(frame({ type: "drain" }));
+      return;
+    }
+    if (url.endsWith("/outbound")) {
+      keys.push(res.req.headers["idempotency-key"]);
+      if (keys.length === 1) return;
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      return;
+    }
+    if (url.endsWith("/drained")) {
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+      stream?.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [], dashboard: "d" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    const summary = await runInCloud({
+      // The first try sits its whole 400ms, longer than the 300ms budget; the budget starts at that failure.
+      cloud: cloud.url, name: "test", tools: [], files: [], log: () => {}, postTimeoutMs: 400, retryBudgetMs: 300,
+      build: () => ({
+        channels: () => [], reacted: () => {},
+        receive: (_id, _incoming, deliver) => { void deliver({ type: "message", text: "again" }); return "m"; },
+      }),
+    });
+    assert.equal(summary.sessionId, "s");
+    assert.deepEqual(keys, ["outbound:c:m1:0", "outbound:c:m1:0"]);
+  } finally { cloud.close(); }
+
+  const refusing = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d", idempotency: true }));
+    if (url.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(message("m1")));
+      return;
+    }
+    if (url.endsWith("/outbound")) {
+      refused++;
+      res.writeHead(400, { "content-type": "application/json" }).end('{"error":"invalid_request"}');
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    await assert.rejects(runInCloud({
+      cloud: refusing.url, name: "test", tools: [], files: [], log: () => {},
+      build: () => ({
+        channels: () => [], reacted: () => {},
+        receive: (_id, _incoming, deliver) => { void deliver({ type: "message", text: "no" }); return "m"; },
+      }),
+    }), (error: unknown) => {
+      assert.ok(!(error instanceof SessionStopped));
+      assert.match((error as Error).message, /invalid_request/);
+      return true;
+    });
+    assert.equal(refused, 1);
+  } finally { refusing.close(); }
 });
