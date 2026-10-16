@@ -145,6 +145,9 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   each verified: your `resolve` key, else the same phone number on channels marked `phone`. Never
   join people any other way. When the SMS provider gives national numbers, set
   `defaultCountryCode` ("+91") so they match the full number WhatsApp gives.
+- Tools key a person's data by `context.person`, their stable id: `key:<resolve's value>`, else
+  `phone:<E.164>`, else `<channel>:<address>`. `context.key` is `resolve`'s value as returned, or
+  null without one: look them up in the backend by that, never by `context.person`.
 - With several channels the agent gets a send tool per channel (`send_sms`, `send_web`) and
   answers each message where it came. Don't add your own.
 - After a restart, `resume()` carries on: cut-off turns run again, background tools that were
