@@ -26,10 +26,17 @@ function frontmatter(text: string): { fields: Record<string, string>; body: stri
 /** An agent's folder as text: AGENTS.md and skills/<name>/SKILL.md, by their paths in it. */
 export type AgentFiles = Record<string, string>;
 
+/** Throws, naming the path, when the folder or its AGENTS.md can't be read: the agent would otherwise run with no prompt. */
 export function readAgentFolder(dir: string): AgentFiles {
   const files: AgentFiles = {};
   const agents = join(dir, "AGENTS.md");
-  if (existsSync(agents)) files["AGENTS.md"] = readFileSync(agents, "utf8");
+  const where = existsSync(dir) ? `${dir} has no AGENTS.md` : `${dir} does not exist`;
+  try {
+    files["AGENTS.md"] = readFileSync(agents, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new Error(`chinwag: can't read the agent's prompt: ${code === "ENOENT" ? where : `${agents}: ${code ?? (error as Error).message}`}. Check createAgent's dir; on a host with no file system (a bundle, an edge runtime), pass files instead.`, { cause: error });
+  }
   const root = join(dir, "skills");
   if (!existsSync(root)) return files;
   for (const entry of readdirSync(root, { withFileTypes: true })) {

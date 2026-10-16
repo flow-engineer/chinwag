@@ -393,7 +393,7 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 
 | Option | What it does |
 |---|---|
-| `dir` | The folder with `AGENTS.md` and `skills/` |
+| `dir` | The folder with `AGENTS.md` and `skills/`; an `AGENTS.md` that can't be read throws, naming the path |
 | `files` | `AGENTS.md` and skills as text, instead of `dir`, where there is no folder to read |
 | `model` | Any `Model`; `openAICompatible({ model })` for most |
 | `tools` | Your tools |
