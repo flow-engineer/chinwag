@@ -107,7 +107,7 @@ export function newStandalone(name: string, options: { into?: string; root?: str
   };
   writeFileSync(join(dir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`);
   writeFileSync(join(dir, "tsconfig.json"), `${JSON.stringify(TSCONFIG, null, 2)}\n`);
-  writeFileSync(join(dir, ".gitignore"), "node_modules/\n.env\n");
+  writeFileSync(join(dir, ".gitignore"), "node_modules/\n.env\n.chinwag/\n");
   // npm install then refuses a Node older than the engines field says, before .ts files fail to load.
   writeFileSync(join(dir, ".npmrc"), "engine-strict=true\n");
   writeFileSync(join(dir, ".env.example"), ENV_EXAMPLE);
