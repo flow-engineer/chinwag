@@ -93,6 +93,24 @@ connects out to the cloud, which plays the person and the tools and judges.
    Then it prints PASS or FAIL per run with every failed check and the judge's reason, and a link
    to watch each conversation in the simulator. The cloud's dashboard, at its own address, shows
    every session over time and each scenario's history.
+4. Each session that opened leaves `.chinwag/last-session.json` in the agent's folder (its path is
+   the last line printed, on every exit): `sessionId`, `dashboard`, `suiteHash`, `endedAt`, `ended`
+   (`finished`, `stopped` or `interrupted`), `only` (the scenarios it was limited to, else `null`) and
+   per run `scenario` (file name without `.yaml`), `channel`, `run`, `verdict` (`passed`, `failed`,
+   `errored`: the cloud could not play or judge it, or `not_played`: the session ended first) and
+   `failedChecks` (`kind` and `text`). Read it instead of parsing the printed report; the judge's
+   reasons are in the printed report and the dashboard, not in the file.
+5. `--only a,b` runs only those scenarios (file names without `.yaml`). `--failed` runs only the ones
+   that did not pass in the last session, on every channel each plays; it goes with `--runs`, never
+   with `--only`. It prints `Nothing failed in the last session (<id>).` and exits 0 when there is
+   nothing to run again, and exits 1 when there is no last session.
+
+Work in this loop, and never finish on a partial run:
+
+1. `npx chinwag test --synthetic`: the whole suite.
+2. Fix what failed (the agent, or a test that asks for the wrong thing; say which).
+3. `npx chinwag test --synthetic --failed`, again until every run in it passes (exit 0).
+4. `npx chinwag test --synthetic`: the whole suite once more, since a fix can break another scenario.
 
 ### Get a test cloud
 

@@ -235,6 +235,31 @@ Your agent stays on your machine with its own model and key; the test cloud ([ge
 
 The command exits 0 when every run passed, and 1 when the session finished and a run failed. A refusal from the cloud (a bad CI key, an invalid suite, the spend cap) or a failure before the session opens exits 1 and prints only that message. If the tunnel, the stream, or the connection fails after the session has opened, it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report, says the cloud keeps playing until it is stopped from the dashboard, and exits 130.
 
+`--only latte-correction,order-fails` runs only those scenarios (file names without `.yaml`); every tool file still goes. Once the session has opened, every exit (0, 1, 2 or 130) writes `.chinwag/last-session.json` in the agent's folder and prints its path; `chinwag new` git-ignores `.chinwag/`. It holds what each run ended as, never what was said:
+
+```json
+{
+  "sessionId": "…", "dashboard": "https://…", "suiteHash": "…", "endedAt": "2026-10-16T09:12:03.000Z",
+  "ended": "finished",
+  "only": null,
+  "runs": [
+    { "scenario": "latte-correction", "channel": "whatsapp", "run": 1, "verdict": "failed",
+      "failedChecks": [{ "kind": "judge", "text": "The agent asks Sam to confirm before placing the order." }] }
+  ]
+}
+```
+
+`ended` is `finished`, `stopped` (the session broke off or the cloud stopped it) or `interrupted`. `only` is the scenarios the session was limited to, `null` for the whole suite. `verdict` is `passed`, `failed`, `errored` (the cloud could not play or judge the run) or `not_played` (the session ended first).
+
+`--failed` runs again only the scenarios that did not pass in that file (failed, errored or not played), on every channel each plays: a scenario's channels are part of its file, so one channel cannot be picked alone. It goes with `--runs`; with `--only` it stops and says to pick one, since the two would each pick the scenarios. With nothing to run again it prints `Nothing failed in the last session (<id>).` and exits 0 (and says when that session ran only some scenarios); with no file it says to run `chinwag test` first and exits 1. The loop, for you or a coding agent:
+
+```bash
+npx chinwag test --synthetic            # the whole suite
+# fix what failed
+npx chinwag test --synthetic --failed   # only what did not pass; again until it exits 0
+npx chinwag test --synthetic            # the whole suite once more before you finish
+```
+
 ### Get a test cloud
 
 1. Sign in at https://flow.engineer/observe (Google, GitHub or an email link).
