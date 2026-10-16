@@ -274,6 +274,20 @@ Each reply is checked against what the run's platform can show, as a Chinwag age
 
 Your agent's own tools run on its side, for real, so `tests/tools/*.yaml` are not used, and outcome checks (which read simulated tool calls) see none: write what must be true as `judge` items. The agent's model cost shows as $0, since Chinwag does not see its model calls. Not yet supported: agents that answer later through a callback instead of in the response, and the person's reactions to the agent's messages.
 
+### Any language
+
+The endpoint's contract is written down in [`spec/`](spec/): [`agent-endpoint.openapi.yaml`](spec/agent-endpoint.openapi.yaml) (OpenAPI 3.1: the request, the answer, statuses, timeouts, the token, and what each platform shows) with JSON Schemas for the [request](spec/request.schema.json) and the [answer](spec/response.schema.json). A coding agent can implement it in any language from those files alone.
+
+Check an endpoint against the contract before a test run, with no cloud, no key and no model call on Chinwag's side:
+
+```bash
+npx chinwag check-endpoint http://localhost:3000/chinwag [--token-env NAME] [--json]
+```
+
+It sends a fixed set of synthetic messages (a typed message, a double text, a photo, a tapped button quoting the agent, a message that may need no answer) and checks each answer: status 200, `{ "replies": [...] }`, every reply against the schema and what WhatsApp can show, and every id a reply names (`replyTo`, a reaction's `messageId`) one of the person's messages. One line per case; exit 0 when all pass, else 1. The token is the value of `NAME` (default `CHINWAG_AGENT_TOKEN`).
+
+The café's agent as an HTTP endpoint, with its two tools and one model through any OpenAI-compatible API (the same key variables as `openAICompatible`, `MODEL` for the model; `FAKE_MODEL=1` for a fixed reply and no model call): [`examples/http-agent-python`](examples/http-agent-python) (standard library only) and [`examples/http-agent-go`](examples/http-agent-go) (standard library only).
+
 ## Models
 
 Any OpenAI-compatible API. `openAICompatible` defaults to OpenRouter and reads `OPENROUTER_API_KEY`; pass `baseURL` and `apiKey` for OpenAI, Gemini, Anthropic or a local server.

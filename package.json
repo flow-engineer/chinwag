@@ -36,6 +36,7 @@
     "examples/cafe/src",
     "examples/cafe/tests",
     "coding-agents",
+    "spec",
     "README.md",
     "LICENSE"
   ],

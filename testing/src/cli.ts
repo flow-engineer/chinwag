@@ -10,6 +10,7 @@
 // The agent's src/agent.ts exports buildAgent({ model, events, tools }) and its tools; its tests are
 // in tests/scenarios and tests/tools. An agent built on anything else is tested through its HTTP
 // endpoint instead, with --agent-url (testing/src/http-agent.ts): its own tools run for real.
+// `chinwag check-endpoint <url>` checks such an endpoint against spec/ first (testing/src/check-endpoint.ts).
 
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -17,6 +18,7 @@ import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { cloudHeaders, runInCloud, SessionStopped, type ConnectOptions } from "./client.ts";
 import { runPrinter } from "./print-run.ts";
+import { checkEndpointCli } from "./check-endpoint.ts";
 import { httpAgent } from "./http-agent.ts";
 import { newStandalone } from "./new.ts";
 import { loadSuite, parseScenario } from "./suite.ts";
@@ -27,6 +29,9 @@ const USAGE = `Usage:
   chinwag test [options]    Run the agent's tests in a test cloud, from the agent's folder
                             (src/agent.ts exports buildAgent({ model, events, tools }) and tools;
                             the tests are in tests/scenarios and tests/tools)
+  chinwag check-endpoint <url> [--token-env NAME] [--json]
+                            Check an agent's HTTP endpoint against the contract, for --agent-url
+                            (chinwag check-endpoint --help)
 
 Options for test:
   --cloud <url>            The test cloud (default: CHINWAG_CLOUD, else http://127.0.0.1:8900)
@@ -62,6 +67,8 @@ Environment (also read from the agent folder's .env; variables already set win):
 // The agent folder's .env (its model key, CHINWAG_CLOUD_KEY), when there is one; variables already
 // set win over the file, and no value is ever printed.
 if (process.argv[2] !== "new" && existsSync(".env")) process.loadEnvFile(".env");
+
+if (process.argv[2] === "check-endpoint") process.exit(await checkEndpointCli(process.argv.slice(3)));
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,

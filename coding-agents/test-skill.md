@@ -114,3 +114,24 @@ GitHub's branch) are kept with the session. A CI step (GitHub Actions shown):
 
 Only the files in your `tests/` folder run; the cloud keeps each file by its hash and compares
 runs only while the tests are the same. Every run calls real models, so it costs a little.
+
+## An agent on another framework, in any language
+
+An agent not built on Chinwag is tested through an HTTP endpoint: `npx chinwag test --agent-url <url>`.
+To implement one:
+
+1. Read the contract, `spec/agent-endpoint.openapi.yaml` (in the chinwag package or the repository),
+   with `spec/request.schema.json` and `spec/response.schema.json`. Implement exactly that: one
+   POST per message of the person's, answered in the same response with status 200 and
+   `{ "replies": [...] }` (`[]` for no reply, never 204). Keep history by `conversationId`, ignore
+   request fields you do not know, and check `authorization: Bearer` when `CHINWAG_AGENT_TOKEN` is set.
+2. Only send what the run's platform shows (`x-chinwag-platforms` in the spec): no buttons on SMS,
+   text within `maxLength`. Name the person's messages by the `messageId` they came with.
+3. Start the endpoint and run `npx chinwag check-endpoint <url>` (`--token-env NAME` when it needs
+   a token). Fix every FAIL line; it must end "5 of 5 cases passed". Give the agent a mode with no
+   model call (the examples' `FAKE_MODEL=1`) so the check costs nothing.
+4. Then write scenarios as above, with one difference: the agent's own tools run for real, so there
+   are no `tests/tools/*.yaml`, no `world` for tools and no `outcome` checks; write what must be true
+   as `judge` items. Run `npx chinwag test --agent-url <url>`.
+
+`examples/http-agent-python` and `examples/http-agent-go` are the café's agent done this way.

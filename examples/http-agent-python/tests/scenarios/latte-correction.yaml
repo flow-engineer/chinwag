@@ -1,0 +1,27 @@
+# The café's scenario (examples/cafe/tests/scenarios/latte-correction.yaml) for an agent tested by
+# its HTTP endpoint: its tools run for real, so there is no world for simulated tools, and what the
+# outcome check said is a judge item.
+id: latte-correction
+title: Orders a latte, corrects the milk mid-thought, confirms
+channels: [whatsapp]
+
+person:
+  persona: Sam, in a hurry on the way to work; types in short bursts, no capitals.
+  goal: Get a large oat latte for pickup, under the name Sam.
+  knows:
+    - Their name is Sam.
+
+opening:
+  - say: "can i get a large latte"
+  - say: "oat milk actually"
+    after_ms: 1200
+
+max_turns: 8
+
+expect:
+  judge:
+    - Sam is told an order was placed for one large latte with oat milk, under the name Sam.
+    - The order read back to Sam uses oat milk, not whole milk.
+    - The agent asks Sam to confirm before placing the order.
+    - Sam is told the order number and when it will be ready.
+    - Prices match the menu.
