@@ -205,10 +205,16 @@ test("STOP on SMS stops everything the business starts, with no model call, unti
   assert.equal(await h.agent.runDue(), 0, "the scheduled one is skipped");
   assert.equal(h.calls.length, 1, "no model call for any of it");
 
-  // They write again: the agent answers, knows about the STOP, and cannot lift it itself.
+  // They write again: the agent answers, knows about the STOP and what they were sent, and cannot lift it itself.
   await h.message("sms", SAM.address, "what time do you open?");
   const asked = await h.nextCall(1);
-  assert.ok(asked.request.messages.some((m) => m.role === "user" && /They texted "Stop\." on sms/.test(m.content)));
+  const stopped = asked.request.messages.findIndex((m) => m.role === "user" && m.content.startsWith("[m2] Stop.\n"));
+  assert.match(asked.request.messages[stopped].content as string, /They texted "Stop\." on sms/);
+  assert.deepEqual(asked.request.messages.slice(stopped + 1, stopped + 4).map((m) => m.role === "assistant" ? m.toolCalls![0].arguments : m.content.split("\n")[0]), [
+    '{"text":"You\'re unsubscribed. Reply START to resume."}',
+    '{"delivered":true,"channel":"sms"}',
+    "[m3] help",
+  ]);
   const stopRule = /\[(nc_stop_\w+)\]/.exec(asked.request.system)![1];
   asked.answer(respond(call("send_sms", { text: "We open at 9." }), call("remove_no_contact", { id: stopRule })));
   const removed = await h.nextCall(2);
@@ -221,6 +227,9 @@ test("STOP on SMS stops everything the business starts, with no model call, unti
   await h.conversation.whenIdle();
   assert.equal((await h.agent.nudge({ to: h.to, text: "Your order is ready." })).status, "sent");
   assert.equal(h.calls.length, 3);
+  const shown = (await h.agent.transcript(h.conversation.id)).flatMap((l) => (l.kind === "in" || l.kind === "out") && /stop|help|start|unsubscribed|opt out/i.test(l.text) ? [[l.kind, l.text]] : []);
+  assert.deepEqual(shown, [["in", "Stop."], ["out", "You're unsubscribed. Reply START to resume."], ["in", "help"], ["out", "Reply STOP to opt out."], ["in", "START"]], "START had no reply to send");
+  assert.deepEqual(h.events.filter((e) => e.answered && e.type === "message.out").map((e) => e.text), ["You're unsubscribed. Reply START to resume.", "Reply STOP to opt out."]);
 });
 
 test("intercept sees STOP, START and HELP first, marked as keywords; its own reply goes instead of Chinwag's, and the STOP holds", async () => {
@@ -243,6 +252,77 @@ test("intercept sees STOP, START and HELP first, marked as keywords; its own rep
   assert.equal(h.calls.length, 0);
 });
 
+/** Answers chest pain by rule, and says nothing to "ok". */
+const emergency: Parameters<typeof multi>[0]["intercept"] = (_id, text) => (/chest pain/i.test(text) ? "Call 911 now." : text === "ok" ? "" : null);
+
+test("a message intercept answers is kept with its reply: the next turn reads both, the transcript shows them, and both are events", async () => {
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, intercept: emergency });
+  assert.equal(await h.message("sms", SAM.address, "I have chest pain"), null);
+  assert.deepEqual(h.texts("sms"), ["Call 911 now."]);
+  assert.equal(h.calls.length, 0, "no model call for it");
+  const a = await h.message("sms", SAM.address, "it's better now");
+  const next = await h.nextCall(0);
+  assert.deepEqual(
+    next.request.messages.map((m) => [m.role, m.role === "assistant" ? m.toolCalls!.map((c) => [c.name, c.arguments]) : m.content]),
+    [
+      ["user", "[m1] I have chest pain\n[Chinwag] The business's own rules answered this for you on sms, as written:"],
+      ["assistant", [["send_sms", '{"text":"Call 911 now."}']]],
+      ["tool", '{"delivered":true,"channel":"sms"}'],
+      ["user", "[m2] it's better now"],
+    ],
+  );
+  next.answer(respond(call("send_sms", { text: "Glad to hear it." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  const transcript = await h.agent.transcript(a!.conversationId);
+  assert.deepEqual(transcript.map((l) => (l.kind === "in" || l.kind === "out") && [l.kind, l.channel, l.text]), [
+    ["in", "sms", "I have chest pain"],
+    ["out", "sms", "Call 911 now."],
+    ["in", "sms", "it's better now"],
+    ["out", "sms", "Glad to hear it."],
+  ]);
+  const answered = h.events.filter((e) => e.answered);
+  assert.deepEqual(answered.map((e) => [e.type, e.text, e.channel, e.direct]), [["message.in", "I have chest pain", "sms", undefined], ["message.out", "Call 911 now.", "sms", true]]);
+  assert.ok(!h.events.some((e) => e.type === "message.in" && e.text === "it's better now" && e.answered), "messages the agent answers are not marked");
+});
+
+test("a message intercept answers with silence is kept, with nothing sent back", async () => {
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, intercept: emergency });
+  await h.message("sms", SAM.address, "ok");
+  assert.deepEqual(h.texts("sms"), []);
+  const a = await h.message("sms", SAM.address, "when do you open?");
+  const next = await h.nextCall(0);
+  assert.deepEqual(next.request.messages.map((m) => [m.role, m.content]), [
+    ["user", "[m1] ok\n[Chinwag] The business's own rules took this message for you on sms and sent nothing back."],
+    ["user", "[m2] when do you open?"],
+  ]);
+  next.answer(respond(call("send_sms", { text: "At 9." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.deepEqual((await h.agent.transcript(a!.conversationId)).map((l) => (l.kind === "in" || l.kind === "out") && [l.kind, l.text]), [["in", "ok"], ["in", "when do you open?"], ["out", "At 9."]]);
+  assert.deepEqual(h.events.filter((e) => e.answered).map((e) => e.type), ["message.in"]);
+});
+
+test("a message intercept answers while a turn runs is answered at once, and joins that turn's history after its step, in order", async () => {
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, intercept: emergency });
+  const a = await h.message("sms", SAM.address, "what should I eat today?");
+  const thinking = await h.nextCall(0);
+  await h.message("sms", SAM.address, "chest pain, help");
+  assert.deepEqual(h.texts("sms"), ["Call 911 now."], "sent while the model was still thinking");
+  assert.equal(thinking.request.signal.aborted, false, "the step in flight goes on");
+  thinking.answer(respond(call("send_sms", { text: "Oats and fruit." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  // The turn takes the exchange in after its step: one more step reads it (the helper answers it with nothing).
+  assert.equal(h.calls.length, 1);
+  const after = h.followUps.at(-1)!;
+  assert.deepEqual(after.messages.slice(1).map((m) => [m.role, m.role === "assistant" ? m.toolCalls![0].arguments : m.content.split("\n")[0]]), [
+    ["assistant", '{"text":"Oats and fruit."}'],
+    ["tool", '{"delivered":true,"channel":"sms"}'],
+    ["user", "[m2] chest pain, help"],
+    ["assistant", '{"text":"Call 911 now."}'],
+    ["tool", '{"delivered":true,"channel":"sms"}'],
+  ]);
+  assert.deepEqual((await h.agent.transcript(a!.conversationId)).map((l) => (l.kind === "in" || l.kind === "out") && l.text), ["what should I eat today?", "Oats and fruit.", "chest pain, help", "Call 911 now."]);
+});
+
 test("a STOP is kept, and Chinwag's reply sent, when intercept throws on it", async () => {
   const keywords = { ...SMS_KEYWORDS, replies: { stop: "You're unsubscribed." } };
   let calls = 0;
@@ -262,6 +342,16 @@ test("receive() keeps a STOP the hook answered, and sends only the hook's reply"
   await h.agent.conversation("c1")!.stored();
   assert.deepEqual(sent, ["Okay, no more texts."]);
   assert.equal((await h.agent.nudge({ to: { channel: "sms", address: "c1" }, text: "Your order is ready." })).status, "dropped");
+});
+
+test("receive() sends a message intercept answers while it runs, and keeps both", async () => {
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, intercept: emergency });
+  await h.agent.resume();
+  const sent: string[] = [];
+  assert.equal(h.agent.receive("c1", "chest pain", (o) => void (o.type === "message" && sent.push(o.text)), { channelName: "sms", messageId: "r1" }), null);
+  assert.deepEqual(sent, ["Call 911 now."], "delivered before receive() returned");
+  await h.agent.conversation("c1")!.whenIdle();
+  assert.deepEqual((await h.agent.transcript("c1")).map((l) => (l.kind === "in" || l.kind === "out") && [l.kind, l.text]), [["in", "chest pain"], ["out", "Call 911 now."]]);
 });
 
 test("with keywords: false, STOP is a message like any other: the hook sees no keyword and the agent answers", async () => {
