@@ -1128,7 +1128,7 @@
     const list = [];
     for (const h of outbox.held) {
       const until = h.reason === "window_closed" ? "until they reply (WhatsApp window closed)" : `until ${at(h.holdUntil, zone)}`;
-      list.push(item(`Held ${h.kind} nudge`, "held", h.what, `${until}${h.expiresAt ? ` · dropped if still held at ${at(h.expiresAt, zone)}` : ""}`));
+      list.push(item(`Held ${h.kind} nudge · goes on ${h.channel}`, "held", h.what, `${until}${h.expiresAt ? ` · dropped if still held at ${at(h.expiresAt, zone)}` : ""}`));
     }
     for (const sc of outbox.schedules) list.push(item(sc.origin === "person" ? "Their reminder" : "Scheduled by the business", "", sc.message, `${sc.summary}${sc.nextRunAt ? ` · next ${at(sc.nextRunAt, sc.timeZone)}` : ""}${sc.respectsQuietHours ? " · waits for quiet hours" : ""}`));
     if (!list.length) { const li = document.createElement("li"); li.className = "empty"; li.textContent = "Nothing scheduled or held."; list.push(li); }
