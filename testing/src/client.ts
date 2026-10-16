@@ -8,6 +8,8 @@ import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { basename, relative, resolve } from "node:path";
 import { toSpec, type Agent, type Incoming, type EventSink, type Outbound, type ChinwagEvent, type Tool } from "../../src/index.ts";
+import { PROFILE_TOOL, profileTool } from "../../src/conversation.ts";
+import { STAND_IN } from "../../src/tools.ts";
 import type { Command, Opened, WireIncoming, OpenSession, Receipt, RunKey, RunSummary, SessionSummary, ToolCallRequest, ToolCallResult } from "./protocol.ts";
 import { mimeOf, parseScenario, parseToolFile, suiteHash, type SuiteFile } from "./suite.ts";
 
@@ -146,7 +148,7 @@ export function postBudgetMs(baseMs: number, bytes: number): number {
 }
 
 /** What the cloud plays: a Chinwag Agent's channels, messages in and reactions. */
-export type AgentUnderTest = Pick<Agent, "channels" | "receive" | "reacted">;
+export type AgentUnderTest = Pick<Agent, "channels" | "receive" | "reacted"> & Partial<Pick<Agent, "hasProfile">>;
 
 export interface CloudAccess {
   /** The cloud's front door, as given to --cloud. */
@@ -293,8 +295,13 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
   // until its simulator has answered and the chosen latency has passed.
   // 210s already includes the default POST budget. A session that sets its own uses that instead, so a test can still watch a timeout.
   const toolBudget = options.postTimeoutMs == null ? CLOUD_MODEL_BUDGET_MS : postTimeoutMs;
-  const toolWait = new Map(options.tools.map((t) => [t.name, toolTimeoutMs(options.files, t.name, toolBudget)]));
-  const tools: Tool[] = options.tools.map((t) => ({
+  // The built-in get_user_profile is played like the agent's own tools, so a test never reads a real
+  // profile: its stand-in is given to every agent, and counts only for one with a `profile`.
+  const ownProfile = options.tools.some((t) => t.name === PROFILE_TOOL);
+  const standIn = ownProfile ? [] : [Object.assign(profileTool(() => null), { [STAND_IN]: true })];
+  const played = [...options.tools, ...standIn];
+  const toolWait = new Map(played.map((t) => [t.name, toolTimeoutMs(options.files, t.name, toolBudget)]));
+  const tools: Tool[] = played.map((t) => ({
     ...t,
     run: (input: unknown, context: { conversationId: string }) => {
       const call = (async () => {
@@ -385,7 +392,7 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
   const agent = options.build({ tools, events: [events] });
 
   const open: OpenSession = {
-    agent: { name: options.name, title: options.title, tools: options.tools.map(toSpec), channels: agent.channels() },
+    agent: { name: options.name, title: options.title, tools: [...options.tools, ...(agent.hasProfile?.() ? standIn : [])].map(toSpec), channels: agent.channels() },
     files: options.files.map(({ path, hash }) => ({ path, hash })),
     runs: options.runs ?? 1,
     deliveryReceipts: true,

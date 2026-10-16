@@ -109,6 +109,7 @@ export function multi(options: {
   history?: { maxTokens?: number; toolResultChars?: number };
   defaultCountryCode?: string;
   intercept?: AgentOptions["intercept"];
+  profile?: AgentOptions["profile"];
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
@@ -138,6 +139,7 @@ export function multi(options: {
     history: options.history,
     defaultCountryCode: options.defaultCountryCode,
     intercept: options.intercept,
+    profile: options.profile,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>

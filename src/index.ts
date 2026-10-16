@@ -22,8 +22,8 @@ export {
   type WhatsAppFeature,
   type WhatsAppProvider,
 } from "./channels.ts";
-export { Conversation, type TranscriptEntry } from "./conversation.ts";
-export { nudgeHandler, type NudgeHandlerOptions } from "./http.ts";
+export { Conversation, type Profile, type TranscriptEntry } from "./conversation.ts";
+export { nudgeHandler, timeZoneHandler, type NudgeHandlerOptions, type TimeZoneHandlerOptions } from "./http.ts";
 export { sqlite, type Database } from "./db.ts";
 export { postgres, type PostgresPool } from "./postgres.ts";
 export { jsonlSink, type EventSink, type ChinwagEvent } from "./events.ts";

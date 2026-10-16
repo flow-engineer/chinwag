@@ -30,7 +30,7 @@ export interface ScheduleScope {
   /** The person's zone, once known. */
   personZone(): string | null;
   setPersonZone(zone: string): Promise<void>;
-  /** The agent's own zone (the business's), if set. */
+  /** The agent's own zone (the business's), if set: only for "in N minutes", which needs no one's clock. */
   agentZone?: string;
 }
 
@@ -86,20 +86,24 @@ export function summary(s: ScheduleRow) {
   };
 }
 
-/** The zone a schedule uses: the one named (never a bare UTC), else the person's, else the agent's. */
-async function zoneFor(scope: ScheduleScope, named?: string): Promise<string | { error: string }> {
+/**
+ * The zone a schedule uses: the one named (never a bare UTC), else the person's. Their zone is never
+ * guessed from the business's: only "in N minutes", which is the same in every zone, goes ahead
+ * without it (shown in the business's time).
+ */
+async function zoneFor(scope: ScheduleScope, named?: string, relative = false): Promise<string | { error: string }> {
   if (named && !isBareUtc(named)) {
     if (!validZone(named)) return { error: `${named} is not a time zone. Use an IANA name such as America/New_York.` };
     await scope.setPersonZone(named);
     return named;
   }
-  const known = scope.personZone() ?? scope.agentZone;
+  const known = scope.personZone() ?? (relative ? (scope.agentZone ?? "UTC") : null);
   if (known) return known;
   return { error: "timezone_needed: you do not know their time zone. Ask which city they are in, then schedule again with timezone." };
 }
 
 async function create(scope: ScheduleScope, input: z.infer<typeof scheduleInput>) {
-  const zone = await zoneFor(scope, input.timezone);
+  const zone = await zoneFor(scope, input.timezone, input.repeat === "once" && input.in_minutes !== undefined);
   if (typeof zone !== "string") return zone;
   const now = scope.now();
   const rule = ruleOf(input, zone, now);

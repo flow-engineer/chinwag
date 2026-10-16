@@ -58,7 +58,8 @@ expect:
 - `world`: everything true in this test, in plain words. It is the only place the situation is
   set: stock, outages, slowness, the person's history. The tool simulator plays every tool from
   it, choosing among the responses in `tests/tools/*.yaml`. Never write tool responses or
-  latencies in a scenario.
+  latencies in a scenario. An agent with a `profile` gets it played from here too
+  (`get_user_profile`): say who the person is ("Sam, a member since 2024, on the monthly plan").
 - `expect`:
   - `outcome`: what must have happened, checked against what the tools did ("exactly one
     order is placed", "no order is placed").

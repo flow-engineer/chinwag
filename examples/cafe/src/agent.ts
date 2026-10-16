@@ -27,7 +27,6 @@ export function buildAgent(options: BuildOptions = {}) {
     ...(options.host ?? { dir: fileURLToPath(new URL("../agent", import.meta.url)) }),
     model: options.model ?? openAICompatible({ model: process.env.CAFE_MODEL }),
     tools: options.tools ?? cafeTools,
-    context: () => `Now: ${new Date().toLocaleString("en-US", { timeZone: "America/New_York" })} (New York)`,
     events: options.events ?? [],
     channels: [whatsapp(provider), sms(provider), customUI("web", provider)],
     testPeople: [

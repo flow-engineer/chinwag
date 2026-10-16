@@ -176,6 +176,31 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 - **One person, one conversation.** The same number on SMS and WhatsApp is one person, however each provider writes it (`+1 555 010 0100`, `15550100100`: both are `+15550100100`), also when their first messages on both arrive at once. If your SMS provider gives national numbers (`098765 43210`), set `createAgent({ defaultCountryCode: "+91" })`: on every phone channel but WhatsApp, a number with no `+` or `00` is then read as that country's (its trunk 0 dropped), so it joins `919876543210` on WhatsApp; without it, bare digits are taken as international. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
 - **The agent gets one send tool per channel** (`send_sms`, `send_whatsapp`, `send_app`) and answers each message where it came in. `instructions` guide the agent on that channel only.
 
+## What the agent knows about the person
+
+Give the agent what your business knows about someone (their account, plan, orders, preferences) with `profile`. Chinwag offers it as a built-in tool, `get_user_profile`, which the agent calls when it needs it; it has no input, so it is always about the person in this conversation:
+
+```ts
+createAgent({
+  // ...
+  resolve: ({ channel, address }) => members.idFor(channel, address),
+  profile: async ({ person }) => members.profile(person), // person: what tools get as context.person
+});
+```
+
+A tool of yours named `get_user_profile` is used instead. In `chinwag test` runs the profile is played by the test cloud from the scenario's `world`, like your tools, so a test never reads a real one.
+
+`context(conversationId)` is still there for small facts at hand, added to the system prompt at the start of every turn. It runs before every reply, so a lookup in it (an API call, a slow query) delays every reply: put those in `profile` or a tool. What is the same for everyone (opening hours, policies) belongs in the agent's `AGENTS.md`.
+
+## Time zones
+
+Chinwag tells the agent the time at every turn: in the person's time zone when it is known, else in the business's (`timeZone`), saying theirs is not known. A person's zone is never guessed from the business's. It is known when:
+
+- **You set it.** Many businesses already know it: `await agent.setTimeZone({ to: { channel: "sms", address: "+15550100100" }, timeZone: "Asia/Kolkata" })`, or over HTTP (below). It answers `{ status: "set" }`, or `{ status: "refused", reason: "unknown_person" }` for someone who has never written; a name that is not an IANA zone throws.
+- **They say it.** When they name a place for a reminder, the agent keeps their zone.
+
+Without it, a reminder at a clock time ("at 9 tomorrow") makes the agent ask where they are first; one "in 30 minutes" needs no zone. A no-contact rule that lasts "until Friday" ends where Friday ends last (UTC-12), so it never lifts early.
+
 ## Reminders and nudges
 
 Built in, so you don't write them as tools:
@@ -233,6 +258,15 @@ curl -s -X POST https://agent.example.com/nudges \
 # {"id":"n_3f9c2a1b","status":"queued"}
 curl -s https://agent.example.com/nudges/n_3f9c2a1b -H "Authorization: Bearer $NUDGE_TOKEN"
 # {"id":"n_3f9c2a1b","status":"sent"}
+```
+
+People's time zones go the same way, for a business that keeps them in its own database: mount `timeZoneHandler(agent, { token })` and `PUT /people/time-zone` with `{ to: { channel, address }, time_zone }`. It answers `200 { status: "set" }`, `404 { status: "refused", reason: "unknown_person" }` for someone who has never written, or `400 { error }` for a name that is not a time zone.
+
+```sh
+curl -s -X PUT https://agent.example.com/people/time-zone \
+  -H "Authorization: Bearer $NUDGE_TOKEN" -H "content-type: application/json" \
+  -d '{"to":{"channel":"sms","address":"+15550100100"},"time_zone":"Asia/Kolkata"}'
+# {"status":"set"}
 ```
 
 The contract is [`spec/nudges.openapi.yaml`](spec/nudges.openapi.yaml). In code, `agent.recordNudge(input)` is the same early answer and `agent.nudgeState(id)` the same read.
@@ -435,9 +469,10 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `testPeople` | Who the playground may play: `[{ name, phone }]` |
 | `templates` | The WhatsApp templates you set up with Meta (header, body, footer, buttons): each send is checked against its declaration, and the playground shows it as WhatsApp does |
 | `transcribe` | Speech to text for voice notes, with the provider you choose |
-| `context` | Text added to every turn: who this person is, the time |
+| `context` | Small facts added to the system prompt at every turn; it runs before every reply, so keep lookups out of it (see [What the agent knows about the person](#what-the-agent-knows-about-the-person)) |
+| `profile` | What your business knows about the person, as the built-in tool `get_user_profile`, called only when the agent needs it |
 | `intercept` | Answer some messages without the model; `message.channel` is the channel it came in on, and it sees STOP, START and HELP first, marked in `message.keyword` (they are built in on SMS and WhatsApp) |
-| `timeZone` | The business's time zone, for schedules when a person's is unknown |
+| `timeZone` | The business's time zone: the time the agent is told when a person's is not known (never taken as theirs; see [Time zones](#time-zones)) |
 | `deadlineMs` | The longest a reply waits for a tool (60,000); a tool can set its own |
 | `partialAfterMs` | How long a finished tool's result waits for the others (5,000) |
 | `debounceMs` | Quiet time after a message before the reply starts (300) |

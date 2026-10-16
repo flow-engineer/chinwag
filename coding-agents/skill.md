@@ -76,8 +76,10 @@ export function buildAgent(options: { model?: Model; events?: EventSink[]; tools
 ```
 
 Other `createAgent` options: `files` replaces `dir` on hosts with no file system (the folder's
-text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `context(conversationId)` adds who the person is and the time to
-every turn (cheaper than a lookup tool); `intercept(conversationId, text, message)` answers a
+text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `profile({ conversationId, person, channel })` is what the business knows about
+the person, offered as the built-in tool `get_user_profile` and run only when the agent calls it (put
+lookups here, not in `context`); `context(conversationId)` adds small facts to the system prompt at
+every turn, before every reply, so it must not call APIs; Chinwag already tells the agent the time; `intercept(conversationId, text, message)` answers a
 message without the model (return the reply, `""` for silence, or `null` to let the agent answer);
 `deadlineMs` (default 60,000) is the longest a reply waits for a tool before it moves to the
 background (set a tool's own `deadlineMs` for a known-slow one); `partialAfterMs` (default 5,000)
@@ -119,6 +121,8 @@ export const app = customUI("app", {
 
 createAgent({ ..., channels: [wa, sms(twilioLike), app], database: sqlite("data/chinwag.db"),
   resolve: ({ channel, address }) => members.idFor(channel, address), timeZone: "America/New_York" });
+// A person's time zone is never guessed from timeZone (the business's): set it when you know it,
+// agent.setTimeZone({ to, timeZone }) or timeZoneHandler over HTTP; else the agent asks them.
 await agent.resume();                     // a durable database: always before the first message
 await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" });
 ```
@@ -160,7 +164,8 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   picks; Chinwag has none. Anything the agent can't read reaches it named, with why, so it asks
   for text. The latest 3 photos and PDFs stay shown; their bytes are never stored.
 
-Built in, so don't build them as tools: scheduled messages (`schedule_message`, `list_scheduled`,
+Built in, so don't build them as tools: what the business knows about the person (`profile`, as
+`get_user_profile`), scheduled messages (`schedule_message`, `list_scheduled`,
 `cancel_scheduled`, in the person's local time), and what a person asked not to be messaged about
 (`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
 `whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with

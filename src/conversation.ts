@@ -35,14 +35,15 @@
 
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import type { z } from "zod";
+import { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
 import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
-import { render, toSpec, type Tool } from "./tools.ts";
+import { formatLocal } from "./time.ts";
+import { render, tool, toSpec, type Tool } from "./tools.ts";
 import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, PersonMessage, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
@@ -263,12 +264,18 @@ export class Conversation {
         },
         agentZone: settings.timeZone,
       }),
-      ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone ?? settings.timeZone ?? "UTC" }),
+      ...noContactTools({ store: settings.store, conversationId: id, now: settings.now, zone: () => this.timeZone }),
     ];
     this.builtins = new Map(builtins.map((t) => [t.name, t]));
     this.builtinSpecs = builtins.map(toSpec);
     this.loaded = settings.ready.then(() => (existing ? this.load() : settings.store.createConversation(id, personKey)));
     this.writes = this.loaded.catch((error) => console.warn(`chinwag: conversation ${id} did not load:`, error));
+  }
+
+  /** Their time zone, as the business knows it (agent.setTimeZone): schedules and the time line use it from now on. */
+  setTimeZone(zone: string): Promise<void> {
+    this.timeZone = zone;
+    return this.persist(() => this.settings.store.updateConversation(this.id, { timeZone: zone }));
   }
 
   /** What a channel of this conversation can show, if the person has written on it. */
@@ -742,7 +749,7 @@ export class Conversation {
       const views = this.views();
       const several = views.length > 1;
       this.sendTools = new Map(views.map((v) => [sendToolName(v.name), v.name]));
-      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, context].filter(Boolean).join("\n\n");
+      const system = [this.settings.instructions, talkInstructions(views, this.settings.talk), rules, nowLine(this.settings.now(), this.timeZone, this.settings.timeZone), context].filter(Boolean).join("\n\n");
       const specs = [...this.settings.specs, ...this.builtinSpecs, ...talkSpecs(views, this.settings.talk)];
       const abort = new AbortController();
       if (restarts < this.settings.maxRestarts) this.stepAbort = abort;
@@ -1369,3 +1376,28 @@ function ago(ms: number): string {
 function stableJson(value: unknown): string {
   return JSON.stringify(value, (_key, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v));
 }
+
+/**
+ * The time, for every turn: in their zone when the business or the person gave it, else in the
+ * business's, saying theirs is not known (never guessed from the business's).
+ */
+export function nowLine(now: number, personZone: string | null, agentZone: string | undefined): string {
+  if (personZone) return `[Chinwag] It is now ${formatLocal(personZone, now)}, their time.`;
+  return `[Chinwag] It is now ${formatLocal(agentZone ?? "UTC", now)}, the business's time. Their time zone is not known: ask where they are before anything that depends on their local time.`;
+}
+
+export const PROFILE_TOOL = "get_user_profile";
+
+/** The built-in tool over createAgent's `profile`: no input, so it is always about the person in this conversation. */
+export function profileTool(profile: Profile): Tool {
+  return tool({
+    name: PROFILE_TOOL,
+    description: "This person's profile from the business: who they are and what the business knows about them. Call it when you need it; it is always about the person you are talking to.",
+    input: z.object({}),
+    run: (_input, context) => profile({ conversationId: context.conversationId, person: context.person, channel: context.channel }),
+  });
+}
+
+/** createAgent's `profile`: what the business knows about the person, fetched only when the agent asks. */
+export type Profile = (who: { conversationId: string; person: string; channel: string }) => Promise<unknown> | unknown;
+

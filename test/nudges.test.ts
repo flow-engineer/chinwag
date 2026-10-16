@@ -157,7 +157,7 @@ test("a no-contact rule ends at its until date, and goes when the agent removes 
   added.answer(respond());
   await h.conversation.whenIdle();
 
-  h.clock.now = Date.UTC(2026, 9, 13, 1); // the day is over (UTC: no zone set)
+  h.clock.now = Date.UTC(2026, 9, 13, 13); // the day is over everywhere: their zone is not known, so it ends where it ends last
   const nudge = h.agent.nudge({ to: h.to, text: "Order ready" });
   const check = await h.nextCall(3);
   assert.doesNotMatch(check.request.messages[0].content as string, /no reminders today/, "the ended rule is gone");

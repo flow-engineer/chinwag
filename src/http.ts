@@ -1,9 +1,16 @@
-// Nudges over HTTP: a handler the owner mounts in their own server, so a backend that is a separate
-// service can nudge people without a route of its own. Behind one bearer token.
+// Nudges and people's time zones over HTTP: handlers the owner mounts in their own server, so a
+// backend that is a separate service can reach the agent without routes of its own. Behind one
+// bearer token each.
 //
+// nudgeHandler:
 //   POST {base}        { to: { channel, address }, text | prompt | template, at?, idempotency_key? }
 //                      → 202 { id, status, reason? } as soon as it is recorded, before any send or turn
 //   GET  {base}/:id    → 200 { id, status, reason? }, its state now; 404 for an id the agent never recorded
+//
+// timeZoneHandler:
+//   PUT  {base}        { to: { channel, address }, time_zone }   the person's zone as the business knows it
+//                      → 200 { status: "set" }; 404 { status: "refused", reason: "unknown_person" } for
+//                      someone who never wrote; 400 for a name that is not a time zone
 //
 // The token lock (a token of at least 32 characters, compared in constant time, wrong tries limited
 // per address) is shared with the deployed playground.
@@ -105,13 +112,7 @@ export function nudgeHandler(agent: NudgeAgent, options: NudgeHandlerOptions): (
     if (path !== base && (id === null || !id || id.includes("/"))) return json(res, 404, { error: "not found" });
 
     const ip = req.socket.remoteAddress ?? "unknown";
-    const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
-    if (bearer === undefined) return json(res, 401, { error: "send Authorization: Bearer <token>" });
-    if (tries.blocked(ip)) return json(res, 429, { error: "too many wrong tokens from this address; try again later" });
-    if (!sameSecret(bearer, token)) {
-      tries.failed(ip);
-      return json(res, 401, { error: "wrong token" });
-    }
+    if (!authorized(req, res, ip, token, tries)) return;
 
     if (id !== null) {
       if (req.method !== "GET") return json(res, 404, { error: "not found" });
@@ -155,6 +156,67 @@ export function nudgeHandler(agent: NudgeAgent, options: NudgeHandlerOptions): (
     handle(req, res).catch((error) => {
       console.warn("chinwag nudges:", error);
       if (!res.headersSent) json(res, 500, { error: "the nudge could not be recorded" });
+    });
+}
+
+/** Checks the bearer token, answering 401 or 429 itself when it fails. */
+function authorized(req: IncomingMessage, res: ServerResponse, ip: string, token: string, tries: ReturnType<typeof wrongTries>): boolean {
+  const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
+  let refusal: [number, string] | null = null;
+  if (bearer === undefined) refusal = [401, "send Authorization: Bearer <token>"];
+  else if (tries.blocked(ip)) refusal = [429, "too many wrong tokens from this address; try again later"];
+  else if (!sameSecret(bearer, token)) {
+    tries.failed(ip);
+    refusal = [401, "wrong token"];
+  }
+  if (refusal) json(res, refusal[0], { error: refusal[1] });
+  return refusal === null;
+}
+
+export interface TimeZoneHandlerOptions {
+  /** At least 32 characters, from a secret; callers send it as `Authorization: Bearer <token>`. */
+  token: string;
+  /** The path it answers. Default "/people/time-zone". */
+  base?: string;
+}
+
+const TimeZoneBody = z.object({ to: z.object({ channel: z.string().min(1), address: z.string().min(1) }).strict(), time_zone: z.string().min(1) }).strict();
+
+/**
+ * People's time zones over HTTP, for a business that already knows them: `PUT {base}` with
+ * `{ to: { channel, address }, time_zone }`. Requests to any other path get 404 without a token check.
+ */
+export function timeZoneHandler(agent: Pick<Agent, "setTimeZone" | "channels">, options: TimeZoneHandlerOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  requireToken(options?.token, "chinwag time zones");
+  const token = options.token;
+  const base = (options.base ?? "/people/time-zone").replace(/\/+$/, "");
+  const tries = wrongTries();
+
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (new URL(req.url ?? "/", "http://localhost").pathname !== base) return json(res, 404, { error: "not found" });
+    const ip = req.socket.remoteAddress ?? "unknown";
+    if (!authorized(req, res, ip, token, tries)) return;
+    if (req.method !== "PUT") return json(res, 404, { error: "not found" });
+    const raw = await readBody(req);
+    if (raw === undefined) return json(res, 400, { error: `the body must be JSON of at most ${MAX_BODY} bytes` });
+    const parsed = TimeZoneBody.safeParse(raw);
+    if (!parsed.success) return json(res, 400, { error: parsed.error.issues.map((i) => (i.path.length ? `${i.path.join(".")}: ${i.message}` : i.message)).join("; ") });
+    const { to, time_zone } = parsed.data;
+    const channels = agent.channels().map((c) => c.name);
+    if (!channels.includes(to.channel)) return json(res, 400, { error: `to.channel must be one of the agent's channels: ${channels.join(", ") || "it has none"}` });
+    let result;
+    try {
+      result = await agent.setTimeZone({ to, timeZone: time_zone });
+    } catch (error) {
+      return json(res, 400, { error: error instanceof Error ? error.message.replace(/^chinwag: /, "") : String(error) });
+    }
+    return json(res, result.status === "set" ? 200 : 404, result);
+  }
+
+  return (req, res) =>
+    handle(req, res).catch((error) => {
+      console.warn("chinwag time zones:", error);
+      if (!res.headersSent) json(res, 500, { error: "the time zone could not be set" });
     });
 }
 

@@ -15,13 +15,14 @@
 
 import { randomUUID } from "node:crypto";
 import { declaredTemplate, fillTemplate, keywordOf, summarize, type Channel, type ChannelSummary, type Keywords } from "./channels.ts";
-import { Conversation, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type TranscriptEntry } from "./conversation.ts";
+import { Conversation, PROFILE_TOOL, profileTool, transcriptOf, windowClosed, type ChannelLink, type ConversationSettings, type Profile, type TranscriptEntry } from "./conversation.ts";
 import { sqlite, type Database } from "./db.ts";
 import { emitter, type EventSink } from "./events.ts";
 import { businessSchedule, claimDue } from "./schedules.ts";
 import { loadInstructions, loadSkills, readAgentFolder, skillTool, type AgentFiles } from "./skills.ts";
 import { Store, type ConversationRow, type IdentityRow, type NudgeRow, type StoreApi, type Via } from "./store.ts";
-import { toSpec, type Tool } from "./tools.ts";
+import { validZone } from "./time.ts";
+import { STAND_IN, toSpec, type Tool } from "./tools.ts";
 import { traces, tracesFromEnv, type Traces, type TracesOptions } from "./traces.ts";
 import type { ChannelInfo, Deliver, Incoming, Model, Outbound, Template, TemplateDefinition, Transcribe } from "./types.ts";
 
@@ -37,8 +38,18 @@ export interface AgentOptions {
    */
   transcribe?: Transcribe;
   tools?: Tool[];
-  /** Added to the system prompt at the start of every turn: who this person is, the time. */
+  /**
+   * Added to the system prompt at the start of every turn, before the model is called: keep it to
+   * small facts at hand. It runs on every turn, so a lookup here (an API call, a slow query) delays
+   * every reply; give the agent `profile` or a tool for those, which it calls only when it needs them.
+   */
   context?: (conversationId: string) => Promise<string> | string;
+  /**
+   * What the business knows about the person (their account, plan, preferences), as the built-in
+   * tool get_user_profile: no input, always about the person in the conversation, and run only when
+   * the agent calls it. A tool of yours with that name is used instead.
+   */
+  profile?: Profile;
   /**
    * Answer some messages without the model: return the reply, "" to send nothing, or null to let
    * the agent reply. `message.channel` is the channel it came in on, by the name in `channels`
@@ -102,7 +113,11 @@ export interface AgentOptions {
    * WhatsApp. Without it, bare digits are taken as international.
    */
   defaultCountryCode?: string;
-  /** The business's time zone (IANA), for scheduled messages when a person's is not known. */
+  /**
+   * The business's time zone (IANA): the time the agent is told when the person's zone is not known,
+   * and the time a business-started schedule is shown in. Never taken as the person's own: set
+   * theirs with setTimeZone, or the agent asks them.
+   */
   timeZone?: string;
   /** How often due scheduled messages are looked for. Default 5,000 ms; 0 turns the timer off. */
   scheduleCheckMs?: number;
@@ -236,7 +251,9 @@ export class Agent {
     if ((options.dir === undefined) === (options.files === undefined)) throw new Error("chinwag: give an agent exactly one of dir or files");
     const files = options.files ?? readAgentFolder(options.dir!);
     const skills = loadSkills(files);
-    const tools = [...(options.tools ?? [])];
+    // The test cloud's stand-in for get_user_profile counts only for an agent with a profile.
+    const tools = (options.tools ?? []).filter((t) => options.profile || !(t as { [STAND_IN]?: boolean })[STAND_IN]);
+    if (options.profile && !tools.some((t) => t.name === PROFILE_TOOL)) tools.push(profileTool(options.profile));
     if (skills.length && !options.inlineSkills) tools.push(skillTool(skills, (id, name) => emit(id, "skill.loaded", { skill: name })));
     if (options.store && (options.database || options.id)) throw new Error("chinwag: give an agent a store or a database (and id), not both");
     this.store = options.store ?? new Store(options.database ?? sqlite(), options.id ?? "default");
@@ -566,6 +583,32 @@ export class Agent {
    * agent chose not to send), dropped (a no-contact rule covers it), refused (outside_window,
    * unknown_person) or failed; or scheduled, for one with `at`.
    */
+  /**
+   * The person's time zone as the business knows it (an IANA name, "Asia/Kolkata"), by a channel
+   * identity they have written from, like a nudge's `to`. Schedules and the agent's time use it from
+   * then on. Throws for a name that is not a zone; refused (unknown_person) for someone who never wrote.
+   */
+  async setTimeZone(input: { to: { channel: string; address: string }; timeZone: string }): Promise<{ status: "set" } | { status: "refused"; reason: "unknown_person" }> {
+    if (!validZone(input.timeZone)) throw new Error(`chinwag: ${input.timeZone} is not a time zone; use an IANA name such as America/New_York`);
+    await this.settings.ready;
+    const identity = await this.store.identity(input.to.channel, input.to.address);
+    if (!identity) return { status: "refused", reason: "unknown_person" };
+    const id = identity.conversationId;
+    const resident = this.conversations.get(id);
+    if (resident) await resident.setTimeZone(input.timeZone);
+    else {
+      await this.store.updateConversation(id, { timeZone: input.timeZone });
+      const row = this.rows.get(id);
+      if (row) this.rows.set(id, { ...row, timeZone: input.timeZone });
+    }
+    return { status: "set" };
+  }
+
+  /** Whether the agent has a profile (get_user_profile), so the test cloud knows to play it. */
+  hasProfile(): boolean {
+    return this.options.profile !== undefined;
+  }
+
   async nudge(input: NudgeInput): Promise<NudgeResult> {
     // outcome() waits while it is queued, so what it resolves is settled.
     return (await this.outcome(await this.recordNudge(input))) as NudgeResult;

@@ -16,8 +16,8 @@ export interface NoContactScope {
   store: StoreApi;
   conversationId: string;
   now(): number;
-  /** The zone an `until` date is read in. */
-  zone(): string;
+  /** Their zone, once known: an `until` date is read in it. */
+  zone(): string | null;
 }
 
 export function noContactTools(scope: NoContactScope): Tool[] {
@@ -31,7 +31,8 @@ export function noContactTools(scope: NoContactScope): Tool[] {
         until: z.string().optional().describe("YYYY-MM-DD, the last day it applies, when they gave one (\"not this week\")"),
       }),
       run: async ({ rule, until }) => {
-        const ends = until ? endOfLocalDay(scope.zone(), until) : null;
+        // Their zone unknown, the day ends where it ends last (UTC-12): the rule never lifts early.
+        const ends = until ? endOfLocalDay(scope.zone() ?? "Etc/GMT+12", until) : null;
         if (until && !ends) return { error: "until must be YYYY-MM-DD." };
         const id = `nc_${randomUUID().slice(0, 6)}`;
         await scope.store.addNoContact(scope.conversationId, id, rule, ends);

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test, type TestContext } from "node:test";
-import { nudgeHandler } from "../src/index.ts";
+import { nudgeHandler, sqlite, Store, timeZoneHandler } from "../src/index.ts";
 import { SMS, call, multi, respond } from "./helpers.ts";
 
 const SAM = { channel: "sms", address: "+15550100100" };
@@ -11,7 +11,8 @@ const auth = { authorization: `Bearer ${TOKEN}`, "content-type": "application/js
 
 /** Sam has written once and been answered; the nudge endpoint is served under /nudges. */
 async function served(t: TestContext) {
-  const h = multi({ channels: { sms: { info: SMS, phone: true } } });
+  const database = sqlite();
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, database });
   const first = await h.message("sms", SAM.address, "hi");
   (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Hi!" })));
   const conversation = h.agent.conversation(first!.conversationId)!;
@@ -24,7 +25,7 @@ async function served(t: TestContext) {
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   const post = (body: unknown, headers: Record<string, string> = auth) => fetch(`${url}/nudges`, { method: "POST", headers, body: typeof body === "string" ? body : JSON.stringify(body) });
   const get = (id: string) => fetch(`${url}/nudges/${id}`, { headers: auth });
-  return { ...h, conversation, logged, url, post, get };
+  return { ...h, database, conversation, logged, url, post, get };
 }
 
 test("a short token throws at setup", () => {
@@ -114,3 +115,21 @@ test("an unknown id is 404, and paths outside its base are not its own, without 
     assert.equal((await fetch(`${h.url}${path}`)).status, 404, path);
   }
 });
+
+test("a business sets a person's time zone over HTTP; someone who never wrote is 404, a wrong zone 400", async (t) => {
+  const h = await served(t);
+  const server = createServer(timeZoneHandler(h.agent, { token: TOKEN }));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/people/time-zone`;
+  const put = (body: unknown, headers: Record<string, string> = auth) => fetch(url, { method: "PUT", headers, body: JSON.stringify(body) });
+  assert.equal((await put({ to: SAM, time_zone: "Asia/Kolkata" }, { "content-type": "application/json" })).status, 401);
+  const set = await put({ to: SAM, time_zone: "Asia/Kolkata" });
+  assert.equal(set.status, 200);
+  assert.deepEqual(await set.json(), { status: "set" });
+  assert.equal((await new Store(h.database, "default").conversation(h.conversation.id))?.timeZone, "Asia/Kolkata");
+  assert.equal((await put({ to: { channel: "sms", address: "+15550100999" }, time_zone: "Asia/Kolkata" })).status, 404);
+  assert.equal((await put({ to: SAM, time_zone: "Mars/Olympus" })).status, 400);
+  assert.equal((await fetch(url, { headers: auth })).status, 404, "only PUT");
+});
+
