@@ -157,7 +157,7 @@ test("a tool call the cloud failed, which the agent started and never awaited, i
         channels: () => [], reacted: () => {},
         receive: (conversationId) => {
           received.push(conversationId);
-          if (conversationId === "sms:a") void tools[0]!.run({}, { conversationId, person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal });
+          if (conversationId === "sms:a") void tools[0]!.run({}, { conversationId, person: "p", channel: "sms", key: null, callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal });
           return null;
         },
       }),
