@@ -278,16 +278,21 @@ fast each message was acknowledged and a trace of every model call and tool. `ca
 custom UI shows a link in its params: `{ match: "/video/", label: "Start video call", kind: "call" }`;
 any other link is "Open in app".
 
+The Person tab also moves the agent's clock when you give it one (`const clock = playgroundClock()`,
+`simulators({ clock })` and `createAgent({ now: clock.now })`), lists what is scheduled or held for
+the person, sets their time zone and quiet hours, and sends nudges with every field the API takes.
+
 To demo what your backend does (an order ships, a price drops) without a page of your own, give the
-playground `actions`: each is a button in its Backend panel that runs your function on the server,
-usually one that calls your backend or `agent.nudge`. What it returns ("sent", "skipped: quiet
+playground `actions`: each is a button in its Person tab ("Their account") that runs your function on
+the server for the person being played (`run({ person, channel })`), usually one that calls your
+backend or `agent.nudge`. Label them about that person ("Their order ships"), never one named person. What it returns ("sent", "skipped: quiet
 hours") shows in the trace with its label; a throw shows as a failure. Actions exist only in the
 playground, behind its token, never on the agent's channels:
 
 ```ts
 const play = simulators({
   title: "My agent",
-  actions: [{ label: "Order 1042 is ready", run: async () => (await notifyOrderReady("1042")).status }],
+  actions: [{ label: "Their order is ready", run: async ({ person }) => (await notifyOrderReady(person.phone)).status }],
 });
 ```
 

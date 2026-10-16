@@ -260,7 +260,6 @@
   <div class="side">
     <nav class="sidetabs" role="tablist" aria-label="Side panel">
       <button type="button" role="tab" data-pane="pPerson" id="tabPerson" hidden>Person</button>
-      <button type="button" role="tab" data-pane="pBackend" id="tabBackend" hidden>Backend</button>
       <button type="button" role="tab" data-pane="pTurns">Turns</button>
       <button type="button" role="tab" data-pane="pTrace">Trace <span class="dot" id="traceDot" hidden></span></button>
     </nav>
@@ -286,6 +285,10 @@
       <div class="sec">
         <div class="label">Waiting to go</div>
         <ul class="items" id="waiting"></ul>
+      </div>
+      <div class="sec" id="actionsSec" hidden>
+        <div class="label">Their account <span class="hint">what the agent's backend can do for this person</span></div>
+        <div class="row2" id="actions"></div>
       </div>
       <div class="sec" id="nudgeSec" hidden>
         <div class="label">Send a nudge <span class="hint">as your backend would, through the API</span></div>
@@ -320,10 +323,6 @@
         <div class="row2"><button type="button" class="ghost" id="qOff">No quiet hours for them</button><button type="button" class="ghost" id="qDefault">Use the agent's</button></div>
         <datalist id="zones"><option value="America/New_York"><option value="America/Chicago"><option value="America/Denver"><option value="America/Los_Angeles"><option value="Europe/London"><option value="Asia/Kolkata"><option value="Asia/Singapore"><option value="Australia/Sydney"></datalist>
       </div>
-    </section>
-    <section class="card pane" id="pBackend" role="tabpanel" hidden>
-      <h2>Backend <span>buttons the agent's author added; results show in the trace</span></h2>
-      <div class="backend" id="actions"></div>
     </section>
     <section class="card pane" id="pTurns" role="tabpanel" hidden>
       <h2>Per turn <span id="status"></span></h2>
@@ -870,8 +869,8 @@
 
   // A Backend button's run, on every open page: what it returned, or why it failed.
   function actionDone(d) {
-    if (d.ok) logRow(d.at, "backend", "inline", d.label + (d.result ? ` → ${d.result}` : ""));
-    else logRow(d.at, "backend failed", "bad", `${d.label}: ${d.error}`);
+    if (d.ok) logRow(d.at, "action", "inline", d.label + (d.result ? ` → ${d.result}` : ""));
+    else logRow(d.at, "action failed", "bad", `${d.label}: ${d.error}`);
   }
 
   function logRow(at, tag, cls, text) {
@@ -1185,17 +1184,17 @@
     let actions = [];
     ({ platforms, cards, people = [], channels = [], actions = [], templates = [], panel = panel } = await (await fetch(BASE + "/api/platforms")).json());
     if (PLAY && actions.length && !REPLAY) {
-      // The Backend panel: each button runs one of the playground's actions on the server.
-      $("tabBackend").hidden = false;
+      // Their account, in the Person tab: each button runs one of the playground's actions on the server, for this person.
+      $("actionsSec").hidden = false;
       actions.forEach((label, index) => {
         const btn = document.createElement("button");
         btn.type = "button"; btn.className = "ghost"; btn.textContent = label;
         btn.addEventListener("click", async () => {
           btn.disabled = true;
           try {
-            const res = await fetch(BASE + "/api/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ index }) });
-            if (!res.ok) logRow(Date.now(), "backend failed", "bad", `${label}: ${res.status}`);
-          } finally { btn.disabled = false; }
+            const res = await fetch(BASE + "/api/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...where(), index }) });
+            if (!res.ok) logRow(Date.now(), "action failed", "bad", `${label}: ${res.status}`);
+          } finally { btn.disabled = false; refreshPerson(); }
         });
         $("actions").appendChild(btn);
       });

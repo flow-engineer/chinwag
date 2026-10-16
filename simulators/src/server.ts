@@ -21,7 +21,7 @@
 //   POST /api/clear       ?person           forget the person: history, schedules, everything
 //   GET  /api/status                         busy / idle, background tasks
 //   GET  /api/platforms                      each platform's rules, the agent's channels and test people, link cards,
-//                                            the Backend panel's action labels
+//                                            the action labels (the Person tab's "Their account")
 //   POST /api/actions     {index}            runs one of `actions`; its result goes to every open page's trace
 //
 // The test cloud (`testCloud: true`, for Chinwag's test cloud only): generated people per run, any
@@ -127,15 +127,18 @@ export interface SimulatorsOptions {
 }
 
 /**
- * A button in the playground's Backend panel that makes your backend do something (an order ships,
+ * A button in the playground's Person tab ("Their account") that makes your backend do something for the person being played (their order ships,
  * a price drops), so a demo shows the agent reacting. Playground only: it runs on this server,
  * behind the playground's token, and never exists on the agent's channels.
  */
 export interface PlaygroundAction {
-  /** The button's label, such as "Order 1042 ships". */
+  /** The button's label, about the person being played, such as "Their order ships". */
   label: string;
-  /** Runs when the button is pressed. A string it returns ("sent", "skipped: quiet hours") shows in the trace; a throw shows as a failure. */
-  run: () => Promise<string | void> | string | void;
+  /**
+   * Runs when the button is pressed, for the test person being played and the channel shown. A
+   * string it returns ("sent", "skipped: quiet hours") shows in the trace; a throw shows as a failure.
+   */
+  run: (played: { person: TestPerson; channel: string }) => Promise<string | void> | string | void;
 }
 
 export interface LinkCard {
@@ -247,7 +250,7 @@ interface Thread {
 }
 
 export function simulators(options: SimulatorsOptions & { testCloud: true }): TestCloudSimulators;
-export function simulators(options?: SimulatorsOptions & { testCloud?: false; /** The playground's Backend panel: one button per action. */ actions?: PlaygroundAction[] }): Playground;
+export function simulators(options?: SimulatorsOptions & { testCloud?: false; /** Buttons in the Person tab, for the person being played: one per action. */ actions?: PlaygroundAction[] }): Playground;
 export function simulators(options: SimulatorsOptions & { testCloud?: boolean; actions?: PlaygroundAction[] } = {}): Playground | TestCloudSimulators {
   const cloud = options.testCloud === true;
   const playPage = options.pages?.page ?? readFileSync(new URL("./page.html", import.meta.url), "utf8");
@@ -673,16 +676,18 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
     if (req.method === "POST" && path === "/api/actions") {
       const action = typeof body?.index === "number" ? options.actions?.[body.index] : undefined;
       if (!action) return json(res, 400, { error: "index must be one of the playground's actions" });
+      const played = agent.testPeople().find((p) => digits(p.phone) === digits(String(body?.person ?? "")) && digits(p.phone) !== "");
+      if (!played) return json(res, 403, { error: "only this agent's test people can be played" });
       console.info(JSON.stringify({ chinwag: "playground.action", label: action.label, at: new Date().toISOString(), ip: req.socket.remoteAddress ?? null }));
       let outcome: { ok: true; result?: string } | { ok: false; error: string };
       try {
-        const result = await action.run();
+        const result = await action.run({ person: played, channel: String(body?.channel ?? "") });
         outcome = { ok: true, ...(typeof result === "string" ? { result } : {}) };
       } catch (error) {
         outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
-      // A backend event belongs to no one conversation: every open page shows it, streamed or polled.
-      const event = { type: "action", label: action.label, at: Date.now(), ...outcome };
+      // Shown in every open page's trace, streamed or polled.
+      const event = { type: "action", label: `${action.label} (${played.name})`, at: Date.now(), ...outcome };
       for (const k of new Set([...clients.keys(), ...recent.keys()])) push(k, event);
       return json(res, 200, outcome);
     }
