@@ -722,7 +722,10 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
       // One person on every channel: their record from whichever channel they have written on.
       let contact = await agent.contact(to);
       for (const c of agent.channels()) contact ??= await agent.contact({ channel: c.name, address: c.kind === "custom" ? `test:${person.phone}` : person.phone });
-      return json(res, 200, { now: options.clock?.now() ?? Date.now(), contact, outbox: id ? await agent.outbox(id) : { schedules: [], held: [] } });
+      // When the agent wrote on each channel (its latest 20), so the page can flag a channel it is not showing.
+      const lastOut: Record<string, number[]> = {};
+      for (const e of id ? await agent.transcript(id) : []) if (e.kind === "out") lastOut[e.channel] = [...(lastOut[e.channel] ?? []), e.at].slice(-20);
+      return json(res, 200, { now: options.clock?.now() ?? Date.now(), contact, outbox: id ? await agent.outbox(id) : { schedules: [], held: [] }, lastOut });
     }
     if (req.method === "POST" && path === "/api/nudge") {
       if (!agent.recordNudge) return json(res, 404, { error: "this agent takes no nudges" });

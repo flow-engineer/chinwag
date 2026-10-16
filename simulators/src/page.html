@@ -23,6 +23,8 @@
   .tab img { width: 16px; height: 16px; }
   .tab small { color: var(--quiet); font-size: 11px; }
   .tab[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .tab { position: relative; }
+  .tab .unread { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: #e5484d; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; }
   .spacer { flex: 1; }
   .ghost { padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); cursor: pointer; }
   select.ghost { max-width: 240px; }
@@ -1059,6 +1061,7 @@
     img.alt = "";
     b.append(img, document.createTextNode(label));
     if (!p.complete) { const s = document.createElement("small"); s.textContent = "partial"; b.appendChild(s); }
+    const badge = document.createElement("span"); badge.className = "unread"; badge.hidden = true; badge.setAttribute("aria-label", "new message"); b.appendChild(badge);
     b.addEventListener("click", () => setPlatform(id));
     $("tabs").appendChild(b);
   }
@@ -1101,7 +1104,8 @@
     if (!PLAY || !panel.person || !current) return;
     const res = await fetch(BASE + "/api/person" + query());
     if (!res.ok) return;
-    const { now, contact, outbox } = await res.json();
+    const { now, contact, outbox, lastOut = {} } = await res.json();
+    markUnread(lastOut);
     const zone = contact?.timeZone;
     $("theirTime").textContent = zone ? at(now, zone) : at(now);
     $("theirZone").textContent = !contact ? "They have not written to the agent yet, so nudges to them are refused (unknown_person)."
@@ -1135,6 +1139,23 @@
     $("waiting").replaceChildren(...list);
     $("toQuietEnd").disabled = !quietEndsAt;
   }
+  // A new message on a channel not shown: a badge on its tab, until it is opened.
+  function markUnread(lastOut) {
+    const key = (ch) => `chinwag.seen.${person}.${ch}`;
+    for (const b of document.querySelectorAll(".tab")) {
+      const ch = b.dataset.id;
+      const times = lastOut[ch] ?? [];
+      const last = times.at(-1) ?? 0;
+      const badge = b.querySelector(".unread");
+      if (!badge) continue;
+      const stored = recall(key(ch));
+      if (ch === current.channel || stored === null) { remember(key(ch), String(last)); badge.hidden = true; continue; }
+      const unread = times.filter((t) => t > Number(stored)).length;
+      badge.hidden = unread === 0;
+      badge.textContent = unread > 9 ? "9+" : String(unread);
+    }
+  }
+
   function setNudgeKind(kind) {
     nudgeKind = kind;
     for (const b of document.querySelectorAll(".seg button")) b.setAttribute("aria-pressed", String(b.dataset.kind === kind));
