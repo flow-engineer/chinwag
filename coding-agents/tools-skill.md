@@ -34,7 +34,7 @@ export const findSlots = tool({
 - Key a person's data by `context.person` (who Chinwag verified they are) or `context.conversationId`,
   never by an id the model passed. `context.person` is `key:<resolve's value>`, else
   `phone:<E.164>` (`phone:+15550100100`), else `<channel>:<address>`. To look the person up in the
-  owner's backend use `context.key`: exactly what `resolve` returned (`mbr_maria`), or null when
+  owner's backend use `context.key`: exactly what `resolve` returned (`customer-7`), or null when
   they are known only by phone or channel.
 - A tool that changes something (books, pays, sends) passes `context.idempotencyKey` to its backend:
   it is the same for the same input in the same turn, also when the turn runs again after a
