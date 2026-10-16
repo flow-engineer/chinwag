@@ -569,5 +569,17 @@ test("chinwag show prints a run's record from the cloud with the CI key: checks 
     const missing = await cliStreams(["show", "trn_9", "--cloud", url], dir, key);
     assert.equal(missing.code, 1);
     assert.match(missing.stderr, /^The cloud answered 404 not_found: No such run\. No run trn_9 for this agent\.$/m);
+
+    // A watch link names its agent: it is read from a folder with no last session (CI, a teammate's
+    // link), and the key never goes to a host other than the configured cloud.
+    const fresh = agentDir();
+    asked.length = 0;
+    const linked = await cliStreams(["show", `${url}/agents/agt_1/tests/runs/trn_2`, "--json", "--cloud", url], fresh, key);
+    assert.equal(linked.code, 0, linked.out);
+    assert.equal(linked.stdout, JSON.stringify(record));
+    const elsewhere = await cliStreams(["show", "https://elsewhere.example/agents/agt_1/tests/runs/trn_2", "--cloud", url], fresh, key);
+    assert.equal(elsewhere.code, 1);
+    assert.match(elsewhere.stderr, new RegExp(`^That link is not on ${url}, the cloud chinwag show reads with your key`, "m"));
+    assert.deepEqual(asked, [{ path: "/v1/agents/agt_1/tests/runs/trn_2", authorization: "Bearer oci_test" }]);
   } finally { server.closeAllConnections(); server.close(); }
 });
