@@ -439,3 +439,71 @@ test("a reminder that can wait skips its runs in their quiet hours; a business s
   assert.ok(outcomes.some((o) => o === "skipped: their quiet hours"), outcomes.join(" | "));
   assert.ok(outcomes.some((o) => /^held: their quiet hours: moved to Tue 13 Oct 2026 07:00/.test(o)), outcomes.join(" | "));
 });
+
+// --- WhatsApp's closed window: the agent's template, else the fallback ---
+
+const WAITING: TemplateDefinition = { name: "message_waiting", language: "en", category: "utility", body: "You have a new message. Reply to see it." };
+const SHIPPED: TemplateDefinition = { name: "order_shipped", language: "en", category: "utility", body: "Hi {{1}}, your order {{2}} has shipped." };
+
+/** Sam on WhatsApp, last heard from 25 hours ago, with a fallback template. */
+async function samWindowClosed() {
+  const clock = { now: Date.UTC(2026, 9, 12, 16) };
+  const h = multi({ channels: { whatsapp: { info: { ...WHATSAPP, replyWindowHours: 24 }, phone: true } }, now: () => clock.now, templates: [WAITING, SHIPPED], fallbackTemplate: { name: "message_waiting" } });
+  const a = await h.message("whatsapp", SAM.address, "hi");
+  (await h.nextCall(0)).answer(respond(call("send_whatsapp", { text: "Hi!" })));
+  const conversation = h.agent.conversation(a!.conversationId)!;
+  await conversation.whenIdle();
+  clock.now += 25 * 3_600_000;
+  return { ...h, conversation, clock, to: { channel: "whatsapp", address: SAM.address } };
+}
+
+const templatesSent = (h: { out: Array<{ outbound: { type: string } }> }) => h.out.flatMap((o) => (o.outbound.type === "template" ? [(o.outbound as unknown as { name: string }).name] : []));
+
+test("past the window, the agent sends a template that says the nudge, filled in", async () => {
+  const h = await samWindowClosed();
+  const nudge = h.agent.nudge({ to: h.to, prompt: "Their order 1042 shipped" });
+  const turn = await h.nextCall(1);
+  assert.match(last(turn.request.messages).content, /window is closed[\s\S]*send_template/);
+  assert.ok(turn.request.tools.some((t) => t.name === "send_template" && !/message_waiting:/.test(t.description)), "the fallback is Chinwag's, not offered");
+  turn.answer(respond(call("send_template", { name: "order_shipped", body: ["Sam", "1042"] })));
+  (await h.nextCall(2)).answer(respond());
+  assert.equal((await nudge).status, "sent");
+  assert.deepEqual(templatesSent(h), ["order_shipped"]);
+});
+
+test("past the window with no template that fits, the fallback goes, the nudge waits for their reply, and template.missing says what", async () => {
+  const h = await samWindowClosed();
+  const nudge = h.agent.nudge({ to: h.to, prompt: "Their refund was approved" });
+  (await h.nextCall(1)).answer(respond());
+  const result = await nudge;
+  assert.deepEqual([result.status, result.reason], ["held", "window_closed"]);
+  await h.sentWhere((o) => o.outbound.type === "template");
+  assert.deepEqual(templatesSent(h), ["message_waiting"]);
+  assert.deepEqual(h.events.filter((e) => e.type === "template.missing").map((e) => e.prompt), ["Their refund was approved"]);
+
+  await h.message("whatsapp", SAM.address, "what's new?");
+  const { call: reply } = await h.callWith(2, (c) => JSON.stringify(c.request.messages).includes("Their refund was approved") && !/window is closed/.test(JSON.stringify(c.request.messages.at(-1))));
+  reply.answer(respond(call("send_whatsapp", { text: "Your refund was approved." })));
+  await h.conversation.whenIdle();
+  assert.equal((await h.agent.nudgeState(result.id))?.status, "sent");
+});
+
+test("a text nudge past the window sends the fallback at once and goes as written when they reply", async () => {
+  const h = await samWindowClosed();
+  const result = await h.agent.nudge({ to: h.to, text: "Your code is 4417" });
+  assert.deepEqual([result.status, result.reason], ["held", "window_closed"]);
+  await h.sentWhere((o) => o.outbound.type === "template");
+  assert.deepEqual(templatesSent(h), ["message_waiting"]);
+  assert.equal(h.calls.length, 1, "no model call");
+  await h.message("whatsapp", SAM.address, "ok?");
+  (await h.nextCall(1)).answer(respond(call("send_whatsapp", { text: "Here it is." })));
+  await h.sentWhere((o) => o.outbound.type === "message" && o.outbound.text === "Your code is 4417");
+  await h.conversation.whenIdle();
+  assert.equal((await h.agent.nudgeState(result.id))?.status, "sent");
+});
+
+test("a fallback template that is not declared, or needs values, throws at setup", () => {
+  assert.throws(() => multi({ channels: { whatsapp: { info: WHATSAPP, phone: true } }, templates: [WAITING], fallbackTemplate: { name: "nope" } }), /not one of the declared templates/);
+  assert.throws(() => multi({ channels: { whatsapp: { info: WHATSAPP, phone: true } }, templates: [SHIPPED], fallbackTemplate: { name: "order_shipped" } }), /body values/);
+});
+

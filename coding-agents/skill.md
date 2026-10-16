@@ -184,7 +184,11 @@ and QUIT, as some US carrier rules expect; `keywords: { stop: [...] }` sets your
 Messages the business starts are nudges: `agent.nudge({ to: { channel, address }, text })` sends
 as written; `prompt` instead lets the agent write it (or decide not to); `template` sends a
 WhatsApp template you already set up. Pass `idempotencyKey` when your system may retry, and `at`
-to send later. Outside WhatsApp's 24-hour window only templates go out (`outside_window`).
+to send later. Prefer `prompt`; use `text` only when the wording must be exact. Outside WhatsApp's
+24-hour window only templates go out: declare a `fallbackTemplate` ("You have a new message. Reply to
+see it.", no values) so a nudge is held until they reply instead of refused (`outside_window`); the
+agent may send a fitting template itself (`send_template`), and `template.missing` events say which
+messages want one. Held nudges (quiet hours, a closed window) settle as `held`, then `sent` or `expired`.
 
 When the owner's backend is a separate service, mount `nudgeHandler(agent, { token })` (from
 `chinwag`; a token of at least 32 characters, from a secret; `base` is `/nudges` by default) in the

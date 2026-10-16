@@ -110,6 +110,7 @@ export function multi(options: {
   defaultCountryCode?: string;
   intercept?: AgentOptions["intercept"];
   profile?: AgentOptions["profile"];
+  fallbackTemplate?: AgentOptions["fallbackTemplate"];
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
@@ -121,8 +122,19 @@ export function multi(options: {
     name,
     kind: "custom" as const,
     ...c,
-    send: (address: string, outbound: Outbound) => void out.push({ channel: name, address, outbound }),
+    send: (address: string, outbound: Outbound) => {
+      out.push({ channel: name, address, outbound });
+      for (const w of waiting.splice(0)) (w.test() ? w.resolve() : waiting.push(w));
+    },
   }));
+  const waiting: Array<{ test: () => boolean; resolve: () => void }> = [];
+  /** Resolves once something sent so far passes `test` (a gate on the channels' sends). */
+  const sentWhere = (test: (o: (typeof out)[number]) => boolean) =>
+    new Promise<void>((resolve) => {
+      const check = () => out.some(test);
+      if (check()) resolve();
+      else waiting.push({ test: check, resolve });
+    });
   const agent = createAgent({
     dir,
     model: scripted.model,
@@ -141,6 +153,7 @@ export function multi(options: {
     defaultCountryCode: options.defaultCountryCode,
     intercept: options.intercept,
     profile: options.profile,
+    fallbackTemplate: options.fallbackTemplate,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>
@@ -153,5 +166,5 @@ export function multi(options: {
       if (test(c)) return { call: c, index: i };
     }
   }
-  return { agent, out, texts, message, events, callWith, dir, database, ...scripted };
+  return { agent, out, texts, message, events, callWith, dir, database, sentWhere, ...scripted };
 }

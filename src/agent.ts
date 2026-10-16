@@ -114,6 +114,13 @@ export interface AgentOptions {
    */
   defaultCountryCode?: string;
   /**
+   * The template sent when a nudge meets someone's closed WhatsApp window and no other template fits
+   * ("You have a new message"): the nudge is then held until they reply, and a `template.missing`
+   * event says which message wanted a template of its own. Declare it in `templates`. Without it a
+   * nudge outside the window is refused (outside_window), as before.
+   */
+  fallbackTemplate?: Template;
+  /**
    * Quiet hours in each person's own time ("22:00" to "07:00", the default), when what the business
    * starts waits: a nudge is held until they end (or the person writes), then the agent writes one
    * message for everything held. A person may set their own; `false` turns them off. They apply only
@@ -269,6 +276,11 @@ export class Agent {
     this.channelsByName = new Map((options.channels ?? []).map((c) => [c.name, c]));
     if (this.channelsByName.size !== (options.channels ?? []).length) throw new Error("chinwag: two channels have the same name");
     this.now = options.now ?? Date.now;
+    if (options.fallbackTemplate) {
+      const declared = declaredTemplate(options.templates, options.fallbackTemplate);
+      if (!declared) throw new Error(`chinwag: fallbackTemplate ${options.fallbackTemplate.name} is not one of the declared templates`);
+      fillTemplate(declared, options.fallbackTemplate);
+    }
     if (options.quietHours && !validQuietHours(options.quietHours)) throw new Error('chinwag: quietHours is { from: "HH:MM", to: "HH:MM" }');
     if (options.defaultCountryCode !== undefined && !/^\+?[1-9]\d{0,2}$/.test(options.defaultCountryCode.trim())) throw new Error(`chinwag: defaultCountryCode is a calling code such as "+91", not "${options.defaultCountryCode}"`);
     this.countryCode = options.defaultCountryCode?.trim().replace(/^\+/, "");
@@ -311,6 +323,8 @@ export class Agent {
       timeZone: options.timeZone,
       quietHours: options.quietHours,
       templates: options.templates ?? [],
+      fallbackTemplate: options.fallbackTemplate?.name,
+      windowClosed: (nudge, to) => this.windowClosed(nudge, to),
       tagChannels: (options.channels ?? []).length > 1,
       links: (id) => this.links(id),
       settle: (target, status, reason) => this.settle(target, status, reason),
@@ -369,8 +383,10 @@ export class Agent {
         await this.settle({ nudge: n.id }, "expired", "held past its expiresAt for their quiet hours");
         continue;
       }
-      if (!writer && (body.holdUntil ?? 0) > now) continue;
-      const inbox = await this.store.releaseNudge(n);
+      // Held for a closed window (no holdUntil), it waits for their reply.
+      if (!writer && (body.holdUntil ?? Infinity) > now) continue;
+      // Released because they just wrote: their window is open, though their message may not have landed yet.
+      const inbox = await this.store.releaseNudge(writer ? { ...n, body: { ...n.body, theyWrote: true } } : n);
       if (inbox !== null) this.wake(n.conversationId, inbox);
     }
   }
@@ -692,6 +708,22 @@ export class Agent {
     };
   }
 
+  /** A window-closed prompt nudge got no template from the agent: held until they reply, and the fallback goes now. */
+  private async windowClosed(nudge: string, to: { channel: string; address: string }): Promise<void> {
+    const row = await this.store.nudge(nudge);
+    if (!row) return;
+    const { windowClosed: _closed, ...body } = row.body;
+    await this.store.holdNudge(nudge, body, "window_closed");
+    this.release(nudge, this.result(nudge, "held", "window_closed"));
+    await this.sendFallback(row.conversationId, to, nudge, body);
+  }
+
+  /** The fallback template for a held nudge, once, and the event that says it wanted a template of its own. */
+  private async sendFallback(conversationId: string, to: { channel: string; address: string }, nudge: string, body: Record<string, unknown>): Promise<void> {
+    this.settings.emit(conversationId, "template.missing", { nudge, channel: to.channel, ...(body.text !== undefined ? { text: body.text } : { prompt: body.prompt }) });
+    await this.recordNudge({ to, template: this.options.fallbackTemplate!, idempotencyKey: `fallback:${nudge}` });
+  }
+
   /** Whether the agent has a profile (get_user_profile), so the test cloud knows to play it. */
   hasProfile(): boolean {
     return this.options.profile !== undefined;
@@ -755,7 +787,16 @@ export class Agent {
       return typeof added === "number" ? { id, status: "held", reason: "quiet_hours" } : added;
     }
     if (!input.template && windowClosed({ info: this.infoOf(input.to.channel, conversationId), lastMessageAt: identity.lastMessageAt }, this.now())) {
-      return settledAs({ ...record, body, status: "refused", reason: "outside_window" });
+      if (!this.options.fallbackTemplate) return settledAs({ ...record, body, status: "refused", reason: "outside_window" });
+      if (input.text !== undefined) {
+        // Exact wording: it waits for their reply, and the fallback tells them something is waiting.
+        const added = await add({ ...record, body: { ...body, expiresAt: input.expiresAt ?? now + DAY_MS }, status: "held", reason: "window_closed" });
+        if (typeof added !== "number") return added;
+        await this.sendFallback(conversationId, input.to, id, body);
+        return { id, status: "held", reason: "window_closed" };
+      }
+      // A prompt nudge: the agent may find a template that says it; else the fallback (windowClosed below).
+      Object.assign(body, { windowClosed: true, expiresAt: input.expiresAt ?? now + DAY_MS });
     }
     const added = await add({ ...record, body, status: "queued" });
     if (typeof added !== "number") return added;

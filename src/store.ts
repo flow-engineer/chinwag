@@ -493,7 +493,12 @@ export class Store {
     });
   }
 
-  /** Nudges held for quiet hours, for one conversation or every one. */
+  /** A nudge waits after all (their WhatsApp window is closed): held, with what its release needs. */
+  async holdNudge(id: string, body: Record<string, unknown>, reason: string): Promise<void> {
+    await this.db.run("UPDATE nudges SET status = 'held', reason = ?, body = ? WHERE agent_id = ? AND id = ?", [reason, json(body), this.agentId, id]);
+  }
+
+  /** Nudges held for quiet hours or a closed window, for one conversation or every one. */
   async heldNudges(conversationId?: string): Promise<NudgeRow[]> {
     const rows = conversationId
       ? await this.db.query("SELECT * FROM nudges WHERE agent_id = ? AND status = 'held' AND conversation_id = ? ORDER BY created_at", [this.agentId, conversationId])

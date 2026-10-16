@@ -229,7 +229,30 @@ Built in, so you don't write them as tools:
 await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt: "Their order is ready for pickup." });
 ```
 
-`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped, and outside WhatsApp's 24-hour window only templates go out. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
+`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed`, `scheduled`, `held` or `expired` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
+
+Prefer `prompt`: the agent writes it in the context of the chat, in their language, and may hold back what no longer fits. Use `text` only where the wording must be exact (a code, a legal notice), and `template` for campaigns and notifications you set up with Meta, which go as they are.
+
+### WhatsApp's 24-hour window
+
+Outside it, WhatsApp delivers only templates. Declare a fallback, a template with no values that says something is waiting ("You have a new message. Reply to see it."), and a nudge still reaches the person:
+
+```ts
+createAgent({
+  // ...
+  templates: [
+    { name: "message_waiting", language: "en", category: "utility", body: "You have a new message. Reply to see it." },
+    { name: "order_shipped", language: "en", category: "utility", body: "Hi {{1}}, your order {{2}} has shipped." },
+  ],
+  fallbackTemplate: { name: "message_waiting" },
+});
+```
+
+- **A `prompt` nudge**: the agent is told the window is closed and may send one of your templates that says the same thing, its values filled in (`send_template`, built in).
+- **When none fits** (or for a `text` nudge), Chinwag sends the fallback, and the nudge is held (`held`, `window_closed`) until they reply, when the agent tells them (or the text goes as written). Past its `expiresAt` (24 hours by default) it expires.
+- **Each fallback emits a `template.missing` event** with what the nudge said: the messages worth a template of their own.
+
+Without a fallback, a `text` or `prompt` nudge outside the window is refused (`outside_window`). A template nudge always goes as it is. Meta decides each template's category from its text and may charge or limit it as marketing: check yours.
 
 ### Quiet hours
 
@@ -487,6 +510,7 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `database` | Where state lives (`sqlite()` in memory by default) |
 | `store` | Instead of `database`: a store of your own that keeps the state elsewhere |
 | `testPeople` | Who the playground may play: `[{ name, phone }]` |
+| `fallbackTemplate` | The declared template sent when a nudge meets a closed WhatsApp window and no other fits; the nudge then waits for their reply (see [WhatsApp's 24-hour window](#whatsapps-24-hour-window)) |
 | `templates` | The WhatsApp templates you set up with Meta (header, body, footer, buttons): each send is checked against its declaration, and the playground shows it as WhatsApp does |
 | `transcribe` | Speech to text for voice notes, with the provider you choose |
 | `context` | Small facts added to the system prompt at every turn; it runs before every reply, so keep lookups out of it (see [What the agent knows about the person](#what-the-agent-knows-about-the-person)) |
