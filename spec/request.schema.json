@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/flow-engineer/chinwag/blob/main/spec/request.schema.json",
+  "title": "AgentRequest",
+  "description": "One of the person's messages, as `chinwag test --agent-url` POSTs it to the agent's endpoint. This schema lists exactly what this version sends (additionalProperties is false so it stays exact); later versions may add optional fields, so an endpoint should ignore fields it does not know rather than validate requests strictly against this file.",
+  "type": "object",
+  "required": [
+    "conversationId",
+    "messageId",
+    "channel",
+    "message"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "conversationId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The conversation, as a phone number or chat would be: keep the history by it. In a test run it is \"<platform>:<session>.<scenario>.<platform>.<run>\", such as \"whatsapp:ses_8f2a.opening-hours.whatsapp.1\"."
+    },
+    "messageId": {
+      "type": "string",
+      "description": "The id this message has in the conversation (m1, m2, ...): what a reply's `replyTo`, a reaction's `messageId` or a read's `messageIds` names."
+    },
+    "channel": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The platform the run plays (whatsapp, sms, imessage, telegram, web), or the name given with --channel."
+    },
+    "message": {
+      "$ref": "#/$defs/message"
+    }
+  },
+  "$defs": {
+    "message": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "What the person wrote; \"\" when they only sent a file (then it is the file's caption, if any)."
+        },
+        "replyTo": {
+          "type": "object",
+          "description": "The message they replied to (theirs or the agent's), quoted.",
+          "required": [
+            "text",
+            "fromAgent"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "fromAgent": {
+              "type": "boolean",
+              "description": "true when the quoted message is the agent's."
+            }
+          }
+        },
+        "choice": {
+          "type": "object",
+          "description": "They tapped a button or picked a list row rather than typing.",
+          "required": [
+            "title"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "The list row's id, when it has one."
+            },
+            "title": {
+              "type": "string"
+            }
+          }
+        },
+        "attachments": {
+          "type": "array",
+          "description": "Photos, voice notes and documents sent with the message.",
+          "items": {
+            "$ref": "#/$defs/attachment"
+          }
+        }
+      }
+    },
+    "attachment": {
+      "type": "object",
+      "required": [
+        "kind",
+        "mime",
+        "data"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "image",
+            "audio",
+            "document"
+          ]
+        },
+        "mime": {
+          "type": "string",
+          "description": "Such as image/jpeg, audio/ogg, application/pdf."
+        },
+        "name": {
+          "type": "string",
+          "description": "The file name, when the platform gives one (documents)."
+        },
+        "data": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The file's bytes, base64 (standard alphabet, with padding)."
+        }
+      }
+    }
+  }
+}

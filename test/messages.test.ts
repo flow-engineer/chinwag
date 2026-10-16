@@ -1,9 +1,9 @@
-// covers: src/conversation.ts src/talk.ts
+// covers: src/conversation.ts src/talk.ts src/agent.ts src/store.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
 import { tool } from "../src/index.ts";
-import { WEB, WHATSAPP, call, harness, last, respond, say, users } from "./helpers.ts";
+import { SMS, WEB, WHATSAPP, call, harness, last, multi, respond, say, users } from "./helpers.ts";
 
 test("the person's messages carry ids the agent can react to", async () => {
   const h = harness();
@@ -98,4 +98,65 @@ test("a reaction from the person is noted for the next turn without starting one
   assert.deepEqual(users(second.request.messages).slice(-2), ['[They reacted ❤️ to your message: "Anytime!"]', "[m2] one more thing"]);
   second.answer(respond(say("Sure, go ahead.")));
   await h.agent.conversation("w4")!.whenIdle();
+});
+
+test("a message the provider sends again (a webhook retried) is taken once; the same id from someone else, or on another channel, is new", async () => {
+  const h = multi({ channels: { sms: { info: SMS, phone: true }, whatsapp: { info: WHATSAPP, phone: true } } });
+  const first = { channel: "sms", from: "+15550100100", message: "first", messageId: "SM9f2c" };
+  const [a, b] = await Promise.all([h.agent.message(first), h.agent.message(first)]);
+  assert.deepEqual(a, b);
+  const turn = await h.nextCall(0);
+  assert.deepEqual(users(turn.request.messages), ["[sms · SM9f2c] first"]);
+  turn.answer(respond(call("send_sms", { text: "Got it." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  await h.agent.message(first);
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.equal(h.calls.length, 1, "no turn for the repeat");
+  assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2);
+
+  // Some providers number messages per chat, so the same id from someone else is a new message.
+  const other = await h.agent.message({ ...first, from: "+15550100200" });
+  assert.notEqual(other!.conversationId, a!.conversationId);
+  assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2, "not taken as a repeat");
+  const theirs = await h.nextCall(1);
+  assert.deepEqual(users(theirs.request.messages), ["[sms · SM9f2c] first"]);
+  theirs.answer(respond(call("send_sms", { text: "Got it." })));
+  await h.agent.conversation(other!.conversationId)!.whenIdle();
+
+  const sameId = await h.agent.message({ channel: "whatsapp", from: "15550100100", message: "second", messageId: "SM9f2c" });
+  assert.equal(sameId!.conversationId, a!.conversationId);
+  assert.equal(h.events.filter((e) => e.type === "message.duplicate").length, 2, "not taken as a repeat");
+  const next = await h.nextCall(2);
+  assert.match(users(next.request.messages).at(-1)!, /^\[whatsapp · SM9f2c\] second$/);
+  next.answer(respond(call("send_whatsapp", { text: "Got that too." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+});
+
+test("a long conversation sends the model only its latest messages that fit", async () => {
+  const report = tool({ name: "report", description: "", input: z.object({}), run: () => "x".repeat(5_000) });
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, tools: [report], history: { maxTokens: 5_000, toolResultChars: 1_000 } });
+  const a = await h.message("sms", "+15550100100", "I'm Sam, allergic to nuts");
+  (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Noted, Sam." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  for (let i = 0; i < 8; i++) {
+    await h.message("sms", "+15550100100", `${i}: ${"a long story ".repeat(120)}`);
+    (await h.nextCall(1 + i)).answer(respond(call("send_sms", { text: "Mm." })));
+    await h.agent.conversation(a!.conversationId)!.whenIdle();
+  }
+  await h.message("sms", "+15550100100", "what can I eat?");
+  const ask = await h.nextCall(9);
+  const sent = ask.request.messages;
+  assert.match(sent[0].role === "user" ? sent[0].content : "", /^\[Chinwag\] Older messages of this conversation are no longer shown to you\.$/);
+  assert.equal(sent[1].role, "user", "it starts at the start of an entry, never at a tool result");
+  assert.ok(!sent.some((m) => m.role === "user" && m.content.includes("allergic")), "the first message is left out");
+  assert.match(users(sent).at(-1)!, /what can I eat\?$/);
+  const chars = ask.request.system.length + JSON.stringify(ask.request.tools).length + sent.reduce((n, m) => n + (m.content?.length ?? 0) + (m.role === "assistant" ? JSON.stringify(m.toolCalls ?? []).length : 0), 0);
+  assert.ok(chars / 3 <= 5_000, `within the budget (${Math.round(chars / 3)} tokens)`);
+  assert.ok(h.events.some((e) => e.type === "history.trimmed"));
+
+  ask.answer(respond(call("send_sms", { text: "Checking." }), call("report")));
+  const result = await h.nextCall(10);
+  assert.match(last(result.request.messages).content, /^x{1000}\n\[Chinwag\] Cut: the result was 5000 characters; only the first 1000 are shown\.$/);
+  result.answer(respond(call("send_sms", { text: "Anything without nuts." })));
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
 });

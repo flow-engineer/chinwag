@@ -14,6 +14,8 @@ export interface OpenAICompatibleOptions {
   images?: boolean;
   /** The model reads PDFs (file parts). Default true on OpenRouter, which reads them for any model; false elsewhere. */
   pdfs?: boolean;
+  /** Its context window in tokens, so the history sent is kept within it. */
+  contextTokens?: number;
 }
 
 /** The first of these with a value is the agent's model. `MODEL` overrides that provider's default id. */
@@ -38,14 +40,20 @@ export function openAICompatible(options: OpenAICompatibleOptions = {}): Model {
   // An explicit key or address is that provider. Otherwise the first key in the environment wins.
   const fromEnv = options.apiKey !== undefined || options.baseURL !== undefined ? undefined : modelFromKeys(process.env);
   const baseURL = options.baseURL ?? fromEnv?.baseURL ?? KEYS[0].baseURL;
+  const apiKey = options.apiKey ?? fromEnv?.apiKey ?? (process.env.OPENROUTER_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim());
+  // A server at a base URL you name (a local one) may need no key; the client still sends one.
+  if (!apiKey && options.baseURL === undefined) {
+    throw new Error(`No model key: set one of ${KEYS.map((k) => k.env).join(", ")} (in the agent's .env), or pass apiKey, or baseURL for a server that needs none.`);
+  }
   const client = new OpenAI({
-    apiKey: options.apiKey ?? fromEnv?.apiKey ?? process.env.OPENROUTER_API_KEY,
+    apiKey: apiKey || "none",
     baseURL,
     maxRetries: 1,
   });
   const model = options.model?.trim() || fromEnv?.model || KEYS[0].model;
   return {
     reads: { images: options.images ?? true, pdfs: options.pdfs ?? baseURL.startsWith("https://openrouter.ai/") },
+    ...(options.contextTokens ? { contextTokens: options.contextTokens } : {}),
     async complete(request: ModelRequest): Promise<ModelResponse> {
       const completion = await client.chat.completions.create(
         {

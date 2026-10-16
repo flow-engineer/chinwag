@@ -6,7 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { ScheduleRow, StoreApi } from "./store.ts";
+import type { NewSchedule, ScheduleRow, StoreApi } from "./store.ts";
 import { DAY_INDEX, clock, date, describe, endOfLocalDay, formatLocal, isBareUtc, localDate, localToUtc, nextRun, parts, validZone, type Rule } from "./time.ts";
 import { tool, type Tool } from "./tools.ts";
 
@@ -176,10 +176,9 @@ function ruleOf(input: z.infer<typeof scheduleInput>, zone: string, now: number)
 }
 
 /** A scheduled message from the business (a nudge with a time): fixed text, or an instruction. */
-export async function addBusinessSchedule(store: StoreApi, conversationId: string, channel: string, at: number, zone: string, body: { text?: string; prompt?: string }): Promise<string> {
-  const id = `s_${randomUUID().slice(0, 8)}`;
-  await store.addSchedule({
-    id,
+export function businessSchedule(conversationId: string, channel: string, at: number, zone: string, body: { text?: string; prompt?: string }): NewSchedule {
+  return {
+    id: `s_${randomUUID().slice(0, 8)}`,
     conversationId,
     channel,
     instruction: body.text ?? body.prompt ?? "",
@@ -191,8 +190,7 @@ export async function addBusinessSchedule(store: StoreApi, conversationId: strin
     maxRuns: null,
     endsOn: null,
     origin: "api",
-  });
-  return id;
+  };
 }
 
 /** What one due run becomes in the conversation's inbox. */

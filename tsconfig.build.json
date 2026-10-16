@@ -14,6 +14,7 @@
     "testing/src/index.ts",
     "testing/src/client.ts",
     "testing/src/http-agent.ts",
+    "testing/src/check-endpoint.ts",
     "testing/src/cli.ts",
     "testing/src/new.ts",
     "testing/src/suite.ts",

@@ -19,8 +19,12 @@ tool, and `chinwag-tests` (`test-skill.md`) before writing or changing a test.
 example: a complete agent with tools and tests that depends on the `chinwag` package and imports
 `chinwag` and `chinwag/simulators`, with these skills in `.claude/skills/`. Run `npm install` there.
 Build in it, changing Pip's prompt, skills, tools and tests into yours. The owner copies
-`.env.example` to `.env` and puts `OPENROUTER_API_KEY` in it (never read or print it), then
-`npm start` opens the playground; `npm run typecheck` checks the types.
+`.env.example` to `.env` and puts one model key in it (never read or print it). Chinwag does not
+issue that key; it is made at the provider: `OPENROUTER_API_KEY` at https://openrouter.ai/keys,
+`OPENAI_API_KEY` at https://platform.openai.com/api-keys, `ANTHROPIC_API_KEY` at
+https://console.anthropic.com/settings/keys, or `GEMINI_API_KEY` at https://aistudio.google.com/apikey.
+The first one with a value is used, and `CAFE_MODEL` sets the café's model id. Then `npm start`
+opens the playground; `npm run typecheck` checks the types.
 
 Inside a clone of Chinwag itself, `npm run new -- <name>` copies the café to `agents/<name>/`
 instead (git-ignored, so it never collides with a pull). Its imports of `../../../src/` and
@@ -80,8 +84,10 @@ background (set a tool's own `deadlineMs` for a known-slow one); `partialAfterMs
 is how long a finished tool's result waits for the others of its response; `shareUpdates` turns live status lines on web and app UIs off, or replaces their
 guidance with a string.
 
-Models are reached through any OpenAI-compatible API; `openAICompatible` defaults to OpenRouter
-and reads `OPENROUTER_API_KEY`.
+Models are reached through any OpenAI-compatible API. `openAICompatible()` with no key reads the
+first of `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` that has a
+value, and uses that provider's default model (`MODEL` overrides it). With none it stops at once and
+names them. Pass `apiKey` and `baseURL` for anywhere else (`baseURL` alone for a local server that needs no key).
 
 Which model: recommend Claude Haiku 5.5 (`anthropic/claude-haiku-5.5`, the default above) or OpenAI
 GPT-6.1 Sol (`openai/gpt-6.1-sol`, about 3x the cost, the most exact). If the owner asks for Luna
@@ -137,7 +143,8 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   (`{ ..., app_link }`), and the agent only passes it on.
 - One person is one conversation across every channel they use. Channels are joined only by what
   each verified: your `resolve` key, else the same phone number on channels marked `phone`. Never
-  join people any other way.
+  join people any other way. When the SMS provider gives national numbers, set
+  `defaultCountryCode` ("+91") so they match the full number WhatsApp gives.
 - With several channels the agent gets a send tool per channel (`send_sms`, `send_web`) and
   answers each message where it came. Don't add your own.
 - After a restart, `resume()` carries on: cut-off turns run again, background tools that were
@@ -155,7 +162,12 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 
 Built in, so don't build them as tools: scheduled messages (`schedule_message`, `list_scheduled`,
 `cancel_scheduled`, in the person's local time), and what a person asked not to be messaged about
-(`add_no_contact`, `remove_no_contact`).
+(`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
+`whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
+no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
+SMS takes only STOP by default; the words carriers or regulators expect differ by country, so
+check the market's rules (`keywords: US_CARRIER_KEYWORDS` adds STOPALL, UNSUBSCRIBE, CANCEL, END
+and QUIT, as some US carrier rules expect; `keywords: { stop: [...] }` sets your own).
 
 Messages the business starts are nudges: `agent.nudge({ to: { channel, address }, text })` sends
 as written; `prompt` instead lets the agent write it (or decide not to); `template` sends a
@@ -219,7 +231,7 @@ import { buildAgent } from "./agent.ts";
 
 const play = simulators({ title: "My agent" });
 const agent = buildAgent({ events: [play.events] });
-await play.listen(agent, 8788);           // 127.0.0.1 only; no token needed there
+await play.listen(agent, 8788);           // 127.0.0.1 only, its own page only; no token needed there
 ```
 
 Open the printed link, pick a test person and a channel, and chat; `/person` shows every channel
@@ -252,17 +264,18 @@ message is logged with the person, channel, time and address.
 
 ## Send traces to a dashboard
 
-Every turn can go to a traces endpoint (OTLP/JSON, posted to `<url>/v1/traces`) as a trace, so
-playground and real chats show up in your dashboard and can be graded. No code: set these in the
-agent's environment (the key and the URL come from your traces endpoint):
+Every turn can go to a traces endpoint as an OTLP/JSON trace, posted to `<url>/v1/traces`, so
+playground and real chats show up in a dashboard and can be graded. No code: set these in the
+agent's environment. The address is https://flow.engineer/observe unless `CHINWAG_TRACES_URL`
+names another; the trace key is made on that same site (never print it):
 
 ```sh
 CHINWAG_TRACES_KEY=...
-CHINWAG_TRACES_URL=https://...   # your traces endpoint's URL; required with the key
-CHINWAG_TRACES_CONTENT=1         # send what was written; without it, metadata only
+CHINWAG_TRACES_URL=https://flow.engineer/observe   # the default; set it only to send them elsewhere
+CHINWAG_TRACES_CONTENT=1                           # send what was written; without it, metadata only
 ```
 
-A key without a URL stops the agent at startup. Without `CHINWAG_TRACES_CONTENT=1` the dashboard
+Without `CHINWAG_TRACES_CONTENT=1` the dashboard
 gets ids, timing, model calls and tool names but no messages, so nothing to show or grade. Or in
 code: `createAgent({ ..., traces: { url, key, content: true, version: "v3" } })`. Traces are sent in the
 background after each turn and a failed send is dropped (logged once), so a dashboard outage never

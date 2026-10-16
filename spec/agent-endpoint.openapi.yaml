@@ -1,0 +1,148 @@
+openapi: 3.1.0
+info:
+  title: Chinwag agent endpoint
+  version: 0.1.0
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    The HTTP endpoint an agent on any framework, in any language, exposes so Chinwag's test suite
+    can talk to it: `chinwag test --agent-url <url>`. Implement this one operation and the test
+    cloud's simulated people can chat with your agent; `chinwag check-endpoint <url>` checks an
+    implementation against this file without a cloud, a key or a model call.
+
+    How a run uses it:
+    - Each of the person's messages is one POST to the URL you give, from the machine running
+      `chinwag test` (so `http://localhost` works and the agent never has to be reachable from the
+      internet). The path is yours; `/chinwag` is the examples'.
+    - A conversation's messages are sent one at a time, in order: the next is POSTed once the last
+      one's answer is in. Different conversations may be in flight at once.
+    - Keep each conversation's history by `conversationId`, as you would per phone number. The
+      request carries only the new message.
+    - Ignore request fields you do not know: later versions may add optional ones. The request
+      schema is exact for this version; do not reject requests that have more.
+    - Answer with status 200 and `{ "replies": [...] }`, the replies to send in order, in the same
+      HTTP response. `{ "replies": [] }` sends nothing (not 204, not an empty body). Answering
+      later, through a callback, is not supported.
+    - Your agent's own tools run on its side, for real: the suite's `tests/tools/*.yaml` simulators
+      are not used, and outcome checks see no tool calls, so write what must be true as `judge`
+      items.
+    - The person's reactions to the agent's messages are not sent in this version.
+
+    What fails a message's turn (the run records why and goes on to the next message):
+    - any status other than 200 (redirects are followed; the final status counts), with the
+      first 200 characters of the body in the reason;
+    - a 200 whose body is not JSON, or has no `replies` array;
+    - no answer within the timeout: 60 seconds by default, `--agent-timeout <s>` to change it;
+    - the URL cannot be reached.
+
+    A reply that is valid JSON but does not fit the run's platform (buttons on SMS, text over its
+    maxLength, an unknown key) is not sent; the run says why and the other replies still go.
+    `x-chinwag-platforms` below lists what each platform shows.
+servers:
+  - url: http://localhost:3000
+    description: Wherever your agent listens; `chinwag test --agent-url` takes the full URL.
+security:
+  - {}
+  - bearer: []
+paths:
+  /chinwag:
+    post:
+      operationId: receiveMessage
+      summary: One message from the person; answer with the replies to send.
+      description: |
+        Sent with `content-type: application/json`. When CHINWAG_AGENT_TOKEN is set where
+        `chinwag test` runs, every request carries `authorization: Bearer <token>`: check it, and
+        answer 401 to anything else.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./request.schema.json
+            examples:
+              text:
+                summary: A typed message
+                value:
+                  conversationId: whatsapp:ses_8f2a.opening-hours.whatsapp.1
+                  messageId: m1
+                  channel: whatsapp
+                  message: { text: "hi, what time are you open today?" }
+              photo:
+                summary: A photo with no caption
+                value:
+                  conversationId: whatsapp:ses_8f2a.receipt.whatsapp.1
+                  messageId: m2
+                  channel: whatsapp
+                  message:
+                    text: ""
+                    attachments: [{ kind: image, mime: image/png, name: receipt.png, data: iVBORw0KGgo= }]
+              tap:
+                summary: A tapped button, replying to the agent's message
+                value:
+                  conversationId: whatsapp:ses_8f2a.order.whatsapp.1
+                  messageId: m3
+                  channel: whatsapp
+                  message:
+                    text: Oat
+                    choice: { title: Oat }
+                    replyTo: { text: "Which milk?", fromAgent: true }
+      responses:
+        "200":
+          description: The replies to send, in order; `[]` is no reply.
+          content:
+            application/json:
+              schema:
+                $ref: ./response.schema.json
+              examples:
+                answer:
+                  value:
+                    replies:
+                      - { type: reaction, emoji: "👍", messageId: m1 }
+                      - { type: message, text: "We're open 8am to 6pm today.", buttons: [Order ahead] }
+                nothing:
+                  value: { replies: [] }
+        default:
+          description: Any other status fails this message's turn; the body's first 200 characters are the reason shown in the run.
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: The value of CHINWAG_AGENT_TOKEN, when it is set where `chinwag test` runs.
+# What each platform a run plays shows, as ChannelInfo in src/types.ts: a reply is checked against
+# its run's platform. A key that is absent means the platform does not have that feature. maxLength
+# absent is 4,000. Kept in step with simulators/src/platforms.ts by test/check-endpoint.test.ts.
+x-chinwag-platforms:
+  sms:
+    reactions: false
+    status: false
+    formatting: plain
+    maxLength: 1530
+  whatsapp:
+    reactions: true
+    status: false
+    formatting: whatsapp
+    maxLength: 4096
+    replies: true
+    buttons: { max: 3, labelMax: 20 }
+    lists: { maxRows: 10, titleMax: 24, buttonMax: 20 }
+    linkButton: { labelMax: 20 }
+    images: { captionMax: 1024 }
+    readReceipts: true
+  imessage:
+    reactions: true
+    status: false
+    formatting: plain
+    images: { captionMax: 4000 }
+  telegram:
+    reactions: true
+    status: false
+    formatting: markdown
+    images: { captionMax: 1024 }
+  web:
+    reactions: true
+    status: true
+    formatting: markdown
+    linkButton: { labelMax: 20 }
+    images: { captionMax: 4000 }

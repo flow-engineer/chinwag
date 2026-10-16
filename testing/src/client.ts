@@ -31,8 +31,8 @@ export interface ConnectOptions {
   openHeaders?: Record<string, string>;
   /** Called as each run finishes, before the session's summary. An older cloud sends none. */
   onRun?: (run: RunSummary) => void;
-  /** Called once the session has a dashboard link. */
-  onDashboard?: (url: string) => void;
+  /** Called once the session has opened, with its dashboard link and its id. */
+  onDashboard?: (url: string, sessionId: string) => void;
   /** How long one POST waits before the size allowance. Default 30s, plus 1s per 100KB of body. A tool call waits {@link CLOUD_MODEL_BUDGET_MS} plus the simulator's latency, unless this is set. */
   postTimeoutMs?: number;
   /** How long the stream may sit with no bytes, including the cloud's 15s ping. Default 45s. */
@@ -373,7 +373,7 @@ async function playSession(options: ConnectOptions, only?: RunKey[]): Promise<Se
   }
   log(`Session ${opened.sessionId}: suite ${suiteHash(options.files).slice(0, 12)}, ${options.files.length} files (${uploads.length} uploaded).`);
   dashboard = opened.dashboard;
-  options.onDashboard?.(dashboard);
+  options.onDashboard?.(dashboard, opened.sessionId);
   log(`Watch it: ${opened.dashboard}`);
   session = `${tunnel}/api/sessions/${opened.sessionId}`;
 

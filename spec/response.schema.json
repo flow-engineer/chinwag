@@ -1,0 +1,284 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/flow-engineer/chinwag/blob/main/spec/response.schema.json",
+  "title": "AgentResponse",
+  "description": "The agent's answer to one message: status 200, content-type application/json, the replies to send, in order. An empty list sends nothing. Keys other than `replies` are ignored.",
+  "type": "object",
+  "required": [
+    "replies"
+  ],
+  "properties": {
+    "replies": {
+      "type": "array",
+      "description": "Sent to the person one after another. Each is checked on its own against what the run's platform can show (see x-chinwag-platforms in agent-endpoint.openapi.yaml): one that does not fit is not sent and the run says why; the others still go.",
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/message"
+          },
+          {
+            "$ref": "#/$defs/read"
+          },
+          {
+            "$ref": "#/$defs/reaction"
+          },
+          {
+            "$ref": "#/$defs/template"
+          },
+          {
+            "$ref": "#/$defs/status"
+          },
+          {
+            "$ref": "#/$defs/typing"
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "message": {
+      "description": "A message to the person. Only the keys below: any other key is refused as something the platform does not show. Not allowed together: `link` with `buttons` or `list`; `image` with `list`. With `image`, `text` is its caption.",
+      "type": "object",
+      "required": [
+        "type",
+        "text"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "message"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "At most the platform's maxLength (4,000 where it sets none)."
+        },
+        "replyTo": {
+          "type": "string",
+          "description": "Quote one of the person's messages, by its messageId (such as m3). Platforms with replies only."
+        },
+        "buttons": {
+          "type": "array",
+          "description": "Reply buttons; a tap comes back as the person's message, with `choice`. Platforms with buttons only, within their max and labelMax.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "list": {
+          "type": "object",
+          "description": "A list the person picks one row from; the pick comes back with `choice`. Platforms with lists only, within their maxRows, titleMax and buttonMax.",
+          "required": [
+            "button",
+            "rows"
+          ],
+          "properties": {
+            "button": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The label that opens the list."
+            },
+            "rows": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "title"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 72
+                  }
+                }
+              }
+            }
+          }
+        },
+        "link": {
+          "type": "object",
+          "description": "A page by https URL: a button where the platform has linkButton (label within its labelMax), else the URL goes on a line after the text (label at most 20 characters).",
+          "required": [
+            "label",
+            "url"
+          ],
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1
+            },
+            "url": {
+              "type": "string",
+              "pattern": "^https://[^\\s/?#]+"
+            }
+          }
+        },
+        "image": {
+          "type": "object",
+          "description": "A photo by https URL, `text` its caption (within the platform's captionMax). Where the platform has no images, the text goes alone.",
+          "required": [
+            "url"
+          ],
+          "properties": {
+            "url": {
+              "type": "string",
+              "pattern": "^https://[^\\s/?#]+"
+            }
+          }
+        },
+        "fields": {
+          "type": "object",
+          "description": "The channel's own parameters, passed on as they are."
+        }
+      }
+    },
+    "read": {
+      "description": "The agent has picked these messages up (read receipts, where the platform shows them).",
+      "type": "object",
+      "required": [
+        "type",
+        "messageIds"
+      ],
+      "properties": {
+        "type": {
+          "const": "read"
+        },
+        "messageIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "reaction": {
+      "description": "An emoji reaction on one of the person's messages, by its messageId (platforms with reactions).",
+      "type": "object",
+      "required": [
+        "type",
+        "emoji",
+        "messageId"
+      ],
+      "properties": {
+        "type": {
+          "const": "reaction"
+        },
+        "emoji": {
+          "type": "string",
+          "minLength": 1
+        },
+        "messageId": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "template": {
+      "description": "A WhatsApp template the owner set up, sent as is, even outside the 24-hour window. Other keys are passed on.",
+      "type": "object",
+      "required": [
+        "type",
+        "name"
+      ],
+      "properties": {
+        "type": {
+          "const": "template"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Its name as approved."
+        },
+        "language": {
+          "type": "string",
+          "description": "Such as en, en_US, hi."
+        },
+        "header": {
+          "type": "object",
+          "description": "{ kind: text, text } or { kind: image | video | document, url? or fileId? }."
+        },
+        "body": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Values for the body's {{1}}, {{2}}, ... in order."
+        },
+        "buttons": {
+          "type": "array",
+          "description": "Values for the buttons that take one, by position from 0.",
+          "items": {
+            "type": "object",
+            "required": [
+              "index",
+              "value"
+            ],
+            "properties": {
+              "index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "value": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "variables": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The body's values by number ({ \"1\": \"Maria\" }), the older form of `body`."
+        }
+      }
+    },
+    "status": {
+      "description": "A short line of what the agent is doing, in the loading indicator (platforms with status); null clears it.",
+      "type": "object",
+      "required": [
+        "type",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "const": "status"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "typing": {
+      "description": "Show or stop the typing indicator.",
+      "type": "object",
+      "required": [
+        "type",
+        "on"
+      ],
+      "properties": {
+        "type": {
+          "const": "typing"
+        },
+        "on": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

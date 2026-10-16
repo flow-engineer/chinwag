@@ -257,7 +257,7 @@ test("a tool call the cloud has not answered does not hold later posts, over HTT
         channels: () => [],
         receive: (id: string, message: Incoming, deliver: (o: unknown) => Promise<void>) => {
           if (message.text === "first") {
-            void Promise.resolve(tools[0].run({}, { conversationId: id, person: "p", channel: "sms" })).catch(() => {});
+            void Promise.resolve(tools[0].run({}, { conversationId: id, person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal })).catch(() => {});
             return "m1";
           }
           events[0]({ type: "turn.start", conversationId: id, at: 1 });

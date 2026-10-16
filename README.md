@@ -25,19 +25,19 @@ Node 22.18 or later. Your agent is TypeScript that Node runs as it is, with no b
 
 ```bash
 npx chinwag new my-agent && cd my-agent && npm install
-cp .env.example .env        # then put your OpenRouter key in it: OPENROUTER_API_KEY=sk-or-...
+cp .env.example .env        # then put one model key in it; the file says where to make one
 npm start
 ```
 
-`chinwag new <name>` makes `./<name>/` from the café example (lowercase letters, digits and dashes). Open the link `npm start` prints and text Pip, a café ordering assistant: your starting point. Pick a platform at the top (SMS, WhatsApp, iMessage, Telegram, web), and turn on **Debug** to see every tool call and how fast each message was answered. The new folder has the coding-agent skills in `.claude/skills/` and an `AGENTS.md` pointing at them, so you can tell Claude Code, Codex or any coding agent what to build.
+`chinwag new <name>` makes `./<name>/` from the café example (lowercase letters, digits and dashes). Open the link `npm start` prints and text Pip, a café ordering assistant: your starting point. Pick a platform at the top (SMS, WhatsApp, iMessage, Telegram, web), and turn on **Debug** to see every tool call and how fast each message was answered. A model call that fails (a wrong or expired key, say) shows in the chat, in Debug and on the terminal. The café's `src/agent.ts` reads its model id from `CAFE_MODEL` (default: the model for the key you set, see [Models](#models)). The new folder has the coding-agent skills in `.claude/skills/` and an `AGENTS.md` pointing at them, so you can tell Claude Code, Codex or any coding agent what to build.
 
 ### In a folder of your own
 
 ```bash
-npm i chinwag
+npm init -y && npm pkg set type=module && npm i chinwag
 ```
 
-`src/main.ts` (with `"type": "module"` in your `package.json`):
+`src/main.ts`:
 
 ```ts
 import { createAgent, openAICompatible, sms, whatsapp } from "chinwag";
@@ -139,7 +139,7 @@ const play = simulators({ title: "My agent" });
 await play.listen(buildAgent({ events: [play.events] }), 8788);
 ```
 
-The playground plays only the test people you declare (`testPeople: [{ name, phone }]`) on the agent's own channels. A test person is a real person to the agent: the same identity, `resolve` and history as if they wrote from their phone, one conversation on every channel, and "Clear history" to start again. Replies go back where the person last wrote from, the playground or the real channel. `simulators({ actions: [{ label, run }] })` adds a Backend panel: each button runs your function on the server (an order ships, a price drops) and its result shows in the trace, so a demo shows the agent reacting to your backend. On a deployed agent, mount `play.handler(agent, { token })`: it refuses requests without the token (at least 32 characters), swaps `?token=` for a cookie on the playground's path, and limits wrong tries.
+The playground plays only the test people you declare (`testPeople: [{ name, phone }]`) on the agent's own channels. A test person is a real person to the agent: the same identity, `resolve` and history as if they wrote from their phone, one conversation on every channel, and "Clear history" to start again. Replies go back where the person last wrote from, the playground or the real channel. `simulators({ actions: [{ label, run }] })` adds a Backend panel: each button runs your function on the server (an order ships, a price drops) and its result shows in the trace, so a demo shows the agent reacting to your backend. Locally it answers only on localhost, and its API only its own page, so a site you visit cannot send it messages. On a deployed agent, mount `play.handler(agent, { token })`: it refuses requests without the token (at least 32 characters), swaps `?token=` for a cookie on the playground's path, and limits wrong tries.
 
 `AGENTS.md` says what the agent is for and what it may and may not do. Leave messaging out of it: Chinwag adds how to talk on each channel (its send tool, reactions, formatting, acknowledging first). A skill's `SKILL.md` starts with a `name` and `description`; the agent sees every description and loads a skill when it needs it (`inlineSkills: true` puts them all in the prompt instead).
 
@@ -173,7 +173,7 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 ```
 
 - **Each platform's rules are built in:** WhatsApp buttons, lists, replies, reactions and its 24-hour window; SMS as plain text in segments; your app's own fields. Features your provider lacks are never offered to the model.
-- **One person, one conversation.** The same number on SMS and WhatsApp is one person. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
+- **One person, one conversation.** The same number on SMS and WhatsApp is one person, however each provider writes it (`+1 555 010 0100`, `15550100100`: both are `+15550100100`), also when their first messages on both arrive at once. If your SMS provider gives national numbers (`098765 43210`), set `createAgent({ defaultCountryCode: "+91" })`: on every phone channel but WhatsApp, a number with no `+` or `00` is then read as that country's (its trunk 0 dropped), so it joins `919876543210` on WhatsApp; without it, bare digits are taken as international. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
 - **The agent gets one send tool per channel** (`send_sms`, `send_whatsapp`, `send_app`) and answers each message where it came in. `instructions` guide the agent on that channel only.
 
 ## Reminders and nudges
@@ -181,22 +181,29 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 Built in, so you don't write them as tools:
 
 - **Scheduled messages.** People ask ("remind me at 9 tomorrow"); the agent schedules, lists and cancels them in the person's own time zone. When one is due, the agent writes it in the context of the chat.
-- **No-contact rules.** "No promotions", "nothing before 9am": the agent keeps them per person, and they apply on every channel.
+- **No-contact rules.** "No promotions", "nothing before 9am": the agent keeps them per person, and they apply on every channel to everything the business starts, sent now or scheduled.
+- **STOP, START and HELP.** On SMS (STOP; START; HELP, INFO) and WhatsApp (STOP, UNSUBSCRIBE; START), a message that is only the keyword is answered with no model call. STOP keeps a hard rule: no nudge, scheduled message or reminder goes to that person, on any channel, until they text START; the agent still answers when they write, and cannot lift it. Set the replies, or other words, with `sms(provider, { keywords: { replies: { stop, start, help } } })` (`keywords: false` turns them off); without a `help` reply the agent answers HELP. A reply left out sends nothing, for providers that send their own. Which words carriers or regulators expect differs by country (some US carrier rules expect STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT too), so check your market's rules; Chinwag's default on SMS is STOP only. For the fuller list, `sms(provider, { keywords: US_CARRIER_KEYWORDS })` (with your replies: `{ ...US_CARRIER_KEYWORDS, replies }`), or name your own words: `keywords: { stop: ["STOP", "ARRET"] }`.
 - **Nudges, messages your business starts:**
 
 ```ts
 await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt: "Their order is ready for pickup." });
 ```
 
-`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe. A nudge a no-contact rule covers is dropped, and outside WhatsApp's 24-hour window only templates go out.
+`text` sends it as written, `prompt` lets the agent write it (or decide not to), `template` sends a WhatsApp template with its header, body and button values (`{ name, header?, body?: [...], buttons?: [{ index, value }] }`; a declared one sent with the wrong values throws before it goes). `at` sends it later, and `idempotencyKey` makes a retry safe: the same key sends once, also from two calls at once, and every call gets the first one's result. A nudge a no-contact rule covers, or to someone who texted STOP, is dropped, and outside WhatsApp's 24-hour window only templates go out. `nudge()` always settles, with `status` `sent`, `silent`, `dropped`, `refused`, `failed` or `scheduled` and a `reason`: when the model fails during a nudge, it is `failed`, and the person is sent nothing (only someone who wrote is told something went wrong).
 
 ## State, restarts and hosting
 
 - Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). Postgres: `postgres(pool)` over your own node-postgres pool. Any other engine: implement the three-method `Database` interface, or pass a whole `store` of your own.
-- After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun.
+- After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun. A tool's `context.idempotencyKey` is the same when the agent calls it again with the same input in that turn, so your backend can do it once; `context.callId` and `context.signal` (aborted when the person is forgotten) are there too.
+- Pass the provider's own id as `messageId` to `agent.message()`: a webhook the provider sends again is taken once. Ids are kept 7 days (`keepMessageIdsDays`); once an hour one runner deletes older ones, a batch at a time, on the scheduled messages' timer.
 - `agent.status()` says whether anything is running and for how long it has been idle, so your platform can stop idle agents and start them on the next message.
-- Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file.
-- Traces: with `CHINWAG_TRACES_KEY` and `CHINWAG_TRACES_URL` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces` (`CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only).
+- Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file. An `EventSink` is a function that gets each event (`{ type, conversationId, at, ... }`) and must not throw:
+
+  ```ts
+  const log: EventSink = (event) => console.log(event.type, event.conversationId);
+  createAgent({ /* ... */ events: [log] });
+  ```
+- Traces: with `CHINWAG_TRACES_KEY` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces`, where the URL is `CHINWAG_TRACES_URL`, else https://flow.engineer/observe (the trace key is made there). `CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only.
 
 ## Testing
 
@@ -223,20 +230,59 @@ expect:
 `tests/tools/*.yaml` describe how each tool behaves (normal, slow, each error). Run the suite from the agent's folder:
 
 ```bash
-npx chinwag test --cloud <test cloud URL> --runs 3 --only latte-correction
+npx chinwag test --cloud https://flow.engineer/observe --synthetic --runs 3 --only latte-correction
 ```
 
-A hosted test cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic` (your attestation that the test files hold no real customer data). Your agent stays on your machine with its own model and key; the test cloud plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation.
+Your agent stays on your machine with its own model and key; the test cloud ([get one](#get-a-test-cloud)) plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation. Before anything is sent it reads every test file as the cloud does, and a mistake stops it with the file and line (`tests/scenarios/latte-correction.yaml:3: person.goal: missing`).
 
 The command exits 0 when every run passed, and 1 when the session finished and a run failed. A refusal from the cloud (a bad CI key, an invalid suite, the spend cap) or a failure before the session opens exits 1 and prints only that message. On a cloud that resumes, a dropped stream is opened again for up to 2 minutes, picking up after the last command. On a cloud that can re-open, a session the cloud lost is opened once more for only the runs with no result (the log names them, since they are played and paid for again), and the report covers both sessions with both dashboard links. If the tunnel, the stream, or the connection fails after the session has opened, it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report, says the cloud keeps playing until it is stopped from the dashboard, and exits 130.
 
-### Test an agent you already have
+`--only latte-correction,order-fails` runs only those scenarios (file names without `.yaml`); every tool file still goes. Once the session has opened, every exit (0, 1, 2 or 130) writes `.chinwag/last-session.json` in the agent's folder and prints its path; `chinwag new` git-ignores `.chinwag/`. It holds what each run ended as, never what was said:
 
-An agent built on any framework is tested through an HTTP endpoint, with no rewrite. From a folder with `tests/scenarios/*.yaml`:
+```json
+{
+  "sessionId": "…", "dashboard": "https://…", "suiteHash": "…", "endedAt": "2026-10-16T09:12:03.000Z",
+  "ended": "finished",
+  "only": null,
+  "runs": [
+    { "scenario": "latte-correction", "channel": "whatsapp", "run": 1, "verdict": "failed",
+      "failedChecks": [{ "kind": "judge", "text": "The agent asks Sam to confirm before placing the order." }] }
+  ]
+}
+```
+
+`ended` is `finished`, `stopped` (the session broke off or the cloud stopped it) or `interrupted`. `only` is the scenarios the session was limited to, `null` for the whole suite. `verdict` is `passed`, `failed`, `errored` (the cloud could not play or judge the run) or `not_played` (the session ended first).
+
+`--failed` runs again only the scenarios that did not pass in that file (failed, errored or not played), on every channel each plays: a scenario's channels are part of its file, so one channel cannot be picked alone. It goes with `--runs`; with `--only` it stops and says to pick one, since the two would each pick the scenarios. With nothing to run again it prints `Nothing failed in the last session (<id>).` and exits 0 (and says when that session ran only some scenarios); with no file it says to run `chinwag test` first and exits 1. The loop, for you or a coding agent:
 
 ```bash
-npx chinwag test --agent-url http://localhost:3000/chinwag
+npx chinwag test --synthetic            # the whole suite
+# fix what failed
+npx chinwag test --synthetic --failed   # only what did not pass; again until it exits 0
+npx chinwag test --synthetic            # the whole suite once more before you finish
 ```
+
+### Get a test cloud
+
+1. Sign in at https://flow.engineer/observe (Google, GitHub or an email link).
+2. Workspace → New agent.
+3. On the agent's Developers page, "Make a CI key". It starts with `oci_` and is shown once.
+4. Put it in the agent's `.env` as `CHINWAG_CLOUD_KEY` (never on the command line).
+5. `npx chinwag test --cloud https://flow.engineer/observe --synthetic` from the agent's folder (`--cloud` is that address by default).
+
+Your agent runs on your machine with your own model key. The cloud's person simulator, tool simulator and judge are free up to $5 a day per workspace, with 2 sessions at once; test data only (`--synthetic`), and records are deleted after 30 days.
+
+`--cloud` (or `CHINWAG_CLOUD`) points at another test cloud. A hosted cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic`, your attestation that the test files hold no real customer data; without the key the command stops and says where to make one.
+
+### Test an agent you already have
+
+An agent built on any framework is tested through an HTTP endpoint, with no rewrite. It needs a test cloud like any run (see [Get a test cloud](#get-a-test-cloud)): `CHINWAG_CLOUD_KEY` and `--synthetic` for the hosted one, the default, or `--cloud` for another. From a folder with `tests/scenarios/*.yaml`, with your agent running:
+
+```bash
+npx chinwag test --agent-url http://localhost:3000/chinwag --cloud https://flow.engineer/observe --synthetic
+```
+
+Before the session opens, the command sends one `HEAD` request to the URL (never a message), and stops with "Could not reach your agent at <url>" if nothing answers; any HTTP status counts as an answer.
 
 `chinwag test` runs on your machine and POSTs each of the person's messages to that URL from there, so your agent never has to be reachable from the internet (`http://localhost` is fine). The request is JSON, with `authorization: Bearer <CHINWAG_AGENT_TOKEN>` when that variable is set:
 
@@ -255,7 +301,7 @@ Keep the conversation's history by `conversationId`, as you would per phone numb
 { "replies": [{ "type": "message", "text": "We're open 8am to 6pm today.", "buttons": ["Order ahead"] }] }
 ```
 
-A minimal server, with no dependencies (the whole file is [`examples/http-agent/server.mjs`](examples/http-agent/server.mjs)):
+A minimal server, with no dependencies (the whole file is [`examples/http-agent/server.mjs`](https://github.com/flow-engineer/chinwag/blob/main/examples/http-agent/server.mjs), with a test scenario beside it; it also ships in the package, in `node_modules/chinwag/examples/http-agent`):
 
 ```js
 import { createServer } from "node:http";
@@ -274,9 +320,23 @@ Each reply is checked against what the run's platform can show, as a Chinwag age
 
 Your agent's own tools run on its side, for real, so `tests/tools/*.yaml` are not used, and outcome checks (which read simulated tool calls) see none: write what must be true as `judge` items. The agent's model cost shows as $0, since Chinwag does not see its model calls. Not yet supported: agents that answer later through a callback instead of in the response, and the person's reactions to the agent's messages.
 
+### Any language
+
+The endpoint's contract is written down in [`spec/`](spec/): [`agent-endpoint.openapi.yaml`](spec/agent-endpoint.openapi.yaml) (OpenAPI 3.1: the request, the answer, statuses, timeouts, the token, and what each platform shows) with JSON Schemas for the [request](spec/request.schema.json) and the [answer](spec/response.schema.json). A coding agent can implement it in any language from those files alone.
+
+Check an endpoint against the contract before a test run, with no cloud, no key and no model call on Chinwag's side:
+
+```bash
+npx chinwag check-endpoint http://localhost:3000/chinwag [--token-env NAME] [--json]
+```
+
+It sends a fixed set of synthetic messages (a typed message, a double text, a photo, a tapped button quoting the agent, a message that may need no answer) and checks each answer: status 200, `{ "replies": [...] }`, every reply against the schema and what WhatsApp can show, and every id a reply names (`replyTo`, a reaction's `messageId`) one of the person's messages. One line per case; exit 0 when all pass, else 1. The token is the value of `NAME` (default `CHINWAG_AGENT_TOKEN`).
+
+The café's agent as an HTTP endpoint, with its two tools and one model through any OpenAI-compatible API (the same key variables as `openAICompatible`, `MODEL` for the model; `FAKE_MODEL=1` for a fixed reply and no model call): [`examples/http-agent-python`](examples/http-agent-python) (standard library only) and [`examples/http-agent-go`](examples/http-agent-go) (standard library only).
+
 ## Models
 
-Any OpenAI-compatible API. `openAICompatible` defaults to OpenRouter and reads `OPENROUTER_API_KEY`; pass `baseURL` and `apiKey` for OpenAI, Gemini, Anthropic or a local server.
+Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`. Give `contextTokens` (the model's window) and a long chat's history is kept within it: the latest messages go to every call, older ones are left out (the agent is told).
 
 For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku-5.5`) or **GPT-6.1 Sol** (`openai/gpt-6.1-sol`, about 3x the cost). In our tests, GPT Luna repeated tool calls and answered twice.
 
@@ -296,12 +356,13 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `templates` | The WhatsApp templates you set up with Meta (header, body, footer, buttons): each send is checked against its declaration, and the playground shows it as WhatsApp does |
 | `transcribe` | Speech to text for voice notes, with the provider you choose |
 | `context` | Text added to every turn: who this person is, the time |
-| `intercept` | Answer some messages without the model (STOP, HELP) |
+| `intercept` | Answer some messages without the model (STOP and HELP are built in on SMS and WhatsApp) |
 | `timeZone` | The business's time zone, for schedules when a person's is unknown |
 | `deadlineMs` | The longest a reply waits for a tool (60,000); a tool can set its own |
 | `partialAfterMs` | How long a finished tool's result waits for the others (5,000) |
 | `debounceMs` | Quiet time after a message before the reply starts (300) |
 | `maxSteps` | Model steps per turn (8) |
+| `history` | How much of a long chat each model call carries: `{ maxTokens, toolResultChars }` (60% of the model's `contextTokens`, else 50,000 tokens; tool results cut at 12,000 characters) |
 | `inlineSkills` | Put every skill in the prompt instead of loading on demand |
 | `shareUpdates` | Live status lines on web and app UIs (on); a string replaces the guidance |
 | `traces` | Where traces go (from the environment by default, see above) |

@@ -8,9 +8,21 @@ export interface ToolCall {
 }
 
 export type ChatMessage =
-  | { role: "user"; content: string; media?: Media[] }
+  | { role: "user"; content: string; media?: Media[]; messages?: PersonMessage[] }
   | { role: "assistant"; content: string | null; toolCalls?: ToolCall[] }
   | { role: "tool"; toolCallId: string; content: string };
+
+/**
+ * One of the person's messages in a history entry, kept beside its text (never sent to the model):
+ * its id (the provider's, or Chinwag's m1, m2, ...), its channel, and what they wrote or tapped.
+ */
+export interface PersonMessage {
+  id: string;
+  channel: string;
+  text: string;
+  /** They tapped a button or list row. */
+  choice?: boolean;
+}
 
 /**
  * A photo or PDF in the person's messages, for the model to read. `data` (base64) is held in memory
@@ -51,6 +63,8 @@ export interface ModelResponse {
 /** Any model behind Chinwag. `complete` must reject promptly when `signal` aborts. */
 export interface Model {
   complete(request: ModelRequest): Promise<ModelResponse>;
+  /** Its context window in tokens, when known: each call is kept well within it (see `history`). */
+  contextTokens?: number;
   /** What it reads besides text, as `media` on the person's messages. Without it: text only, and a note for each photo or PDF. */
   reads?: { images?: boolean; pdfs?: boolean };
 }

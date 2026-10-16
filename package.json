@@ -1,6 +1,6 @@
 {
   "name": "chinwag",
-  "version": "0.1.8",
+  "version": "0.1.10",
   "description": "An open-source runtime for chat agents that feel like a person texting back.",
   "license": "MIT",
   "repository": {
@@ -35,14 +35,16 @@
     "examples/cafe/agent",
     "examples/cafe/src",
     "examples/cafe/tests",
+    "examples/http-agent",
     "coding-agents",
+    "spec",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node -e \"for (const f of ['page.html', 'person.html']) fs.copyFileSync('simulators/src/' + f, 'dist/simulators/src/' + f)\"",
     "prepack": "npm run build",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --test --test-timeout=30000 \"test/**/*.test.ts\"",
     "test:changed": "node scripts/test-changed.ts",
     "new": "node scripts/new-agent.ts",
     "typecheck": "tsc --noEmit"

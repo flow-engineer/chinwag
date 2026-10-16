@@ -34,15 +34,16 @@
 //   few are shown, and their bytes are never stored: after a restart they are named, not shown.
 
 import { Buffer } from "node:buffer";
+import { createHash, randomUUID } from "node:crypto";
 import type { z } from "zod";
 import { declaredTemplate, fillTemplate, fitMessage } from "./channels.ts";
 import type { ChinwagEvent, Emit, EventSink } from "./events.ts";
 import { coveredBy, noContactTools, rulesSection } from "./nudges.ts";
 import { scheduleTools } from "./schedules.ts";
-import type { ConversationRow, InboxRow, StoreApi } from "./store.ts";
+import type { ConversationRow, InboxRow, NoContactRow, StoreApi } from "./store.ts";
 import { REACT, UPDATE, reactInput, sendInput, sendRefusal, sendToolName, talkInstructions, talkSpecs, updateInput, type ChannelView, type SendInput, type TalkSettings } from "./talk.ts";
 import { render, toSpec, type Tool } from "./tools.ts";
-import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
+import type { Attachment, ChannelInfo, ChatMessage, Deliver, Incoming, Media, Model, Outbound, PersonMessage, Template, TemplateDefinition, ToolCall, ToolSpec, Transcribe } from "./types.ts";
 
 export interface ConversationSettings {
   model: Model;
@@ -61,6 +62,10 @@ export interface ConversationSettings {
   partialAfterMs: number;
   debounceMs: number;
   maxSteps: number;
+  /** About how many tokens one model call may carry (instructions, tools and history). */
+  historyTokens: number;
+  /** The longest a tool result is kept, in characters. */
+  toolResultChars: number;
   /** How many times one step restarts for new messages before it lets the step finish. */
   maxRestarts: number;
   talk: TalkSettings;
@@ -98,6 +103,8 @@ const ACKNOWLEDGE_FIRST =
   "[Chinwag] They have not heard from you yet. In one response, acknowledge them " +
   "(react to their message or send a short line) and make your tool calls again.";
 const INTERRUPTED = "[Chinwag] Cut off by a restart: this may or may not have happened. Check before you rely on it.";
+const APOLOGY = "Sorry, something went wrong on my side. Could you send that again?";
+const EARLIER = "[Chinwag] Older messages of this conversation are no longer shown to you.";
 const NOT_SHOWN = "[Chinwag] You are no longer shown the photos or documents in these messages; ask them to send one again if you need it.";
 
 /** Photos and PDFs the model is shown at once, the latest; each is resent on every model call. */
@@ -146,7 +153,11 @@ interface Owed {
 
 interface Pending {
   id: string;
+  /** As the agent reads it, after its id. */
   text: string;
+  /** As the person wrote it (the transcript's). */
+  shown: string;
+  choice?: boolean;
   channel: string;
   media?: Media[];
   inbox?: number;
@@ -188,6 +199,10 @@ export class Conversation {
   private readonly messageIds = new Map<string, string>();
   private readonly knownInbox = new Set<number>();
   private messageCount = 0;
+  /** Turns begun, kept in the store: tools' idempotency keys carry the turn's number. */
+  private turns = 0;
+  /** Aborted when the conversation closes: tools' signal. */
+  private readonly lifetime = new AbortController();
   private recentChannels: string[] = [];
   private timeZone: string | null = null;
   private running = false;
@@ -218,6 +233,12 @@ export class Conversation {
   private resumeTurn = false;
   /** Forgotten: nothing more runs, is sent or is kept. */
   private closed = false;
+  /** This turn took in a message from the person: if it fails, they are told. */
+  private theirMessages = false;
+  /** History entries left out of the latest model call (0: none), so a change is an event once. */
+  private leftOut = 0;
+  /** They texted STOP (as of the latest look): what the business starts is dropped, with no model call. */
+  private stop: NoContactRow | null = null;
 
   constructor(id: string, personKey: string, settings: ConversationSettings, existing: ConversationRow | null = null) {
     this.id = id;
@@ -225,6 +246,7 @@ export class Conversation {
     this.settings = settings;
     if (existing) {
       this.messageCount = existing.messageCount;
+      this.turns = existing.turns;
       this.recentChannels = existing.recentChannels;
       this.timeZone = existing.timeZone;
     }
@@ -270,6 +292,11 @@ export class Conversation {
   receive(input: string | Incoming, options: { channel: string; messageId?: string }): string {
     const incoming: Incoming = typeof input === "string" ? { text: input } : input;
     const channel = options.channel;
+    if (options.messageId !== undefined && this.messageIds.get(options.messageId) === channel) {
+      // The channel gave this message before (a retry): it is taken once.
+      this.settings.emit(this.id, "message.duplicate", { messageId: options.messageId, channel });
+      return options.messageId;
+    }
     const id = options.messageId ?? `m${++this.messageCount}`;
     this.messageIds.set(id, channel);
     void this.typing(true, channel);
@@ -299,14 +326,22 @@ export class Conversation {
   /** The message is ready for the agent: it joins the reply in progress, or starts one. */
   private arrive(incoming: Incoming, id: string, channel: string, ownId: boolean, files: Files): void {
     const at = this.settings.now();
-    const item: Pending = { id, text: describe(incoming, files), channel, ...(files.media.length ? { media: files.media } : {}) };
+    const item: Pending = { id, text: describe(incoming, files), shown: shownText(incoming, files), ...(incoming.choice ? { choice: true } : {}), channel, ...(files.media.length ? { media: files.media } : {}) };
     this.pending.push(item);
     this.recentChannels = [...this.recentChannels, channel].slice(-5);
     const link = this.channels.get(channel);
     if (link) link.lastMessageAt = at;
     const fields = { messageCount: this.messageCount, recentChannels: this.recentChannels };
     this.persist(async () => {
-      item.inbox = await this.settings.store.addInbox(this.id, "message", { id, text: item.text, channel, ...(item.media ? { media: item.media.map(stored) } : {}) });
+      const payload = { id, text: item.text, shown: item.shown, ...(item.choice ? { choice: true } : {}), channel, ...(item.media ? { media: item.media.map(stored) } : {}) };
+      const inbox = await this.settings.store.addMessage(this.id, payload, ownId ? { channel, messageId: id } : undefined);
+      if (inbox === null) {
+        // Another runner took this provider id first (a retry reached both): the message is theirs.
+        this.pending = this.pending.filter((waiting) => waiting !== item);
+        this.settings.emit(this.id, "message.duplicate", { messageId: id, channel });
+        return;
+      }
+      item.inbox = inbox;
       this.knownInbox.add(item.inbox);
       await this.settings.store.updateConversation(this.id, fields);
       if (link) await this.settings.store.touchIdentity(channel, link.address, at);
@@ -381,7 +416,7 @@ export class Conversation {
     const p = row.payload as Record<string, any>;
     if (row.kind === "message") {
       // Its photos and PDFs are named, not shown: their bytes were never stored.
-      this.pending.push({ id: p.id, text: p.text, channel: p.channel, inbox: row.id, ...(Array.isArray(p.media) ? { media: p.media } : {}) });
+      this.pending.push({ id: p.id, text: p.text, shown: p.shown ?? p.text, ...(p.choice ? { choice: true } : {}), channel: p.channel, inbox: row.id, ...(Array.isArray(p.media) ? { media: p.media } : {}) });
       this.messageIds.set(p.id, p.channel);
       this.unanswered.add(p.channel);
       this.firstResponse = true;
@@ -413,6 +448,25 @@ export class Conversation {
   undelivered(text: string, reason: string): void {
     this.settings.emit(this.id, "message.undelivered", { text, reason });
     this.note(`[Not delivered] "${text}": ${reason}`);
+  }
+
+  /**
+   * They texted a STOP or START keyword: their STOP is kept (or lifted) with no model call, and
+   * the agent learns it at its next turn. Resolves once it is stored.
+   */
+  keyword(kind: "stop" | "start", text: string, channel: string, messageId?: string): Promise<void> {
+    const { store } = this.settings;
+    const inbound = messageId === undefined ? undefined : { channel, messageId };
+    this.settings.emit(this.id, "keyword", { keyword: kind, text, channel });
+    if (kind === "stop") {
+      const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true };
+      this.stop = rule;
+      this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: nothing the business starts (nudges, scheduled messages) reaches them until they text START. Answer them when they write.`, true);
+      return this.persist(() => store.setStop(this.id, rule, inbound));
+    }
+    this.stop = null;
+    this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: messages the business starts may reach them again.`, true);
+    return this.persist(() => store.setStop(this.id, null, inbound));
   }
 
   get busy(): boolean {
@@ -451,6 +505,7 @@ export class Conversation {
     this.direct = [];
     this.stepAbort?.abort();
     this.wakeTools?.();
+    this.lifetime.abort();
   }
 
   /** Runs `work` after every earlier write to the store, in order. */
@@ -474,7 +529,7 @@ export class Conversation {
     const only = [...this.channels.keys()][0] ?? "chat";
     for (const entry of history) {
       if (entry.role !== "user") continue;
-      for (const m of entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)[,\]]/gm)) this.messageIds.set(m[2], m[1] ?? only);
+      for (const m of personMessages(entry, only)) this.messageIds.set(m.id, m.channel);
     }
     // A step cut off while its tools ran: those calls get a result that says so.
     const answered = new Set(history.flatMap((e) => (e.role === "tool" ? [e.toolCallId] : [])));
@@ -523,23 +578,44 @@ export class Conversation {
       for (;;) {
         if (this.closed) break;
         if (this.pending.length || this.notes.some((n) => !n.wait) || this.resumeTurn) {
-          this.resumeTurn = false;
-          await this.turn();
+          try {
+            await this.turn();
+          } catch (error) {
+            await this.turnFailed(error);
+          }
           continue;
         }
         const next = this.direct.shift();
         if (!next) break;
-        await this.sendDirect(next);
+        try {
+          await this.sendDirect(next);
+        } catch (error) {
+          this.settings.emit(this.id, "model.error", { error: String(error) });
+          this.settle(next, "failed", errorText(error));
+          this.flush([next]);
+        }
       }
-    } catch (error) {
-      this.settings.emit(this.id, "model.error", { error: String(error) });
-      await this.send(this.currentChannel(), { type: "message", text: "Sorry, something went wrong on my side. Could you send that again?" });
     } finally {
       this.running = false;
       for (const channel of [...this.typingOn]) await this.typing(false, channel);
       for (const link of this.channels.values()) if (link.info.status) await this.send(link.name, { type: "status", text: null });
       this.checkIdle();
     }
+  }
+
+  /**
+   * A turn threw (the model failed): what it owed is settled as failed, what was waiting is taken
+   * in so it is not tried again, and only a person waiting on a reply is told something went wrong.
+   * A turn they did not start (a nudge, a scheduled message, a background result) stays silent.
+   */
+  private async turnFailed(error: unknown): Promise<void> {
+    this.settings.emit(this.id, "model.error", { error: String(error) });
+    this.absorb();
+    for (const o of this.owed.splice(0)) this.settle(o, "failed", `the agent's turn failed: ${errorText(error)}`);
+    this.resultUnsent = false;
+    this.persist(() => this.settings.store.updateConversation(this.id, { turnOpen: false }));
+    const waiting = this.theirMessages ? [...this.unanswered] : [];
+    if (waiting.length) await this.send(waiting.includes(this.currentChannel()) ? this.currentChannel() : waiting[0], { type: "message", text: APOLOGY });
   }
 
   private checkIdle(): void {
@@ -564,6 +640,12 @@ export class Conversation {
     if (!this.pending.length && !this.notes.length) return false;
     const items: Array<{ inbox?: number }> = [];
     for (const note of this.notes.splice(0)) {
+      if (note.owed && this.stop) {
+        // They texted STOP: what the business started never reaches the model.
+        this.settle(note.owed, "dropped", `no-contact rule ${this.stop.id}: ${this.stop.rule}`);
+        items.push(note);
+        continue;
+      }
       this.history.push({ role: "user", content: note.text });
       if (note.text.startsWith("[Background result:")) this.resultUnsent = "background";
       if (note.owed) this.owed.push(note.owed);
@@ -571,9 +653,11 @@ export class Conversation {
     }
     const messages = this.pending.splice(0);
     if (messages.length) {
+      this.theirMessages = true;
       const tag = this.settings.tagChannels || this.channels.size > 1;
       const media = messages.flatMap((m) => m.media ?? []);
-      this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n"), ...(media.length ? { media } : {}) });
+      const said: PersonMessage[] = messages.map((m) => ({ id: m.id, channel: m.channel, text: m.shown, ...(m.choice ? { choice: true } : {}) }));
+      this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n"), ...(media.length ? { media } : {}), messages: said });
       if (media.length) this.showLatestMedia();
       items.push(...messages);
       for (const channel of new Set(messages.map((m) => m.channel))) {
@@ -609,8 +693,20 @@ export class Conversation {
   private async turn(): Promise<void> {
     const started = Date.now();
     const { store } = this.settings;
+    const noContact = await store.noContact(this.id, this.settings.now());
+    this.stop = noContact.find((r) => r.hard) ?? null;
+    if (this.stop && !this.resumeTurn && !this.pending.length && !this.notes.some((n) => !n.wait && !n.owed)) {
+      // Only what the business started is waiting, and they texted STOP: it is dropped, no turn runs.
+      this.absorb();
+      return;
+    }
+    // A turn cut off by a restart keeps its number, so a tool called again in it gets the same key.
+    if (!this.resumeTurn) this.turns++;
+    const turns = this.turns;
+    this.resumeTurn = false;
+    this.theirMessages = false;
     this.settings.emit(this.id, "turn.start", {});
-    this.persist(() => store.updateConversation(this.id, { turnOpen: true }));
+    this.persist(() => store.updateConversation(this.id, { turnOpen: true, turns }));
     this.absorb();
     // A turn the person started (as against a background result, a scheduled message or a nudge).
     const theirs = this.unanswered.size > 0;
@@ -631,7 +727,7 @@ export class Conversation {
         }
       }
     }
-    const rules = rulesSection(await store.noContact(this.id, this.settings.now()), this.timeZone ?? this.settings.timeZone ?? "UTC");
+    const rules = rulesSection(noContact, this.timeZone ?? this.settings.timeZone ?? "UTC");
     // A message that came while those loaded had no step to restart: it joins the first one.
     this.absorb();
     let restarts = 0;
@@ -653,7 +749,7 @@ export class Conversation {
       const callStarted = Date.now();
       let response;
       try {
-        response = await this.settings.model.complete({ system, messages: this.history.map(forModel), tools: specs, signal: abort.signal });
+        response = await this.settings.model.complete({ system, messages: this.window(system, specs), tools: specs, signal: abort.signal });
       } catch (error) {
         if (!abort.signal.aborted) throw error;
       } finally {
@@ -736,7 +832,7 @@ export class Conversation {
       const problems = said.some((s) => s.refused);
       const results = new Map<string, string>();
       talk.forEach((call, i) => results.set(call.id, said[i].content));
-      work.forEach((call, i) => results.set(call.id, done[i]));
+      work.forEach((call, i) => results.set(call.id, this.capped(done[i])));
       for (const call of response.toolCalls) {
         this.history.push({ role: "tool", toolCallId: call.id, content: results.get(call.id) ?? "" });
       }
@@ -910,11 +1006,22 @@ export class Conversation {
     const link = this.channels.get(d.channel);
     if (!link) return settle("failed", `no way to reach them on ${d.channel} right now`);
     if (!d.template && windowClosed(link, this.settings.now())) return settle("refused", "outside_window");
-    if (d.nudge) {
-      const rules = await this.settings.store.noContact(this.id, this.settings.now());
-      const covered = rules.length ? await coveredBy(this.settings.model, rules, d.text ?? `the template "${d.template?.name}"`) : null;
-      if (covered) return settle("dropped", `no-contact rule ${covered.id}: ${covered.rule}`);
+    // Every direct send is one the business starts (a nudge, or its scheduled text): the person's rules apply.
+    const rules = await this.settings.store.noContact(this.id, this.settings.now());
+    let covered = rules.find((r) => r.hard) ?? null;
+    if (!covered && rules.length) {
+      const started = Date.now();
+      try {
+        const check = await coveredBy(this.settings.model, rules, d.text ?? `the template "${d.template?.name}"`);
+        this.settings.emit(this.id, "model.call", { ms: Date.now() - started, toolCalls: ["decide"], usage: check.usage, purpose: "no-contact check", ...(check.model ? { model: check.model } : {}) });
+        covered = check.rule;
+      } catch (error) {
+        // Not knowing whether a rule covers it, nothing is sent, and the person hears nothing of it.
+        this.settings.emit(this.id, "model.error", { error: String(error), purpose: "no-contact check" });
+        return settle("failed", `their no-contact rules could not be checked: ${errorText(error)}`);
+      }
     }
+    if (covered) return settle("dropped", `no-contact rule ${covered.id}: ${covered.rule}`);
     const outbound: Outbound = d.template ? { type: "template", ...d.template } : { type: "message", text: d.text ?? "" };
     const failure = await this.send(d.channel, outbound);
     if (failure) return settle("failed", failure);
@@ -934,6 +1041,36 @@ export class Conversation {
     }
     this.settings.emit(this.id, "message.out", { text: d.text ?? d.template?.name, channel: d.channel, direct: true });
     settle("sent");
+  }
+
+  /**
+   * The history the model is sent: all of it while it fits the budget, else the latest entries
+   * that do, from the start of one (never between a call and its result), after a line that says
+   * older ones are left out. The latest turn always goes, however long.
+   */
+  private window(system: string, specs: ToolSpec[]): ChatMessage[] {
+    const all = this.history.map(forModel);
+    let room = this.settings.historyTokens - tokens(system) - tokens(JSON.stringify(specs)) - tokens(EARLIER);
+    let start = all.length;
+    for (let i = all.length - 1; i >= 0; i--) {
+      room -= size(all[i]);
+      if (room < 0) break;
+      if (all[i].role === "user") start = i;
+    }
+    if (room >= 0) start = 0;
+    else if (start === all.length) start = Math.max(0, all.findLastIndex((m) => m.role === "user"));
+    if (start !== this.leftOut) {
+      this.leftOut = start;
+      if (start) this.settings.emit(this.id, "history.trimmed", { leftOut: start, kept: all.length - start });
+    }
+    return start ? [{ role: "user", content: EARLIER }, ...all.slice(start)] : all;
+  }
+
+  /** A tool result as the history keeps it: cut at toolResultChars, saying so. */
+  private capped(text: string): string {
+    const max = this.settings.toolResultChars;
+    if (text.length <= max) return text;
+    return `${text.slice(0, max)}\n[Chinwag] Cut: the result was ${text.length} characters; only the first ${max} are shown.`;
   }
 
   /** The send tools the agent has right now, for Chinwag's notes: "send_sms", or "send_sms or send_app". */
@@ -1016,7 +1153,8 @@ export class Conversation {
     }
 
     this.settings.emit(this.id, "tool.start", { callId: call.id, tool: call.name, input: parsed.data });
-    const context = { conversationId: this.id, person: this.personKey, channel: this.currentChannel() };
+    const key = createHash("sha256").update(`${this.id}\u0000${this.turns}\u0000${call.name}\u0000${input}`).digest("hex").slice(0, 32);
+    const context = { conversationId: this.id, person: this.personKey, channel: this.currentChannel(), callId: call.id, idempotencyKey: key, signal: this.lifetime.signal };
     const r: Running = {
       call,
       input,
@@ -1044,7 +1182,7 @@ export class Conversation {
       this.tasks.delete(task.id);
       this.persist(() => this.settings.store.removeTask(this.id, task.id));
       this.settings.emit(this.id, "task.done", { callId: call.id, tool: call.name, task: task.id, ms: Date.now() - startedAt, ok: result.ok, output: clipOutput(result.text) });
-      this.note(`[Background result: ${call.name} (${task.id})] ${result.text}\n[Chinwag] They have not seen this result: tell them with ${this.sendToolsNow()}.`);
+      this.note(`[Background result: ${call.name} (${task.id})] ${this.capped(result.text)}\n[Chinwag] They have not seen this result: tell them with ${this.sendToolsNow()}.`);
       this.checkIdle();
     });
     return (
@@ -1087,7 +1225,7 @@ export type TranscriptEntry =
 const SEND_KEYS = new Set(["text", "reply_to", "buttons", "list", "link", "image", "confirm"]);
 
 /**
- * The history as the person saw it: their messages (with the ids describe() wrote), what the agent
+ * The history as the person saw it: their messages (with their ids and channels), what the agent
  * delivered with its send tools and reactions, and its other tool calls with their results.
  * Chinwag's notes and the agent's plain text never reached the person and are left out. `only` is
  * the channel of untagged messages (an agent with one channel does not tag them).
@@ -1104,15 +1242,10 @@ export function transcriptOf(history: Array<{ entry: ChatMessage; at: number }>,
         lines.push({ kind: "out", channel: template[2], text: template[3] ?? "", at, template: template[1] });
         continue;
       }
-      const starts = [...entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)(?=[,\]])/gm)];
-      starts.forEach((m, i) => {
-        const channel = m[1] ?? only;
-        const rest = entry.content.slice(m.index! + m[0].length, i + 1 < starts.length ? starts[i + 1].index! - 1 : undefined);
-        const tapped = rest.indexOf(", tapped] ");
-        const text = rest.startsWith("] ") ? rest.slice(2) : tapped >= 0 ? rest.slice(tapped + 10) : rest.slice(rest.indexOf('"] ') + 3);
-        channelOf.set(m[2], channel);
-        lines.push({ kind: "in", channel, id: m[2], text, at, ...(tapped >= 0 ? { choice: true } : {}) });
-      });
+      for (const m of personMessages(entry, only)) {
+        channelOf.set(m.id, m.channel);
+        lines.push({ kind: "in", channel: m.channel, id: m.id, text: m.text, at, ...(m.choice ? { choice: true } : {}) });
+      }
       continue;
     }
     if (entry.role !== "assistant") continue;
@@ -1164,6 +1297,39 @@ function describe(incoming: Incoming, files?: Files): string {
   return `${parts.join("")}] ${body}`;
 }
 
+/** What the person wrote, as the transcript shows it: the tap, or the files' marks and the text. */
+function shownText(incoming: Incoming, files: Files): string {
+  if (incoming.choice) return incoming.choice.title;
+  return [files.marks.join(" "), files.transcript, incoming.text].filter(Boolean).join(" ");
+}
+
+/**
+ * The person's messages in a history entry: kept beside it, or (in entries stored before they
+ * were) read back from the text, where only Chinwag's own m1, m2, ... ids can be told apart.
+ */
+function personMessages(entry: Extract<ChatMessage, { role: "user" }>, only: string): PersonMessage[] {
+  if (entry.messages) return entry.messages;
+  const starts = [...entry.content.matchAll(/^\[(?:([\w-]+) · )?(m\d+)(?=[,\]])/gm)];
+  return starts.map((m, i) => {
+    const rest = entry.content.slice(m.index! + m[0].length, i + 1 < starts.length ? starts[i + 1].index! - 1 : undefined);
+    const tapped = rest.indexOf(", tapped] ");
+    const text = rest.startsWith("] ") ? rest.slice(2) : tapped >= 0 ? rest.slice(tapped + 10) : rest.slice(rest.indexOf('"] ') + 3);
+    return { id: m[2], channel: m[1] ?? only, text, ...(tapped >= 0 ? { choice: true } : {}) };
+  });
+}
+
+/** About how many tokens a text is (a little over, for safety: 3 characters a token). */
+function tokens(text: string | null | undefined): number {
+  return Math.ceil((text?.length ?? 0) / 3);
+}
+
+/** About how many tokens a history entry takes, a photo or PDF shown counted as 1,500. */
+function size(entry: ChatMessage): number {
+  if (entry.role === "assistant") return tokens(entry.content) + tokens(JSON.stringify(entry.toolCalls ?? []));
+  if (entry.role === "tool") return tokens(entry.content);
+  return tokens(entry.content) + (entry.media?.filter((m) => m.data).length ?? 0) * 1_500;
+}
+
 /** A photo or PDF as it is stored: named, without its bytes. */
 function stored(media: Media): Media {
   const { data: _bytes, ...rest } = media;
@@ -1172,15 +1338,20 @@ function stored(media: Media): Media {
 
 /** A history entry as the model is sent it: media no longer shown are taken off, and it is told. */
 function forModel(entry: ChatMessage): ChatMessage {
-  if (entry.role !== "user" || !entry.media) return entry;
+  if (entry.role !== "user") return entry;
+  if (!entry.media) return { role: "user", content: entry.content };
   const shown = entry.media.filter((m) => m.data);
-  if (shown.length === entry.media.length) return entry;
+  if (shown.length === entry.media.length) return { role: "user", content: entry.content, media: entry.media };
   return { role: "user", content: `${entry.content}\n${NOT_SHOWN}`, ...(shown.length ? { media: shown } : {}) };
 }
 
 /** A tool's output as events carry it: whole up to 4,000 characters (for debugging and observability). */
 function clipOutput(text: string): string {
   return text.length > 4_000 ? `${text.slice(0, 4_000)}…` : text;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function clip(text: string): string {

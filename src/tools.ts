@@ -14,6 +14,16 @@ export interface ToolContext {
   person: string;
   /** The channel of their latest message. */
   channel: string;
+  /** The model's id for this call, as the history keeps it. */
+  callId: string;
+  /**
+   * The same for the same tool with the same input in the same turn, also when that turn runs
+   * again after a restart (a cut-off call is not rerun, but the agent may call it again): pass it
+   * to your backend so a booking or payment happens once.
+   */
+  idempotencyKey: string;
+  /** Aborted when the conversation closes (the person was forgotten): stop and drop the work. */
+  signal: AbortSignal;
 }
 
 export interface Tool<Input = any> {
