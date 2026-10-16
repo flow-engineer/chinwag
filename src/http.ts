@@ -105,7 +105,7 @@ export type NudgeAgent = Pick<Agent, "recordNudge" | "nudgeState" | "channels" |
 export function nudgeHandler(agent: NudgeAgent, options: NudgeHandlerOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   requireToken(options?.token, "chinwag nudges");
   const token = options.token;
-  const base = (options.base ?? "/nudges").replace(/\/+$/, "");
+  const base = withoutTrailingSlashes(options.base ?? "/nudges");
   const tries = wrongTries();
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -205,7 +205,7 @@ const QuietHoursBody = z.object({ to: To, quiet_hours: z.union([Hours, z.literal
 export function peopleHandler(agent: Pick<Agent, "setTimeZone" | "setQuietHours" | "contact" | "channels">, options: PeopleHandlerOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   requireToken(options?.token, "chinwag people");
   const token = options.token;
-  const base = (options.base ?? "/people").replace(/\/+$/, "");
+  const base = withoutTrailingSlashes(options.base ?? "/people");
   const tries = wrongTries();
   const routes = new Set(["time-zone", "quiet-hours", "contact"]);
   const unknown = { status: "refused", reason: "unknown_person" };
@@ -250,6 +250,13 @@ export function peopleHandler(agent: Pick<Agent, "setTimeZone" | "setQuietHours"
       console.warn("chinwag people:", error);
       if (!res.headersSent) json(res, 500, { error: "that could not be done" });
     });
+}
+
+/** A path with its trailing slashes taken off, in one pass (no regular expression to backtrack). */
+export function withoutTrailingSlashes(path: string): string {
+  let end = path.length;
+  while (end > 0 && path[end - 1] === "/") end--;
+  return path.slice(0, end);
 }
 
 /** The parsed JSON body, or undefined when it is too large or not JSON. */

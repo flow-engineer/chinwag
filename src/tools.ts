@@ -7,11 +7,14 @@ import type { ToolSpec } from "./types.ts";
 export interface ToolContext {
   conversationId: string;
   /**
-   * Who the person is, as Chinwag verified it: the owner's own key from `resolve`, a phone number
-   * the channel verified, or the channel and its address. Key a person's data by this, never by an
-   * id the model passed.
+   * Who the person is, as Chinwag verified it, in one of three forms: `key:<resolve's value>` when
+   * the owner's `resolve` knew them, else `phone:<E.164>` (`phone:+15551234567`) for a number a
+   * phone channel verified, else `<channel>:<address>`. It is the stable id to key a person's data
+   * by, never an id the model passed. To look them up in your own backend, use `key`.
    */
   person: string;
+  /** Exactly what the owner's `resolve` returned for this person (no `key:`), or null when they are known only by phone or channel and address. */
+  key: string | null;
   /** The channel of their latest message. */
   channel: string;
   /** The model's id for this call, as the history keeps it. */

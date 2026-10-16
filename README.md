@@ -173,7 +173,7 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
 ```
 
 - **Each platform's rules are built in:** WhatsApp buttons, lists, replies, reactions and its 24-hour window; SMS as plain text in segments; your app's own fields. Features your provider lacks are never offered to the model.
-- **One person, one conversation.** The same number on SMS and WhatsApp is one person, however each provider writes it (`+1 555 010 0100`, `15550100100`: both are `+15550100100`), also when their first messages on both arrive at once. If your SMS provider gives national numbers (`098765 43210`), set `createAgent({ defaultCountryCode: "+91" })`: on every phone channel but WhatsApp, a number with no `+` or `00` is then read as that country's (its trunk 0 dropped), so it joins `919876543210` on WhatsApp; without it, bare digits are taken as international. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses.
+- **One person, one conversation.** The same number on SMS and WhatsApp is one person, however each provider writes it (`+1 555 010 0100`, `15550100100`: both are `+15550100100`), also when their first messages on both arrive at once. If your SMS provider gives national numbers (`098765 43210`), set `createAgent({ defaultCountryCode: "+91" })`: on every phone channel but WhatsApp, a number with no `+` or `00` is then read as that country's (its trunk 0 dropped), so it joins `919876543210` on WhatsApp; without it, bare digits are taken as international. Anything else (your app, your website) is joined only by your `resolve`. Chinwag never guesses. A tool sees who the person is as `context.person`, the stable id to key their data by: `key:<your resolve's value>`, else `phone:<E.164>` (`phone:+15550100100`), else `<channel>:<address>`. `context.key` is your `resolve`'s value as it returned it (`customer-7`), or null when the person is known only by phone or channel, so `members.get(context.key)` finds them.
 - **The agent gets one send tool per channel** (`send_sms`, `send_whatsapp`, `send_app`) and answers each message where it came in. `instructions` guide the agent on that channel only.
 
 ## What the agent knows about the person
@@ -319,6 +319,7 @@ The contract is [`spec/nudges.openapi.yaml`](spec/nudges.openapi.yaml). In code,
 - Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). Postgres: `postgres(pool)` over your own node-postgres pool. Any other engine: implement the three-method `Database` interface, or pass a whole `store` of your own.
 - After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun. A tool's `context.idempotencyKey` is the same when the agent calls it again with the same input in that turn, so your backend can do it once; `context.callId` and `context.signal` (aborted when the person is forgotten) are there too.
 - Pass the provider's own id as `messageId` to `agent.message()`: a webhook the provider sends again is taken once. Ids are kept 7 days (`keepMessageIdsDays`); once an hour one runner deletes older ones, a batch at a time, on the scheduled messages' timer.
+- Run one copy of an agent per database. Scheduled messages, upkeep and a provider's retried webhooks are claimed in the database, so they happen once whichever copy takes them; a conversation, though, lives in one process (its turn, folded double texts, background tools), and two copies taking messages for the same conversation would run overlapping turns. On a platform that adds instances under load, set it to exactly one instance, kept warm, with CPU always on, and use a durable `database`.
 - `agent.status()` says whether anything is running and for how long it has been idle, so your platform can stop idle agents and start them on the next message.
 - Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file. An `EventSink` is a function that gets each event (`{ type, conversationId, at, ... }`) and must not throw:
 
@@ -531,6 +532,10 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 ## With a coding agent
 
 `chinwag new` puts the skills in your agent's `.claude/skills/`. They are also in [`coding-agents/`](https://github.com/flow-engineer/chinwag/tree/main/coding-agents): `skill.md` builds an agent, `tools-skill.md` writes tools and their test files, `test-skill.md` writes scenarios. The café in [`examples/cafe`](https://github.com/flow-engineer/chinwag/tree/main/examples/cafe) is a complete agent with tests to copy from.
+
+## Roadmap
+
+- **Several copies of one agent.** Each conversation owned by one copy at a time (a claim in the database, taken over when a copy stops), so an agent can run on more than one instance. Until then, run one copy (see [State, restarts and hosting](#state-restarts-and-hosting)).
 
 ## Contributing
 

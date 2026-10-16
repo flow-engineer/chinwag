@@ -55,12 +55,16 @@ test("different numbers, and a web visitor with no resolver, are never joined", 
   assert.equal(new Set([a!.conversationId, b!.conversationId, c!.conversationId]).size, 3);
 });
 
+/** A tool that records who it ran for: `context.person` and `context.key`. */
+function whoami(seen: Array<{ person: string; key: string | null }>) {
+  return tool({ name: "whoami", description: "", input: z.object({}), run: (_input, { person, key }) => (seen.push({ person, key }), "ok") });
+}
+
 test("the owner's resolver joins a web visitor to the person, and tools get who they are", async () => {
-  const seen: string[] = [];
-  const whoami = tool({ name: "whoami", description: "", input: z.object({}), run: (_input, context) => (seen.push(context.person), "ok") });
+  const seen: Array<{ person: string; key: string | null }> = [];
   const h = multi({
     channels: { sms: { info: SMS, phone: true }, web: { info: WEB_APP } },
-    tools: [whoami],
+    tools: [whoami(seen)],
     resolve: ({ address }) => (address === "+15550100100" || address === "session-sam" ? "customer-7" : null),
   });
   const a = await h.message("sms", "+15550100100", "hi");
@@ -71,7 +75,22 @@ test("the owner's resolver joins a web visitor to the person, and tools get who 
   (await h.nextCall(1)).answer(respond(call("send_web", { text: "Hello again." }), call("whoami")));
   (await h.nextCall(2)).answer(respond());
   await h.agent.conversation(a!.conversationId)!.whenIdle();
-  assert.deepEqual(seen, ["key:customer-7"]);
+  assert.deepEqual(seen, [{ person: "key:customer-7", key: "customer-7" }], "key is resolve's value as returned");
+});
+
+test("a person resolve does not know is keyed by their verified phone, with no key, in tools", async () => {
+  const seen: Array<{ person: string; key: string | null }> = [];
+  const h = multi({ channels: { sms: { info: SMS, phone: true } }, tools: [whoami(seen)], resolve: () => null });
+  const a = await h.message("sms", "+1 (555) 010-0300", "hi");
+  (await h.nextCall(0)).answer(respond(call("send_sms", { text: "Hi!" }), call("whoami")));
+  (await h.nextCall(1)).answer(respond());
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.deepEqual(seen, [{ person: "phone:+15550100300", key: null }]);
+});
+
+test("a channel may not be named key or phone, so a channel identity never reads as a resolve key or a phone", () => {
+  assert.throws(() => multi({ channels: { key: { info: WEB_APP } } }), /"key" is reserved/);
+  assert.throws(() => multi({ channels: { phone: { info: SMS, phone: true } } }), /"phone" is reserved/);
 });
 
 test("each channel's send tool is named for it from the first message; a second channel adds one and changes nothing", async () => {

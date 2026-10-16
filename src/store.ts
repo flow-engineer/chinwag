@@ -236,6 +236,7 @@ export class Store {
     return rows.map(identityOf);
   }
 
+  /** The conversation of one person, by their person key: `key:<resolve's value>`, `phone:<E.164>` or `<channel>:<address>`. */
   async conversationByKey(personKey: string): Promise<ConversationRow | null> {
     const [row] = await this.db.query("SELECT * FROM conversations WHERE agent_id = ? AND person_key = ?", [this.agentId, personKey]);
     return row ? conversationOf(row) : null;
