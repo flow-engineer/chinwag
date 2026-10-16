@@ -33,6 +33,8 @@ test("chinwag new makes an agent of its own: chinwag imports, a package on this 
   assert.equal(pkg.scripts.test, "chinwag test");
   assert.equal(pkg.engines.node, own.engines.node);
   assert.equal(readFileSync(join(dir, ".npmrc"), "utf8"), "engine-strict=true\n");
+  // The key and each test session's results (.chinwag/last-session.json) stay out of git.
+  assert.deepEqual(readFileSync(join(dir, ".gitignore"), "utf8").split("\n").filter(Boolean), ["node_modules/", ".env", ".chinwag/"]);
   assert.equal(JSON.parse(readFileSync(join(dir, "tsconfig.json"), "utf8")).extends, undefined);
   for (const skill of ["chinwag", "chinwag-tools", "chinwag-tests"]) assert.ok(existsSync(join(dir, ".claude", "skills", skill, "SKILL.md")), skill);
   assert.equal(readFileSync(join(dir, "CLAUDE.md"), "utf8"), "@AGENTS.md\n");
