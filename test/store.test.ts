@@ -231,6 +231,31 @@ test("a provider's message id is kept with what its message stored, so a crash b
   }
 });
 
+test("a message intercept answered is answered once when the provider sends it again, also after a restart, and the agent still reads it", async () => {
+  const path = file();
+  const intercept = (_id: string, text: string) => (/chest pain/i.test(text) ? "Call 911 now." : null);
+  const before = multi({ channels: CHANNELS, database: sqlite(path), intercept });
+  await before.agent.resume();
+  const sent = { channel: "sms", from: "+15550100100", message: "I have chest pain", messageId: "SM1" };
+  assert.equal(await before.agent.message(sent), null);
+  await before.agent.message(sent);
+  assert.deepEqual(before.texts(), ["Call 911 now."]);
+  const id = before.events.find((e) => e.type === "message.in")!.conversationId;
+  await before.agent.conversation(id)!.whenIdle();
+
+  const after = multi({ channels: CHANNELS, database: sqlite(path), dir: before.dir, intercept });
+  await after.agent.resume();
+  await after.agent.message(sent);
+  assert.deepEqual(after.texts(), [], "not answered again");
+  assert.deepEqual([...before.events, ...after.events].filter((e) => e.type === "message.in" || e.type === "message.duplicate").map((e) => e.type), ["message.in", "message.duplicate", "message.duplicate"]);
+  await after.agent.message({ ...sent, message: "it's better now", messageId: "SM2" });
+  const next = await after.nextCall(0);
+  assert.deepEqual(users(next.request.messages), ["[SM1] I have chest pain\n[Chinwag] The business's own rules answered this for you on sms, as written:", "[SM2] it's better now"]);
+  next.answer(respond(call("send_sms", { text: "Glad to hear it." })));
+  await after.agent.conversation(id)!.whenIdle();
+  assert.deepEqual((await after.agent.transcript(id)).map((l) => (l.kind === "in" || l.kind === "out") && l.text), ["I have chest pain", "Call 911 now.", "it's better now", "Glad to hear it."]);
+});
+
 test("provider message ids are deleted once older than 7 days, in batches, by one of two runners, at most hourly", async () => {
   const path = file();
   let deletes = [0, 0];

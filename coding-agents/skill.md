@@ -78,7 +78,9 @@ export function buildAgent(options: { model?: Model; events?: EventSink[]; tools
 Other `createAgent` options: `files` replaces `dir` on hosts with no file system (the folder's
 text by path: `{ "AGENTS.md": ..., "skills/<name>/SKILL.md": ... }`); `context(conversationId)` adds who the person is and the time to
 every turn (cheaper than a lookup tool); `intercept(conversationId, text, message)` answers a
-message without the model (return the reply, `""` for silence, or `null` to let the agent answer);
+message without the model (return the reply, `""` for silence, or `null` to let the agent answer;
+the message and the reply are kept in the history, so the next turn knows, and in the transcript,
+and are `message.in`/`message.out` events marked `answered: true`);
 `deadlineMs` (default 60,000) is the longest a reply waits for a tool before it moves to the
 background (set a tool's own `deadlineMs` for a known-slow one); `partialAfterMs` (default 5,000)
 is how long a finished tool's result waits for the others of its response; `shareUpdates` turns live status lines on web and app UIs off, or replaces their

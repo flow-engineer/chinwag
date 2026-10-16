@@ -29,6 +29,9 @@
 // - Everything is kept in the store as it happens: the history, the inbox of events not yet
 //   handled, background tools in flight. After a restart the conversation carries on.
 // - Scheduled messages and nudges arrive through the inbox and wait for the turn in progress.
+// - A message the agent's own rules answer with no model call (its intercept, a STOP, START or
+//   HELP keyword) is kept with what was sent back, in order with the person's other messages, and
+//   starts no turn: a turn running takes it in at its next step, else it is stored at once.
 // - Files the person sends: photos and PDFs go to the model when it reads them, a voice note as its
 //   transcript; anything it cannot read is named with why, so it can ask for text. Only the latest
 //   few are shown, and their bytes are never stored: after a restart they are named, not shown.
@@ -161,6 +164,14 @@ interface Pending {
   channel: string;
   media?: Media[];
   inbox?: number;
+  /** Answered with no model call: the agent reads it with what was sent back, and it starts no turn. */
+  answer?: Answer;
+}
+
+/** What a message answered with no model call got back ("" for nothing), and Chinwag's line about it (a STOP's). */
+interface Answer {
+  reply: string;
+  note?: string;
 }
 
 interface Note {
@@ -362,6 +373,72 @@ export class Conversation {
   }
 
   /**
+   * A message the agent's own rules answered with no model call (its intercept, a STOP, START or
+   * HELP keyword), and `reply`, what goes back to them ("" for nothing). Both join the history in
+   * order with their other messages, at the next step of a turn running now or else at once, and
+   * start no turn. Null when the channel gave this message before.
+   *
+   * `taken` is false when its provider id was taken first (by another runner, or before the STOP
+   * written in `claimed`, which already holds the id): nothing is kept then. `send` delivers the
+   * reply, unless it was not taken; it starts the delivery at once, so call it once `taken` where
+   * a retry must not be answered twice.
+   */
+  answered(input: string | Incoming, options: { channel: string; messageId?: string; claimed?: Promise<boolean>; note?: string }, reply: string): { id: string; taken: Promise<boolean>; send(): Promise<void> } | null {
+    const incoming: Incoming = typeof input === "string" ? { text: input } : input;
+    const { channel, messageId } = options;
+    if (messageId !== undefined && this.messageIds.get(messageId) === channel) {
+      this.settings.emit(this.id, "message.duplicate", { messageId, channel });
+      return null;
+    }
+    const id = messageId ?? `m${++this.messageCount}`;
+    this.messageIds.set(id, channel);
+    const none: Files = { marks: [], media: [] };
+    const answer: Answer = { reply, ...(options.note ? { note: options.note } : {}) };
+    const item: Pending = { id, text: describe(incoming, none), shown: shownText(incoming, none), ...(incoming.choice ? { choice: true } : {}), channel, answer };
+    this.pending.push(item);
+    const at = this.settings.now();
+    this.recentChannels = [...this.recentChannels, channel].slice(-5);
+    const link = this.channels.get(channel);
+    if (link) link.lastMessageAt = at;
+    const fields = { messageCount: this.messageCount, recentChannels: this.recentChannels };
+    const ownId = messageId !== undefined;
+    let lost = false;
+    const stored = this.persist(async () => {
+      if (options.claimed && !(await options.claimed)) return void (lost = true);
+      const payload = { id, text: item.text, shown: item.shown, ...(item.choice ? { choice: true } : {}), channel, answer };
+      // Its provider id is written with it (unless the STOP already holds it), so a retry is not answered again.
+      const inbox = await this.settings.store.addMessage(this.id, payload, ownId && !options.claimed ? { channel, messageId: id } : undefined);
+      if (inbox === null) return void (lost = true);
+      item.inbox = inbox;
+      this.knownInbox.add(inbox);
+      await this.settings.store.updateConversation(this.id, fields);
+      if (link) await this.settings.store.touchIdentity(channel, link.address, at);
+    });
+    const taken = stored.then(() => {
+      if (this.closed) return false;
+      if (lost) {
+        this.pending = this.pending.filter((waiting) => waiting !== item);
+        this.settings.emit(this.id, "message.duplicate", { messageId: id, channel });
+        this.checkIdle();
+        return false;
+      }
+      this.settings.emit(this.id, "message.in", { text: incoming.text, messageId: id, ownId, channel, replyTo: incoming.replyTo, choice: incoming.choice, answered: true });
+      return true;
+    });
+    const send = async () => {
+      const failure = reply ? await this.send(channel, { type: "message", text: reply }) : null;
+      if (!(await taken)) return;
+      if (failure) {
+        // Kept as answered with nothing, if it is not in the history yet; the agent hears it did not arrive.
+        answer.reply = "";
+        this.undelivered(reply, failure);
+      } else if (reply) this.settings.emit(this.id, "message.out", { text: reply, channel, direct: true, answered: true });
+      if (!this.running && !this.timer) void this.run();
+    };
+    return { id, taken, send };
+  }
+
+  /**
    * What the agent gets of the person's files: photos and PDFs the model reads, a voice note as its
    * transcript, and for anything else a mark saying why it cannot be read, so it can ask for text.
    */
@@ -416,11 +493,13 @@ export class Conversation {
     const p = row.payload as Record<string, any>;
     if (row.kind === "message") {
       // Its photos and PDFs are named, not shown: their bytes were never stored.
-      this.pending.push({ id: p.id, text: p.text, shown: p.shown ?? p.text, ...(p.choice ? { choice: true } : {}), channel: p.channel, inbox: row.id, ...(Array.isArray(p.media) ? { media: p.media } : {}) });
+      this.pending.push({ id: p.id, text: p.text, shown: p.shown ?? p.text, ...(p.choice ? { choice: true } : {}), channel: p.channel, inbox: row.id, ...(Array.isArray(p.media) ? { media: p.media } : {}), ...(p.answer ? { answer: p.answer } : {}) });
       this.messageIds.set(p.id, p.channel);
-      this.unanswered.add(p.channel);
-      this.firstResponse = true;
-      this.wakeTools?.();
+      if (!p.answer) {
+        this.unanswered.add(p.channel);
+        this.firstResponse = true;
+        this.wakeTools?.();
+      }
     } else if (row.kind === "note") {
       this.notes.push({ text: p.text, inbox: row.id, wait: p.wait === true });
     } else if (row.kind === "schedule") {
@@ -451,26 +530,28 @@ export class Conversation {
   }
 
   /**
-   * They texted a STOP or START keyword: their STOP is kept (or lifted) with no model call, and
-   * the agent learns it at its next turn. Resolves once it is stored.
+   * They texted a STOP or START keyword: their STOP is kept (or lifted) with no model call, with
+   * the message's provider id. Returns the line the agent learns it by, kept with the message
+   * (`answered`), and `stored`, false when that id was taken before.
    */
-  keyword(kind: "stop" | "start", text: string, channel: string, messageId?: string): Promise<void> {
+  keyword(kind: "stop" | "start", text: string, channel: string, messageId?: string): { note: string; stored: Promise<boolean> } {
     const { store } = this.settings;
     const inbound = messageId === undefined ? undefined : { channel, messageId };
     this.settings.emit(this.id, "keyword", { keyword: kind, text, channel });
+    let taken = true;
+    const keep = (rule: NoContactRow | null) => this.persist(async () => void (taken = await store.setStop(this.id, rule, inbound))).then(() => taken);
     if (kind === "stop") {
       const rule: NoContactRow = { id: `nc_stop_${randomUUID().slice(0, 6)}`, rule: `nothing the business starts: they texted ${text.trim()} on ${channel}; only START lifts it`, until: null, hard: true };
       this.stop = rule;
-      this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: nothing the business starts (nudges, scheduled messages) reaches them until they text START. Answer them when they write.`, true);
-      return this.persist(() => store.setStop(this.id, rule, inbound));
+      return { note: `[Chinwag] They texted "${clip(text.trim())}" on ${channel}: nothing the business starts (nudges, scheduled messages) reaches them until they text START. Answer them when they write.`, stored: keep(rule) };
     }
     this.stop = null;
-    this.note(`[Chinwag] They texted "${clip(text.trim())}" on ${channel}: messages the business starts may reach them again.`, true);
-    return this.persist(() => store.setStop(this.id, null, inbound));
+    return { note: `[Chinwag] They texted "${clip(text.trim())}" on ${channel}: messages the business starts may reach them again.`, stored: keep(null) };
   }
 
   get busy(): boolean {
-    return this.running || this.timer !== null || this.tasks.size > 0 || this.preparing !== null;
+    // A message answered with no model call waits in `pending` for its reply to go and its place in the history.
+    return this.running || this.timer !== null || this.tasks.size > 0 || this.preparing !== null || this.pending.length > 0;
   }
 
   get idleForMs(): number {
@@ -547,6 +628,11 @@ export class Conversation {
     if ((this.resumeTurn || this.hasWork()) && !this.running) this.schedule(0);
   }
 
+  /** Messages from the person the agent has yet to answer (not those answered with no model call). */
+  private unread(): boolean {
+    return this.pending.some((p) => !p.answer);
+  }
+
   private hasWork(): boolean {
     return this.pending.length > 0 || this.notes.some((n) => !n.wait) || this.direct.length > 0;
   }
@@ -577,12 +663,17 @@ export class Conversation {
       await this.loaded;
       for (;;) {
         if (this.closed) break;
-        if (this.pending.length || this.notes.some((n) => !n.wait) || this.resumeTurn) {
+        if (this.unread() || this.notes.some((n) => !n.wait) || this.resumeTurn) {
           try {
             await this.turn();
           } catch (error) {
             await this.turnFailed(error);
           }
+          continue;
+        }
+        // Only messages answered with no model call: into the history, with no turn.
+        if (this.pending.length) {
+          this.absorb();
           continue;
         }
         const next = this.direct.shift();
@@ -653,15 +744,39 @@ export class Conversation {
     }
     const messages = this.pending.splice(0);
     if (messages.length) {
-      this.theirMessages = true;
       const tag = this.settings.tagChannels || this.channels.size > 1;
-      const media = messages.flatMap((m) => m.media ?? []);
-      const said: PersonMessage[] = messages.map((m) => ({ id: m.id, channel: m.channel, text: m.shown, ...(m.choice ? { choice: true } : {}) }));
-      this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n"), ...(media.length ? { media } : {}), messages: said });
-      if (media.length) this.showLatestMedia();
+      const line = (m: Pending) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`;
+      const said = (m: Pending): PersonMessage => ({ id: m.id, channel: m.channel, text: m.shown, ...(m.choice ? { choice: true } : {}) });
+      // In order: the messages the agent answers, together in one entry, and each answered with no
+      // model call as one of its own, with what was sent back as the agent's (as a text nudge is).
+      let group: Pending[] = [];
+      const read = () => {
+        if (!group.length) return;
+        const media = group.flatMap((m) => m.media ?? []);
+        this.history.push({ role: "user", content: group.map(line).join("\n"), ...(media.length ? { media } : {}), messages: group.map(said) });
+        if (media.length) this.showLatestMedia();
+        group = [];
+      };
+      for (const m of messages) {
+        if (!m.answer) {
+          group.push(m);
+          continue;
+        }
+        read();
+        const how = m.answer.reply ? `[Chinwag] The business's own rules answered this for you on ${m.channel}, as written:` : `[Chinwag] The business's own rules took this message for you on ${m.channel} and sent nothing back.`;
+        this.history.push({ role: "user", content: [line(m), m.answer.note, how].filter(Boolean).join("\n"), messages: [said(m)] });
+        if (m.answer.reply) {
+          const callId = `answered_${randomUUID().slice(0, 8)}`;
+          this.history.push({ role: "assistant", content: null, toolCalls: [{ id: callId, name: sendToolName(m.channel), arguments: JSON.stringify({ text: m.answer.reply }) }] });
+          this.history.push({ role: "tool", toolCallId: callId, content: JSON.stringify({ delivered: true, channel: m.channel }) });
+        }
+      }
+      read();
       items.push(...messages);
-      for (const channel of new Set(messages.map((m) => m.channel))) {
-        if (this.channels.get(channel)?.info.readReceipts) void this.send(channel, { type: "read", messageIds: messages.filter((m) => m.channel === channel).map((m) => m.id) });
+      const theirs = messages.filter((m) => !m.answer);
+      if (theirs.length) this.theirMessages = true;
+      for (const channel of new Set(theirs.map((m) => m.channel))) {
+        if (this.channels.get(channel)?.info.readReceipts) void this.send(channel, { type: "read", messageIds: theirs.filter((m) => m.channel === channel).map((m) => m.id) });
       }
     }
     this.flush(items);
@@ -695,7 +810,7 @@ export class Conversation {
     const { store } = this.settings;
     const noContact = await store.noContact(this.id, this.settings.now());
     this.stop = noContact.find((r) => r.hard) ?? null;
-    if (this.stop && !this.resumeTurn && !this.pending.length && !this.notes.some((n) => !n.wait && !n.owed)) {
+    if (this.stop && !this.resumeTurn && !this.unread() && !this.notes.some((n) => !n.wait && !n.owed)) {
       // Only what the business started is waiting, and they texted STOP: it is dropped, no turn runs.
       this.absorb();
       return;
@@ -1108,7 +1223,7 @@ export class Conversation {
         break;
       }
       const now = Date.now();
-      const all: Detach | null = this.pending.length ? "message" : firstDoneAt !== null && now - firstDoneAt >= this.settings.partialAfterMs ? "partial" : null;
+      const all: Detach | null = this.unread() ? "message" : firstDoneAt !== null && now - firstDoneAt >= this.settings.partialAfterMs ? "partial" : null;
       if (all) {
         for (const { i, r } of open) results[i] = this.detach(r, all);
         break;
