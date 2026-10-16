@@ -83,12 +83,14 @@ written in scenarios: the dashboard shows it for the whole run (average, p95, mi
 Tests run in the Chinwag cloud: your agent stays on your machine with its own model and key and
 connects out to the cloud, which plays the person and the tools and judges.
 
-1. Have a test cloud to point at (one running on this machine answers at http://127.0.0.1:8900,
-   the default).
+1. Have a test cloud to point at: `--cloud <url>` or `CHINWAG_CLOUD`. **Get a test cloud.**
+   (Placeholder: how to get access to a hosted test cloud is coming soon.)
 2. From the agent's folder (it must export `buildAgent` and `tools` from `src/agent.ts`), which reads
    the agent's `.env` itself: `npx chinwag test --cloud <url> [--runs 3]` (`npm test` in an agent
    `chinwag new` made).
-3. It prints PASS or FAIL per run with every failed check and the judge's reason, and a link
+3. It first reads every test file as the cloud does; a mistake stops it with
+   `tests/scenarios/<file>.yaml:<line>: <field>: <what is wrong>`, one line each, and nothing is sent.
+   Then it prints PASS or FAIL per run with every failed check and the judge's reason, and a link
    to watch each conversation in the simulator. The cloud's dashboard, at its own address, shows
    every session over time and each scenario's history.
 

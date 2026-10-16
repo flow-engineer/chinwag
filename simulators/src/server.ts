@@ -554,6 +554,8 @@ export function simulators(options: SimulatorsOptions & { testCloud?: boolean; a
 
   const playgroundEvents: EventSink = (event) => {
     const person = people.get(event.conversationId);
+    // A failed turn (a wrong or expired model key, say) on the terminal too, also for no known person.
+    if (event.type === "model.error") console.error(`chinwag: model error${person ? ` (${person.name})` : ""}: ${String(event.error)}`);
     if (!person || !playing) return;
     for (const c of playing.channels()) show(threadKey(c.name, person), event);
   };

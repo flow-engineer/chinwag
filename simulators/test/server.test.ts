@@ -1,12 +1,12 @@
 // covers: simulators/src/server.ts simulators/src/platforms.ts src/agent.ts src/conversation.ts src/channels.ts
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { sqlite, type ChannelInfo, type ChannelSummary, type Deliver, type Incoming, type TemplateDefinition } from "../../src/index.ts";
-import { WHATSAPP, call, multi, respond } from "../../test/helpers.ts";
+import { createAgent, sqlite, type ChannelInfo, type ChannelSummary, type Deliver, type Incoming, type Model, type TemplateDefinition } from "../../src/index.ts";
+import { WHATSAPP, call, gate, multi, respond } from "../../test/helpers.ts";
 import { simulators, type AgentConnection, type Line } from "../src/index.ts";
 
 /** An agent that answers nothing by itself: the test delivers through the last `deliver` it got. */
@@ -332,5 +332,36 @@ test("the playground's Backend buttons run on the server behind its token, and t
     ]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("a turn's model error is printed on the terminal and reaches the playground's trace with its text", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chinwag-"));
+  writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
+  const play = simulators();
+  // The model fails only once the message is taken, so the playground knows whose conversation it is.
+  const asked = gate();
+  const model: Model = { complete: async () => { await asked.promise; throw new Error("401 Incorrect API key"); } };
+  const channels = [{ name: "whatsapp", kind: "custom" as const, info: WHATSAPP, phone: true, send: () => {} }];
+  const agent = createAgent({ dir, model, debounceMs: 0, events: [play.events], channels, database: sqlite(), testPeople: [SAM], scheduleCheckMs: 0 });
+  await agent.resume();
+  const printed = gate<string>();
+  const error = console.error;
+  console.error = (...args: unknown[]) => { if (String(args[0]).includes("model error")) printed.open(args.map(String).join(" ")); };
+  const server = await play.listen(agent, 0);
+  const where = `channel=whatsapp&person=${encodeURIComponent(SAM.phone)}`;
+  try {
+    const { seq } = await (await fetch(`${server.url}/api/transcript?${where}`)).json();
+    const sent = await fetch(`${server.url}/api/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "whatsapp", person: SAM.phone, text: "hi" }) });
+    assert.equal(sent.status, 202);
+    asked.open();
+    assert.equal(await printed.promise, "chinwag: model error (Sam): Error: 401 Incorrect API key");
+    await agent.conversation((await agent.testConversation(SAM.phone))!)!.whenIdle();
+    const polled = (await (await fetch(`${server.url}/api/poll?${where}&after=${seq}`)).json()) as { events: Array<{ type: string; event?: { type: string; error?: string } }> };
+    const traced = polled.events.flatMap((e) => (e.type === "trace" && e.event?.type === "model.error" ? [e.event.error] : []));
+    assert.deepEqual(traced, ["Error: 401 Incorrect API key"]);
+  } finally {
+    console.error = error;
+    await server.close();
   }
 });

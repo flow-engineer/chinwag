@@ -29,15 +29,15 @@ cp .env.example .env        # then put your OpenRouter key in it: OPENROUTER_API
 npm start
 ```
 
-`chinwag new <name>` makes `./<name>/` from the café example (lowercase letters, digits and dashes). Open the link `npm start` prints and text Pip, a café ordering assistant: your starting point. Pick a platform at the top (SMS, WhatsApp, iMessage, Telegram, web), and turn on **Debug** to see every tool call and how fast each message was answered. The new folder has the coding-agent skills in `.claude/skills/` and an `AGENTS.md` pointing at them, so you can tell Claude Code, Codex or any coding agent what to build.
+`chinwag new <name>` makes `./<name>/` from the café example (lowercase letters, digits and dashes). Open the link `npm start` prints and text Pip, a café ordering assistant: your starting point. Pick a platform at the top (SMS, WhatsApp, iMessage, Telegram, web), and turn on **Debug** to see every tool call and how fast each message was answered. A model call that fails (a wrong or expired key, say) shows in the chat, in Debug and on the terminal. The café's `src/agent.ts` reads its model id from `CAFE_MODEL` (default: the model for the key you set, see [Models](#models)). The new folder has the coding-agent skills in `.claude/skills/` and an `AGENTS.md` pointing at them, so you can tell Claude Code, Codex or any coding agent what to build.
 
 ### In a folder of your own
 
 ```bash
-npm i chinwag
+npm init -y && npm pkg set type=module && npm i chinwag
 ```
 
-`src/main.ts` (with `"type": "module"` in your `package.json`):
+`src/main.ts`:
 
 ```ts
 import { createAgent, openAICompatible, sms, whatsapp } from "chinwag";
@@ -195,7 +195,12 @@ await agent.nudge({ to: { channel: "whatsapp", address: "+15550100100" }, prompt
 - Everything is stored as it happens: history, messages not yet handled, background tools, schedules. SQLite is built in (`sqlite("file.db")`; in memory by default). Postgres: `postgres(pool)` over your own node-postgres pool. Any other engine: implement the three-method `Database` interface, or pass a whole `store` of your own.
 - After a restart, `await agent.resume()` carries on: cut-off turns run again, and background tools that were running are reported as interrupted, never silently rerun.
 - `agent.status()` says whether anything is running and for how long it has been idle, so your platform can stop idle agents and start them on the next message.
-- Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file.
+- Every message, turn, model call (tokens and cost), tool and schedule is an event. Send events wherever you like; `jsonlSink(path)` writes them to a file. An `EventSink` is a function that gets each event (`{ type, conversationId, at, ... }`) and must not throw:
+
+  ```ts
+  const log: EventSink = (event) => console.log(event.type, event.conversationId);
+  createAgent({ /* ... */ events: [log] });
+  ```
 - Traces: with `CHINWAG_TRACES_KEY` and `CHINWAG_TRACES_URL` set, every turn is posted as an OTLP/JSON trace to `<url>/v1/traces` (`CHINWAG_TRACES_CONTENT=1` adds what was written; without it, metadata only).
 
 ## Testing
@@ -226,17 +231,21 @@ expect:
 npx chinwag test --cloud <test cloud URL> --runs 3 --only latte-correction
 ```
 
-A hosted test cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic` (your attestation that the test files hold no real customer data). Your agent stays on your machine with its own model and key; the test cloud plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation.
+**Get a test cloud.** (Placeholder: how to get access to a hosted test cloud is coming soon.)
+
+`chinwag test` needs a test cloud: pass `--cloud <url>` or set `CHINWAG_CLOUD`. A hosted test cloud takes its key in `CHINWAG_CLOUD_KEY` and `--synthetic` (your attestation that the test files hold no real customer data). Your agent stays on your machine with its own model and key; the test cloud plays the person and the tools and judges each run. The cloud is a hosted service, not part of this package. The command prints pass or fail per run, with the judge's reasons, the cost, and a link to watch each conversation. Before anything is sent it reads every test file as the cloud does, and a mistake stops it with the file and line (`tests/scenarios/latte-correction.yaml:3: person.goal: missing`).
 
 The command exits 0 when every run passed, and 1 when the session finished and a run failed. A refusal from the cloud (a bad CI key, an invalid suite, the spend cap) or a failure before the session opens exits 1 and prints only that message. If the tunnel, the stream, or the connection fails after the session has opened, it exits 2: the runs that had already finished are printed, then `N of M runs finished before: <reason>`, then the dashboard link. Ctrl-C prints that same partial report, says the cloud keeps playing until it is stopped from the dashboard, and exits 130.
 
 ### Test an agent you already have
 
-An agent built on any framework is tested through an HTTP endpoint, with no rewrite. From a folder with `tests/scenarios/*.yaml`:
+An agent built on any framework is tested through an HTTP endpoint, with no rewrite. It needs a test cloud like any run (see [Testing](#testing)): `--cloud` or `CHINWAG_CLOUD`, and for a hosted one `CHINWAG_CLOUD_KEY` and `--synthetic`. From a folder with `tests/scenarios/*.yaml`, with your agent running:
 
 ```bash
-npx chinwag test --agent-url http://localhost:3000/chinwag
+npx chinwag test --agent-url http://localhost:3000/chinwag --cloud <test cloud URL> --synthetic
 ```
+
+Before the session opens, the command sends one `HEAD` request to the URL (never a message), and stops with "Could not reach your agent at <url>" if nothing answers; any HTTP status counts as an answer.
 
 `chinwag test` runs on your machine and POSTs each of the person's messages to that URL from there, so your agent never has to be reachable from the internet (`http://localhost` is fine). The request is JSON, with `authorization: Bearer <CHINWAG_AGENT_TOKEN>` when that variable is set:
 
@@ -255,7 +264,7 @@ Keep the conversation's history by `conversationId`, as you would per phone numb
 { "replies": [{ "type": "message", "text": "We're open 8am to 6pm today.", "buttons": ["Order ahead"] }] }
 ```
 
-A minimal server, with no dependencies (the whole file is [`examples/http-agent/server.mjs`](examples/http-agent/server.mjs)):
+A minimal server, with no dependencies (the whole file is [`examples/http-agent/server.mjs`](https://github.com/flow-engineer/chinwag/blob/main/examples/http-agent/server.mjs), with a test scenario beside it; it also ships in the package, in `node_modules/chinwag/examples/http-agent`):
 
 ```js
 import { createServer } from "node:http";

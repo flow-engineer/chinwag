@@ -1,8 +1,8 @@
-// covers: testing/src/cli.ts
+// covers: testing/src/cli.ts testing/src/suite.ts
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,11 +58,11 @@ function cloud(hold: boolean) {
   });
 }
 
-function runCli(url: string, dir: string) {
+function runCli(url: string, dir: string, extra: string[] = []) {
   const env = { ...process.env };
   delete env.CHINWAG_CLOUD;
   delete env.CHINWAG_CLOUD_KEY;
-  return spawn(process.execPath, [cli, "test", "--cloud", url], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
+  return spawn(process.execPath, [cli, "test", "--cloud", url, ...extra], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
 }
 
 test("a stream that dies prints the runs already in and exits 2", { timeout: 15_000 }, async () => {
@@ -78,6 +78,60 @@ test("a stream that dies prints the runs already in and exits 2", { timeout: 15_
     assert.match(out, /1 of 1 runs finished before: the cloud closed the stream before the session finished/);
     assert.match(out, /http:\/\/dash\/s/);
   } finally { child.kill(); local.close(); }
+});
+
+/** Runs the CLI with these arguments, without the developer's cloud settings, and gives its exit code and output. */
+async function cliOutput(args: string[], dir: string, node: string[] = []): Promise<{ code: number | null; out: string }> {
+  const env: NodeJS.ProcessEnv = { ...process.env, OPENROUTER_API_KEY: "test-key" };
+  delete env.CHINWAG_CLOUD;
+  delete env.CHINWAG_CLOUD_KEY;
+  const child = spawn(process.execPath, [...node, cli, ...args], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  child.stdout.on("data", (chunk) => { out += chunk; });
+  child.stderr.on("data", (chunk) => { out += chunk; });
+  const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+  return { code, out };
+}
+
+test("the command line: --version, each command's own --help, and a plain line for a wrong flag", { timeout: 15_000 }, async () => {
+  const dir = agentDir();
+  const version = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")).version;
+  assert.deepEqual(await cliOutput(["--version"], dir), { code: 0, out: `${version}\n` });
+  const testHelp = await cliOutput(["test", "--help"], dir);
+  assert.equal(testHelp.code, 0);
+  assert.match(testHelp.out, /chinwag test \[options\]/);
+  assert.doesNotMatch(testHelp.out, /chinwag new <name>/);
+  const newHelp = await cliOutput(["new", "--help"], dir);
+  assert.match(newHelp.out, /chinwag new <name>/);
+  assert.doesNotMatch(newHelp.out, /--cloud/);
+  const bogus = await cliOutput(["test", "--bogus"], dir);
+  assert.equal(bogus.code, 1);
+  assert.match(bogus.out, /^chinwag: unknown option --bogus\n\nUsage:\n {2}chinwag test/);
+  assert.doesNotMatch(bogus.out, /ERR_PARSE_ARGS|\n\s+at /);
+  assert.deepEqual(await cliOutput(["test", "--runs", "abc"], dir), { code: 1, out: '--runs must be a whole number above 0, such as 3 (got "abc").\n' });
+  const old = await cliOutput(["new", "x"], dir, ["--import", 'data:text/javascript,Object.defineProperty(process.versions,"node",{value:"22.17.0"})']);
+  assert.deepEqual(old, { code: 1, out: "Chinwag needs Node 22.18 or newer (you have 22.17.0).\n" });
+  assert.ok(!existsSync(join(dir, "x")));
+});
+
+test("what is wrong on this machine is said before the cloud is called, and an address that does not answer is named", { timeout: 15_000 }, async () => {
+  const closed = "http://127.0.0.1:9";
+  const empty = mkdtempSync(join(tmpdir(), "chinwag-cli-"));
+  const noAgent = await cliOutput(["test", "--cloud", closed], empty);
+  assert.equal(noAgent.code, 1);
+  assert.match(noAgent.out, /^No src\/agent\.ts in .+ Run chinwag test from your agent's folder/);
+  const dir = agentDir();
+  writeFileSync(join(dir, "tests", "scenarios", "bad.yaml"), "id: bad\nchannels: [sms, fax]\nperson:\n  persona: a\nopening:\n  - say: hi\n");
+  assert.deepEqual(await cliOutput(["test", "--cloud", closed], dir), {
+    code: 1,
+    out: `${join("tests", "scenarios", "bad.yaml")}:2: channels[1]: Invalid option: expected one of "sms"|"whatsapp"|"imessage"|"telegram"|"web"\n${join("tests", "scenarios", "bad.yaml")}:3: person.goal: missing\n\nNothing was sent: fix the test files above.\n`,
+  });
+  const good = agentDir();
+  assert.match((await cliOutput(["test", "--cloud", closed, "--agent-url", "http://127.0.0.1:9/chinwag"], good)).out, /^Could not reach your agent at http:\/\/127\.0\.0\.1:9\/chinwag: ECONNREFUSED\. Start it first/m);
+  const named = await cliOutput(["test", "--cloud", closed], good);
+  assert.equal(named.code, 1);
+  assert.match(named.out, /^Could not reach http:\/\/127\.0\.0\.1:9: ECONNREFUSED\.$/m);
+  assert.match((await cliOutput(["test"], good)).out, /^Could not reach http:\/\/127\.0\.0\.1:8900: ECONNREFUSED\. Set CHINWAG_CLOUD or pass --cloud\.$/m);
 });
 
 test("Ctrl-C prints the same partial report and exits 130", { timeout: 15_000 }, async () => {
