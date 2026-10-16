@@ -187,6 +187,7 @@ test("a scheduled text from the business goes through their no-contact rules, as
   check.answer(respond(call("decide", { send: false })));
   await h.conversation.whenIdle();
   assert.deepEqual(h.texts("sms"), ["Hi!", "Got it."], "the scheduled sale text was dropped");
+  assert.ok(h.events.some((e) => e.type === "model.call" && e.purpose === "no-contact check"), "the check's cost is an event");
 });
 
 test("STOP on SMS stops everything the business starts, with no model call, until START; HELP gets the owner's reply", async () => {
@@ -220,4 +221,27 @@ test("STOP on SMS stops everything the business starts, with no model call, unti
   await h.conversation.whenIdle();
   assert.equal((await h.agent.nudge({ to: h.to, text: "Your order is ready." })).status, "sent");
   assert.equal(h.calls.length, 3);
+});
+
+test("a model error in a nudge texts the person nothing, and the nudge settles as failed; their own turn still says sorry", async () => {
+  const h = await withSam();
+  await h.message("sms", SAM.address, "no promos please");
+  (await h.nextCall(1)).answer(respond(call("send_sms", { text: "Got it." }), call("add_no_contact", { rule: "no promotions" })));
+  (await h.nextCall(2)).answer(respond());
+  await h.conversation.whenIdle();
+
+  const text = h.agent.nudge({ to: h.to, text: "Your session is tomorrow at 10." });
+  (await h.nextCall(3)).fail(new Error("503 overloaded"));
+  assert.deepEqual(await text, { id: (await text).id, status: "failed", reason: "their no-contact rules could not be checked: 503 overloaded" });
+  const prompt = h.agent.nudge({ to: h.to, prompt: "Their session is tomorrow at 10" });
+  (await h.nextCall(4)).fail(new Error("503 overloaded"));
+  assert.deepEqual(await prompt, { id: (await prompt).id, status: "failed", reason: "the agent's turn failed: 503 overloaded" });
+  await h.conversation.whenIdle();
+  assert.deepEqual(h.texts("sms"), ["Hi!", "Got it."], "no apology to someone who did not write");
+  assert.equal(h.events.filter((e) => e.type === "model.error").length, 2);
+
+  await h.message("sms", SAM.address, "is it at 10?");
+  (await h.nextCall(5)).fail(new Error("503 overloaded"));
+  await h.conversation.whenIdle();
+  assert.equal(h.texts("sms").at(-1), "Sorry, something went wrong on my side. Could you send that again?");
 });

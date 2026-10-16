@@ -10,7 +10,7 @@ import type { ChannelInfo, ChannelKind, ChatMessage, Keywords, Model, ModelReque
  * unless `followUps: "manual"`: then it is a call like any other.
  */
 export function scriptedModel(options: { followUps?: "auto" | "manual" } = {}) {
-  const calls: Array<{ request: ModelRequest; answer(r: ModelResponse): void }> = [];
+  const calls: Array<{ request: ModelRequest; answer(r: ModelResponse): void; fail(error: Error): void }> = [];
   const followUps: ModelRequest[] = [];
   const waiters: Array<() => void> = [];
   const model: Model = {
@@ -21,7 +21,7 @@ export function scriptedModel(options: { followUps?: "auto" | "manual" } = {}) {
       }
       return new Promise((resolve, reject) => {
         request.signal.addEventListener("abort", () => reject(new Error("aborted")));
-        calls.push({ request, answer: resolve });
+        calls.push({ request, answer: resolve, fail: reject });
         waiters.splice(0).forEach((w) => w());
       });
     },

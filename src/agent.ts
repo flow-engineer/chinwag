@@ -152,10 +152,16 @@ export interface NudgeInput {
 
 export interface NudgeResult {
   id: string;
-  /** sent, silent (the agent chose not to), dropped (a no-contact rule), refused, failed, or scheduled. */
-  status: string;
+  /**
+   * sent; silent (the agent chose not to); dropped (a no-contact rule, or their STOP); refused
+   * (outside_window, unknown_person); failed (it could not be sent, or the model failed: `reason`
+   * says why, and the person was sent nothing about it); or scheduled.
+   */
+  status: NudgeStatus;
   reason?: string;
 }
+
+export type NudgeStatus = "sent" | "silent" | "dropped" | "refused" | "failed" | "scheduled";
 
 const NO_EXTRAS: ChannelInfo = { reactions: false, status: false };
 
@@ -607,7 +613,7 @@ export class Agent {
   }
 
   private result(id: string, status: string, reason?: string | null): NudgeResult {
-    return reason ? { id, status, reason } : { id, status };
+    return reason ? { id, status: status as NudgeStatus, reason } : { id, status: status as NudgeStatus };
   }
 
   private mustBeResumed(): void {

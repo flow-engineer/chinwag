@@ -10,7 +10,7 @@ import { z } from "zod";
 import type { NoContactRow, StoreApi } from "./store.ts";
 import { endOfLocalDay, formatLocal } from "./time.ts";
 import { tool, toSpec, type Tool } from "./tools.ts";
-import type { Model } from "./types.ts";
+import type { Model, ModelResponse } from "./types.ts";
 
 export interface NoContactScope {
   store: StoreApi;
@@ -68,8 +68,11 @@ const decision = tool({
   run: () => "",
 });
 
-/** A fixed-text nudge to a person with rules: one small model call says whether a rule covers it. */
-export async function coveredBy(model: Model, rules: NoContactRow[], text: string): Promise<NoContactRow | null> {
+/**
+ * A fixed-text message the business starts, to a person with rules: one small model call says
+ * whether a rule covers it. Rejects when the model does; the caller sends nothing then.
+ */
+export async function coveredBy(model: Model, rules: NoContactRow[], text: string): Promise<{ rule: NoContactRow | null; usage?: ModelResponse["usage"]; model?: string }> {
   const response = await model.complete({
     system: "A business wants to send this message to a person. The person asked not to be messaged about some things. Decide whether any of their rules covers this message; call decide once.",
     messages: [{ role: "user", content: `Rules:\n${rules.map((r) => `- [${r.id}] ${r.rule}`).join("\n")}\n\nMessage:\n${text}` }],
@@ -83,6 +86,7 @@ export async function coveredBy(model: Model, rules: NoContactRow[], text: strin
   } catch {
     // An unreadable answer sends nothing: a rule the person set is safer kept than broken.
   }
-  if (parsed.send === true) return null;
-  return rules.find((r) => r.id === parsed.rule) ?? rules[0];
+  const said = { usage: response.usage, model: response.model };
+  if (parsed.send === true) return { rule: null, ...said };
+  return { rule: rules.find((r) => r.id === parsed.rule) ?? rules[0], ...said };
 }

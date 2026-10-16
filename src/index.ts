@@ -1,4 +1,4 @@
-export { Agent, createAgent, type AgentOptions, type AgentStatus, type NudgeInput, type NudgeResult, type PlaygroundSink, type ReceiveOptions, type TestPerson } from "./agent.ts";
+export { Agent, createAgent, type AgentOptions, type AgentStatus, type NudgeInput, type NudgeResult, type NudgeStatus, type PlaygroundSink, type ReceiveOptions, type TestPerson } from "./agent.ts";
 export {
   customUI,
   declaredTemplate,

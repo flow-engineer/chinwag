@@ -99,6 +99,7 @@ const ACKNOWLEDGE_FIRST =
   "[Chinwag] They have not heard from you yet. In one response, acknowledge them " +
   "(react to their message or send a short line) and make your tool calls again.";
 const INTERRUPTED = "[Chinwag] Cut off by a restart: this may or may not have happened. Check before you rely on it.";
+const APOLOGY = "Sorry, something went wrong on my side. Could you send that again?";
 const NOT_SHOWN = "[Chinwag] You are no longer shown the photos or documents in these messages; ask them to send one again if you need it.";
 
 /** Photos and PDFs the model is shown at once, the latest; each is resent on every model call. */
@@ -219,6 +220,8 @@ export class Conversation {
   private resumeTurn = false;
   /** Forgotten: nothing more runs, is sent or is kept. */
   private closed = false;
+  /** This turn took in a message from the person: if it fails, they are told. */
+  private theirMessages = false;
   /** They texted STOP (as of the latest look): what the business starts is dropped, with no model call. */
   private stop: NoContactRow | null = null;
 
@@ -546,22 +549,44 @@ export class Conversation {
       for (;;) {
         if (this.closed) break;
         if (this.pending.length || this.notes.some((n) => !n.wait) || this.resumeTurn) {
-          await this.turn();
+          try {
+            await this.turn();
+          } catch (error) {
+            await this.turnFailed(error);
+          }
           continue;
         }
         const next = this.direct.shift();
         if (!next) break;
-        await this.sendDirect(next);
+        try {
+          await this.sendDirect(next);
+        } catch (error) {
+          this.settings.emit(this.id, "model.error", { error: String(error) });
+          this.settle(next, "failed", errorText(error));
+          this.flush([next]);
+        }
       }
-    } catch (error) {
-      this.settings.emit(this.id, "model.error", { error: String(error) });
-      await this.send(this.currentChannel(), { type: "message", text: "Sorry, something went wrong on my side. Could you send that again?" });
     } finally {
       this.running = false;
       for (const channel of [...this.typingOn]) await this.typing(false, channel);
       for (const link of this.channels.values()) if (link.info.status) await this.send(link.name, { type: "status", text: null });
       this.checkIdle();
     }
+  }
+
+  /**
+   * A turn threw (the model failed): what it owed is settled as failed, what was waiting is taken
+   * in so it is not tried again, and only a person waiting on a reply is told something went wrong.
+   * A turn they did not start (a nudge, a scheduled message, a background result) stays silent.
+   */
+  private async turnFailed(error: unknown): Promise<void> {
+    this.settings.emit(this.id, "model.error", { error: String(error) });
+    this.absorb();
+    for (const o of this.owed.splice(0)) this.settle(o, "failed", `the agent's turn failed: ${errorText(error)}`);
+    this.resultUnsent = false;
+    this.persist(() => this.settings.store.updateConversation(this.id, { turnOpen: false }));
+    const waiting = this.theirMessages ? [...this.unanswered] : [];
+    if (waiting.length) await this.send(waiting.includes(this.currentChannel()) ? this.currentChannel() : waiting[0], { type: "message", text: APOLOGY });
   }
 
   private checkIdle(): void {
@@ -599,6 +624,7 @@ export class Conversation {
     }
     const messages = this.pending.splice(0);
     if (messages.length) {
+      this.theirMessages = true;
       const tag = this.settings.tagChannels || this.channels.size > 1;
       const media = messages.flatMap((m) => m.media ?? []);
       this.history.push({ role: "user", content: messages.map((m) => `[${tag ? `${m.channel} · ` : ""}${m.id}${m.text}`).join("\n"), ...(media.length ? { media } : {}) });
@@ -645,6 +671,7 @@ export class Conversation {
       return;
     }
     this.resumeTurn = false;
+    this.theirMessages = false;
     this.settings.emit(this.id, "turn.start", {});
     this.persist(() => store.updateConversation(this.id, { turnOpen: true }));
     this.absorb();
@@ -948,7 +975,19 @@ export class Conversation {
     if (!d.template && windowClosed(link, this.settings.now())) return settle("refused", "outside_window");
     // Every direct send is one the business starts (a nudge, or its scheduled text): the person's rules apply.
     const rules = await this.settings.store.noContact(this.id, this.settings.now());
-    const covered = rules.find((r) => r.hard) ?? (rules.length ? await coveredBy(this.settings.model, rules, d.text ?? `the template "${d.template?.name}"`) : null);
+    let covered = rules.find((r) => r.hard) ?? null;
+    if (!covered && rules.length) {
+      const started = Date.now();
+      try {
+        const check = await coveredBy(this.settings.model, rules, d.text ?? `the template "${d.template?.name}"`);
+        this.settings.emit(this.id, "model.call", { ms: Date.now() - started, toolCalls: ["decide"], usage: check.usage, purpose: "no-contact check", ...(check.model ? { model: check.model } : {}) });
+        covered = check.rule;
+      } catch (error) {
+        // Not knowing whether a rule covers it, nothing is sent, and the person hears nothing of it.
+        this.settings.emit(this.id, "model.error", { error: String(error), purpose: "no-contact check" });
+        return settle("failed", `their no-contact rules could not be checked: ${errorText(error)}`);
+      }
+    }
     if (covered) return settle("dropped", `no-contact rule ${covered.id}: ${covered.rule}`);
     const outbound: Outbound = d.template ? { type: "template", ...d.template } : { type: "message", text: d.text ?? "" };
     const failure = await this.send(d.channel, outbound);
@@ -1216,6 +1255,10 @@ function forModel(entry: ChatMessage): ChatMessage {
 /** A tool's output as events carry it: whole up to 4,000 characters (for debugging and observability). */
 function clipOutput(text: string): string {
   return text.length > 4_000 ? `${text.slice(0, 4_000)}…` : text;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function clip(text: string): string {
