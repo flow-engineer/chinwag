@@ -107,6 +107,7 @@ export function multi(options: {
   testPeople?: TestPerson[];
   templates?: TemplateDefinition[];
   history?: { maxTokens?: number; toolResultChars?: number };
+  defaultCountryCode?: string;
 }) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "chinwag-"));
   writeFileSync(join(dir, "AGENTS.md"), "You are a test agent.");
@@ -134,6 +135,7 @@ export function multi(options: {
     testPeople: options.testPeople,
     templates: options.templates,
     history: options.history,
+    defaultCountryCode: options.defaultCountryCode,
     scheduleCheckMs: 0,
   });
   const texts = (channel?: string) =>

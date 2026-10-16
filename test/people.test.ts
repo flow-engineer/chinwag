@@ -21,6 +21,23 @@ test("the same phone number on two channels is one person, in one conversation, 
   await h.agent.conversation(a!.conversationId)!.whenIdle();
 });
 
+test("with a default country code, a national number on SMS and the full one on WhatsApp are one person; without it, two", async () => {
+  const channels = { sms: { info: SMS, phone: true, kind: "sms" as const }, whatsapp: { info: WHATSAPP, phone: true, kind: "whatsapp" as const } };
+  const database = sqlite();
+  const h = multi({ channels, database, defaultCountryCode: "+91" });
+  const national = await h.message("sms", "098765 43210", "hi");
+  const whatsapp = await h.message("whatsapp", "919876543210", "hi");
+  const full = await h.message("sms", "+91 98765 43210", "hi");
+  assert.equal(new Set([national!.conversationId, whatsapp!.conversationId, full!.conversationId]).size, 1);
+  assert.deepEqual((await new Store(database, "default").allConversations()).map((c) => c.personKey), ["phone:+919876543210"]);
+
+  const plain = multi({ channels });
+  const a = await plain.message("sms", "09876543210", "hi");
+  const b = await plain.message("whatsapp", "919876543210", "hi");
+  assert.notEqual(a!.conversationId, b!.conversationId, "bare digits are international without it");
+  assert.throws(() => multi({ channels, defaultCountryCode: "IN" }), /calling code such as "\+91"/);
+});
+
 test("first messages from one number on two channels at once make one conversation", async () => {
   const database = sqlite();
   const h = multi({ channels: PHONES, database });

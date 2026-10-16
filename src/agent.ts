@@ -90,6 +90,14 @@ export interface AgentOptions {
    * none. Identities with the same key are one person.
    */
   resolve?: (identity: { channel: string; address: string }) => Promise<string | null> | string | null;
+  /**
+   * The calling code ("+91", "+44", "+1") for phone numbers that come without one. Set it when
+   * your SMS provider gives national numbers ("098765 43210"): on every phone channel but
+   * WhatsApp (whose numbers are always full), a number with no "+" or "00" is then read as this
+   * country's, its trunk 0 dropped (Italy's +39 keeps it), so it joins the same number on
+   * WhatsApp. Without it, bare digits are taken as international.
+   */
+  defaultCountryCode?: string;
   /** The business's time zone (IANA), for scheduled messages when a person's is not known. */
   timeZone?: string;
   /** How often due scheduled messages are looked for. Default 5,000 ms; 0 turns the timer off. */
@@ -199,6 +207,8 @@ export class Agent {
   private playgroundSink: PlaygroundSink | null = null;
   /** Before this, this runner does not ask for the pruning claim again (it, or another runner, had it). */
   private pruneAfter = 0;
+  /** `defaultCountryCode`'s digits. */
+  private readonly countryCode: string | undefined;
   private readonly traces: Traces | null;
 
   constructor(options: AgentOptions) {
@@ -206,6 +216,8 @@ export class Agent {
     this.channelsByName = new Map((options.channels ?? []).map((c) => [c.name, c]));
     if (this.channelsByName.size !== (options.channels ?? []).length) throw new Error("chinwag: two channels have the same name");
     this.now = options.now ?? Date.now;
+    if (options.defaultCountryCode !== undefined && !/^\+?[1-9]\d{0,2}$/.test(options.defaultCountryCode.trim())) throw new Error(`chinwag: defaultCountryCode is a calling code such as "+91", not "${options.defaultCountryCode}"`);
+    this.countryCode = options.defaultCountryCode?.trim().replace(/^\+/, "");
     const tracing = options.traces ?? tracesFromEnv();
     this.traces = tracing ? traces(tracing, { service: options.id ?? "chinwag", kindOf: (name) => this.channelsByName.get(name)?.kind }) : null;
     const sinks = [...(options.events ?? []), ...(this.traces ? [this.traces.sink] : [])];
@@ -415,7 +427,7 @@ export class Agent {
       [personKey, verifiedBy] = [await this.testPersonKey(testPerson, adapter), "test person"];
     } else {
       const owner = await this.options.resolve?.({ channel, address });
-      const phone = adapter.phone ? normalizePhone(address) : "";
+      const phone = adapter.phone ? normalizePhone(address, adapter.kind === "whatsapp" ? undefined : this.countryCode) : "";
       [personKey, verifiedBy] = owner ? [`key:${owner}`, "resolver"] : phone ? [`phone:${phone}`, "phone"] : [`${channel}:${address}`, "channel"];
     }
     let row = await this.store.conversationByKey(personKey);
@@ -728,11 +740,15 @@ const viaKey = (channel: string, address: string) => `${channel}\u0000${address}
 /**
  * A phone number as one string however the channel gave it, in E.164: formatting dropped, a 00
  * prefix read as +, and digits with no + taken as international (WhatsApp gives "15550100100" for
- * "+1 555 010 0100"). "" when there are no digits (not a phone number).
+ * "+1 555 010 0100"), or, given a `countryCode`, as that country's national number. "" when there
+ * are no digits (not a phone number).
  */
-export function normalizePhone(address: string): string {
-  const digits = address.trim().replace(/^00/, "").replace(/\D/g, "");
-  return digits ? `+${digits}` : "";
+export function normalizePhone(address: string, countryCode?: string): string {
+  const trimmed = address.trim();
+  const digits = trimmed.replace(/^00/, "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (!countryCode || trimmed.startsWith("+") || trimmed.startsWith("00")) return `+${digits}`;
+  return `+${countryCode}${countryCode === "39" ? digits : digits.replace(/^0/, "")}`;
 }
 
 export function createAgent(options: AgentOptions): Agent {

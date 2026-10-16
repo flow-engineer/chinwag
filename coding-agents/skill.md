@@ -143,7 +143,8 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   (`{ ..., app_link }`), and the agent only passes it on.
 - One person is one conversation across every channel they use. Channels are joined only by what
   each verified: your `resolve` key, else the same phone number on channels marked `phone`. Never
-  join people any other way.
+  join people any other way. When the SMS provider gives national numbers, set
+  `defaultCountryCode` ("+91") so they match the full number WhatsApp gives.
 - With several channels the agent gets a send tool per channel (`send_sms`, `send_web`) and
   answers each message where it came. Don't add your own.
 - After a restart, `resume()` carries on: cut-off turns run again, background tools that were
