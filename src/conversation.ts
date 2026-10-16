@@ -1269,7 +1269,7 @@ export class Conversation {
 
     this.settings.emit(this.id, "tool.start", { callId: call.id, tool: call.name, input: parsed.data });
     const key = createHash("sha256").update(`${this.id}\u0000${this.turns}\u0000${call.name}\u0000${input}`).digest("hex").slice(0, 32);
-    const context = { conversationId: this.id, person: this.personKey, channel: this.currentChannel(), callId: call.id, idempotencyKey: key, signal: this.lifetime.signal };
+    const context = { conversationId: this.id, person: this.personKey, key: this.personKey.startsWith("key:") ? this.personKey.slice(4) : null, channel: this.currentChannel(), callId: call.id, idempotencyKey: key, signal: this.lifetime.signal };
     const r: Running = {
       call,
       input,

@@ -1,7 +1,8 @@
 // covers: src/agent.ts src/store.ts src/conversation.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { sqlite, type Database, type Outbound } from "../src/index.ts";
+import { z } from "zod";
+import { sqlite, tool, type Database, type Outbound } from "../src/index.ts";
 import { Store } from "../src/store.ts";
 import { WEB_APP, WHATSAPP, call, multi, respond, users } from "./helpers.ts";
 
@@ -104,4 +105,26 @@ test("forgetting a person stops their turn, leaves nothing of them, and their ne
   assert.doesNotMatch(fresh.request.system, /no promotions/);
   fresh.answer(respond(call("send_whatsapp", { text: "Hi! How can I help?" })));
   await h.agent.conversation(b!.conversationId)!.whenIdle();
+});
+
+test("a test person's tools get the key resolve gives their real number, on any channel", async () => {
+  const seen: Array<string | null> = [];
+  const whoami = tool({ name: "whoami", description: "", input: z.object({}), run: (_input, context) => (seen.push(context.key), "ok") });
+  const h = multi({
+    channels: { whatsapp: { info: WHATSAPP, phone: true }, app: { info: WEB_APP } },
+    testPeople: [SAM],
+    tools: [whoami],
+    resolve: ({ channel, address }) => (channel === "whatsapp" && address === SAM.phone ? "mbr_sam" : null),
+  });
+  h.agent.attachPlayground(() => {});
+  const a = await h.agent.simulate({ person: SAM.phone, channel: "app", message: "who am I?" });
+  (await h.nextCall(0)).answer(respond(call("send_app", { text: "Let me check." }), call("whoami")));
+  (await h.nextCall(1)).answer(respond());
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  const b = await h.message("whatsapp", SAM.phone, "and from my phone?");
+  assert.equal(b!.conversationId, a!.conversationId);
+  (await h.nextCall(2)).answer(respond(call("send_whatsapp", { text: "Still you." }), call("whoami")));
+  (await h.nextCall(3)).answer(respond());
+  await h.agent.conversation(a!.conversationId)!.whenIdle();
+  assert.deepEqual(seen, ["mbr_sam", "mbr_sam"]);
 });

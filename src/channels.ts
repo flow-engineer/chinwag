@@ -16,7 +16,7 @@ export type ChannelKind = "sms" | "whatsapp" | "custom";
 
 /** A channel as the agent uses it. Made by whatsapp(), sms() or customUI(), or written by hand. */
 export interface Channel {
-  /** The agent's name for it; its send tool is send_<name> when a person uses several. */
+  /** The agent's name for it; its send tool is always send_<name> (lowercase, other characters as _). "key" and "phone" are reserved. */
   name: string;
   kind: ChannelKind;
   info: ChannelInfo;

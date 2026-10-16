@@ -147,6 +147,9 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   each verified: your `resolve` key, else the same phone number on channels marked `phone`. Never
   join people any other way. When the SMS provider gives national numbers, set
   `defaultCountryCode` ("+91") so they match the full number WhatsApp gives.
+- Tools key a person's data by `context.person`, their stable id: `key:<resolve's value>`, else
+  `phone:<E.164>`, else `<channel>:<address>`. `context.key` is `resolve`'s value as returned, or
+  null without one: look them up in the backend by that, never by `context.person`.
 - With several channels the agent gets a send tool per channel (`send_sms`, `send_web`) and
   answers each message where it came. Don't add your own.
 - Run exactly one copy of the agent per database (one instance, kept warm, CPU always on): a
@@ -183,6 +186,14 @@ Messages the business starts are nudges: `agent.nudge({ to: { channel, address }
 as written; `prompt` instead lets the agent write it (or decide not to); `template` sends a
 WhatsApp template you already set up. Pass `idempotencyKey` when your system may retry, and `at`
 to send later. Outside WhatsApp's 24-hour window only templates go out (`outside_window`).
+
+When the owner's backend is a separate service, mount `nudgeHandler(agent, { token })` (from
+`chinwag`; a token of at least 32 characters, from a secret; `base` is `/nudges` by default) in the
+agent's server rather than writing a route: `POST /nudges` takes the same fields with
+`idempotency_key` and `at` in ms since the epoch, and answers `202 { id, status }` once recorded,
+before any send or turn (`queued`, or `refused`/`dropped`/`scheduled` decided then: still a 202);
+`GET /nudges/<id>` reads its state. Both need `Authorization: Bearer <token>`. Contract:
+`spec/nudges.openapi.yaml`.
 
 Templates are WhatsApp only. Declare the ones the owner set up with Meta beside `testPeople`, so
 Chinwag checks each send against them and the playground shows them as WhatsApp does:

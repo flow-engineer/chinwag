@@ -108,7 +108,7 @@ test("a tool call waits out the simulator's latency, then the POST budget, and a
         channels: () => [], reacted: () => {},
         receive: () => {
           const lookup = tools[0];
-          if (lookup) void Promise.resolve(lookup.run({}, { conversationId: "c", person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal })).then(() => {}, (error: unknown) => { timed = error; });
+          if (lookup) void Promise.resolve(lookup.run({}, { conversationId: "c", person: "p", key: null, channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal })).then(() => {}, (error: unknown) => { timed = error; });
           return "m";
         },
       }),
@@ -157,7 +157,7 @@ test("a tool call the cloud failed, which the agent started and never awaited, i
         channels: () => [], reacted: () => {},
         receive: (conversationId) => {
           received.push(conversationId);
-          if (conversationId === "sms:a") void tools[0]!.run({}, { conversationId, person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal });
+          if (conversationId === "sms:a") void tools[0]!.run({}, { conversationId, person: "p", channel: "sms", key: null, callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal });
           return null;
         },
       }),
