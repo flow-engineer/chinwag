@@ -118,10 +118,12 @@ test("a tool call waits out the simulator's latency, then the POST budget, and a
   } finally { cloud.close(); }
 });
 
-test("no bytes for the idle window means the stream is dead, and the run already in is kept", { timeout: 10_000 }, async () => {
+test("on a cloud that does not resume, no bytes for the idle window means the stream is dead, and the run already in is kept", { timeout: 10_000 }, async () => {
+  let gets = 0;
   const cloud = await listen(({ url }, res) => {
     if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "http://dash/s" }));
     if (url.endsWith("/stream")) {
+      gets++;
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(frame(run("r1")));
       return; // no ping, no finished
@@ -139,6 +141,7 @@ test("no bytes for the idle window means the stream is dead, and the run already
       assert.equal(error.runs[0]?.runId, "r1");
       return true;
     });
+    assert.equal(gets, 1);
   } finally { cloud.close(); }
 });
 
@@ -503,6 +506,7 @@ test("a cloud that stores keys retries a 503 on events, receipts and outbound, a
     assert.deepEqual(summary.runs.map((item) => item.runId), ["r1", "r2"]);
     const opened = proxy.posts.find((post) => post.path === "/api/sessions");
     assert.equal(JSON.parse(opened?.body ?? "{}").retries, true);
+    assert.equal(JSON.parse(opened?.body ?? "{}").resume, true);
     const outboundKeys = applied.filter((key) => key.startsWith("outbound:")).sort();
     assert.deepEqual(outboundKeys, ["outbound:c:m1:0", "outbound:c:m2:0"]);
     assert.ok(applied.some((key) => key.startsWith("events:")));
@@ -577,4 +581,126 @@ test("with keys, an outbound timeout longer than the retry budget is sent again 
     });
     assert.equal(refused, 1);
   } finally { refusing.close(); }
+});
+
+const numbered = (id: number, command: unknown) => `id: ${id}\n${frame(command)}`;
+const finished = { type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [], dashboard: "d" } };
+const openedResuming = JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d", resume: true });
+
+test("a dropped stream resumes after its last command, and a command sent again is not handled twice", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  const asked: unknown[] = [];
+  const received: string[] = [];
+  const streams: ServerResponse[] = [];
+  const cloud = await listen(({ url, body }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(openedResuming);
+    if (url.endsWith("/stream")) {
+      asked.push(res.req.headers["last-event-id"]);
+      streams.push(res);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (streams.length === 1) {
+        res.write(numbered(1, message("m1")));
+        res.write(numbered(2, message("m2")));
+      } else {
+        // The cloud sends 2 again: the client handled it on the first stream.
+        res.write(numbered(2, message("m2")));
+        res.write(numbered(3, message("m3")));
+      }
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    if (url.endsWith("/receipts")) {
+      const id = JSON.parse(body).messageId;
+      if (id === "m2") streams[0]?.destroy();
+      if (id === "m3") streams[1]?.end(numbered(4, finished));
+    }
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [], log: (line) => logs.push(line),
+      build: () => ({ channels: () => [], reacted: () => {}, receive: (_id, _incoming, _deliver, options) => { received.push(options?.messageId ?? ""); return "m"; } }),
+    });
+    assert.equal(summary.sessionId, "s");
+    assert.deepEqual(asked, [undefined, "2"]);
+    assert.deepEqual(received, ["m1", "m2", "m3"]);
+    assert.equal(logs.filter((line) => line.startsWith("stream ")).length, 1);
+    assert.match(logs.join("\n"), /stream lost \(.+\); resuming after command 2/);
+  } finally { cloud.close(); }
+});
+
+test("a silent resumable stream is opened again instead of ending the session", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  const asked: unknown[] = [];
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(openedResuming);
+    if (url.endsWith("/stream")) {
+      asked.push(res.req.headers["last-event-id"]);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (asked.length === 1) res.write(numbered(1, run("r1"))); // then nothing, not even a ping
+      else res.end(numbered(2, finished));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [], log: (line) => logs.push(line), streamIdleMs: 200,
+      build: () => ({ channels: () => [], receive: () => null, reacted: () => {} }),
+    });
+    assert.equal(summary.sessionId, "s");
+    assert.deepEqual(asked, [undefined, "1"]);
+    assert.match(logs.join("\n"), /stream lost \(no bytes for 0.2s\); resuming after command 1/);
+  } finally { cloud.close(); }
+});
+
+test("a stream that cannot resume within the window stops the session with the runs already in", { timeout: 10_000 }, async () => {
+  let gets = 0;
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(openedResuming);
+    if (url.endsWith("/stream")) {
+      gets++;
+      if (gets > 1) return void res.writeHead(503, { "content-type": "text/html" }).end("<html>503 Server Error</html>");
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(numbered(1, run("r1")));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    await assert.rejects(runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [], log: () => {}, resumeWindowMs: 600,
+      build: () => ({ channels: () => [], receive: () => null, reacted: () => {} }),
+    }), (error: unknown) => {
+      assert.ok(error instanceof SessionStopped);
+      assert.match(error.message, /the stream did not resume within 0.6s \(lost \(the cloud closed it\)\); last try: could not open the stream \(503\)/);
+      assert.deepEqual(error.runs.map((r) => r.runId), ["r1"]);
+      return true;
+    });
+    assert.ok(gets >= 2, `stream opened ${gets} times`);
+  } finally { cloud.close(); }
+});
+
+test("a resumable stream is replaced before the tunnel's hour limit", { timeout: 10_000 }, async () => {
+  const logs: string[] = [];
+  const asked: unknown[] = [];
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(openedResuming);
+    if (url.endsWith("/stream")) {
+      asked.push(res.req.headers["last-event-id"]);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (asked.length === 1) res.write(numbered(1, run("r1")));
+      else res.end(numbered(2, finished));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    const summary = await runInCloud({
+      cloud: cloud.url, name: "test", tools: [], files: [], log: (line) => logs.push(line), streamRefreshMs: 150,
+      build: () => ({ channels: () => [], receive: () => null, reacted: () => {} }),
+    });
+    assert.equal(summary.sessionId, "s");
+    assert.deepEqual(asked, [undefined, "1"]);
+    assert.match(logs.join("\n"), /stream refreshed before the tunnel's hour limit; resuming after command 1/);
+  } finally { cloud.close(); }
 });

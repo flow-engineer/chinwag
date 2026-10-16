@@ -4,6 +4,7 @@
 //   POST /api/sessions                 OpenSession → Opened     start a session, learn which files to upload
 //   POST /api/files                    { files: UploadFile[] }   upload the files the cloud lacks
 //   GET  /api/sessions/:id/stream      server-sent Commands     the person's side, cloud → agent
+//        Last-Event-ID: N                                    a resume: the commands after N
 //   POST /api/sessions/:id/outbound    { conversationId, outbound } → { ok } | 409 { error }
 //   POST /api/sessions/:id/tool-calls  ToolCallRequest → ToolCallResult   held open while the tool is simulated
 //   POST /api/sessions/:id/events      { seq, events: ChinwagEvent[] }
@@ -12,6 +13,11 @@
 // says idempotency, a repeat of a key is the stored answer and the client may send it again.
 //   POST /api/sessions/:id/receipts    Receipt → { ok }
 //   POST /api/sessions/:id/drained     {} → { ok }   flush before the terminal command
+//
+// When Opened says resume, every command on the stream carries `id: N` (1, 2, 3, ... per session).
+// A stream that drops, or sits silent past the idle watch, is opened again with Last-Event-ID set
+// to the last id the client handled (0 for none); the cloud sends the commands after it, and holds
+// them for 2 minutes while no stream is attached. The client skips an id it has handled.
 //
 // The open goes to the cloud's front door; every later call goes to Opened.tunnel (else the same
 // address) and carries `authorization: Bearer <token>` from Opened.
@@ -44,6 +50,8 @@ export interface OpenSession {
   deliveryReceipts?: boolean;
   /** The client will retry a call when this cloud stores the result under Idempotency-Key. */
   retries?: boolean;
+  /** The client opens a lost stream again with Last-Event-ID when this cloud resumes. */
+  resume?: boolean;
 }
 
 export interface Receipt {
@@ -64,6 +72,9 @@ export interface Opened {
   tunnel?: string;
   /** This cloud stores each Idempotency-Key with its result. Absent on an older cloud. */
   idempotency?: boolean;
+  /** This cloud numbers stream commands with an SSE id, sends the ones after Last-Event-ID to a
+   * stream opened again, and holds them 2 minutes while none is attached. Absent on an older cloud. */
+  resume?: boolean;
 }
 
 export interface UploadFile {

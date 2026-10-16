@@ -39,6 +39,10 @@ export interface ConnectOptions {
   streamIdleMs?: number;
   /** How long one call keeps trying after its first failure. Default 30s. */
   retryBudgetMs?: number;
+  /** How long a lost stream keeps trying to resume, on a cloud that resumes (Opened.resume). Default 2 minutes, as long as the cloud holds its commands. */
+  resumeWindowMs?: number;
+  /** How often a resumable stream is replaced, before the tunnel's one-hour request cap. Default 50 minutes. */
+  streamRefreshMs?: number;
 }
 
 /** The tunnel, the stream, or the connection failed after the session opened. `runs` are the ones already received. The CLI prints them and exits 2. */
@@ -63,14 +67,16 @@ export class TimeoutError extends Error {
 
 /** The stream stopped carrying bytes: the idle watch fired, or the cloud closed it before finished. */
 export class StreamLost extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "StreamLost";
   }
 }
 
 const POST_TIMEOUT_MS = 30_000;
 const STREAM_IDLE_MS = 45_000;
+const RESUME_WINDOW_MS = 120_000;
+const STREAM_REFRESH_MS = 50 * 60_000;
 /** How long one call keeps trying after its first failure. The first try's own wait does not count, so a timed-out try is still sent again. */
 export const RETRY_BUDGET_MS = 30_000;
 /** The cloud abandons one model attempt at 90s and tries a timeout once more, then this POST has its 30s. */
@@ -167,6 +173,8 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   const postTimeoutMs = options.postTimeoutMs ?? POST_TIMEOUT_MS;
   const streamIdleMs = options.streamIdleMs ?? STREAM_IDLE_MS;
   const retryBudgetMs = options.retryBudgetMs ?? RETRY_BUDGET_MS;
+  const resumeWindowMs = options.resumeWindowMs ?? RESUME_WINDOW_MS;
+  const streamRefreshMs = options.streamRefreshMs ?? STREAM_REFRESH_MS;
   let idempotent = false;
   const base = options.cloud.replace(/\/$/, "");
 
@@ -180,6 +188,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
   let dashboard = "";
   const runs: RunSummary[] = [];
   let idle: ReturnType<typeof setTimeout> | undefined;
+  let refresh: ReturnType<typeof setTimeout> | undefined;
   const fail = (context: string, error: unknown) => {
     if (stopped || failure) return;
     failure = new Error(`${context}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
@@ -288,6 +297,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     runs: options.runs ?? 1,
     deliveryReceipts: true,
     retries: true,
+    resume: true,
   };
   const opened = await post<Opened>(`${base}/api/sessions`, open, options.openHeaders, controller.signal, undefined, postTimeoutMs);
   idempotent = opened.idempotency === true;
@@ -311,15 +321,30 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
 
   if (failure) throw failure;
   startFlush();
-  stream = await openStream(`${session}/stream`, auth, controller.signal);
+  const streamUrl = `${session}/stream`;
+  stream = await openStream(streamUrl, auth, controller.signal);
   if (failure) throw failure;
+  // A cloud that resumes numbers its commands: a lost stream is opened again after the last one
+  // handled, and a command the cloud sends again is skipped.
+  const resume = opened.resume === true;
+  let lastId = 0;
+  let refreshing = false;
   // The cloud writes ": ping" every 15s. Three missed pings and the stream is dead.
   const arm = () => {
     if (idle) clearTimeout(idle);
-    idle = setTimeout(() => fail("the stream is dead", new StreamLost(`no bytes for ${streamIdleMs / 1000}s`)), streamIdleMs);
+    idle = setTimeout(() => {
+      const lost = new StreamLost(`no bytes for ${streamIdleMs / 1000}s`);
+      if (resume) stream?.destroy(lost);
+      else fail("the stream is dead", lost);
+    }, streamIdleMs);
+  };
+  // The tunnel cuts a request at an hour, so a resumable stream is replaced before then.
+  const scheduleRefresh = () => {
+    if (refresh) clearTimeout(refresh);
+    if (resume) refresh = setTimeout(() => { refreshing = true; stream?.destroy(); }, streamRefreshMs);
   };
   arm();
-  let buffer = "";
+  scheduleRefresh();
   let draining = false;
   let drained = false;
   let receiveFails = 0;
@@ -341,103 +366,163 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
       if (failure) throw failure;
     } while (pending.size || queued.length);
   };
-  const decoder = new TextDecoder();
-  for await (const chunk of stream) {
-    arm();
-    buffer += decoder.decode(chunk, { stream: true });
-    let end: number;
-    while ((end = buffer.indexOf("\n\n")) >= 0) {
-      const frame = buffer.slice(0, end);
-      buffer = buffer.slice(end + 2);
-      const data = frame.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).join("\n");
-      if (!data) continue;
-      let command: Command;
+  /** One command from the stream. Returns the summary once the session has finished. */
+  const handle = async (command: Command): Promise<SessionSummary | undefined> => {
+    if (draining && (command.type === "message" || command.type === "reaction")) throw new Error("the cloud sent a command after drain");
+    if (command.type === "message") {
+      const deliveries: Promise<unknown>[] = [];
+      // Not async: register the promise during receive(), before its fire-and-forget
+      // interceptor returns null. Each command owns its deliveries, even in a burst.
+      let outboundIndex = 0;
+      const deliver = (outbound: Outbound): Promise<void> => {
+        const index = outboundIndex++;
+        const delivery = postRetry(`${session}/outbound`, { conversationId: command.conversationId, outbound }, auth, controller.signal, log, postTimeoutMs, {
+          mode: idempotent ? "idempotent" : "outbound",
+          key: `outbound:${command.conversationId}:${command.messageId}:${index}`,
+          budgetMs: retryBudgetMs,
+          what: "outbound delivery",
+        }).then(() => {});
+        deliveries.push(delivery);
+        // Keep the rejection for the normal conversation's delivery recovery, but
+        // attach a handler immediately for fire-and-forget interceptor sends too.
+        // A tunnel blip (no JSON from the cloud) is not a reason to end the session.
+        watch(delivery, "outbound delivery", true);
+        return delivery;
+      };
+      let taken: string | null;
       try {
-        command = JSON.parse(data) as Command;
-      } catch {
-        log("a stream frame was not valid JSON");
-        continue;
+        taken = agent.receive(command.conversationId, withFiles(command.incoming, options.testsDir, log), deliver, {
+        channel: command.channel,
+        channelName: command.channelName,
+        messageId: command.messageId,
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        receiveFails++;
+        // One broken message can time out. An agent that throws on every message would
+        // wait out the whole suite, one run at a time.
+        if (receiveFails >= 3) throw new Error(`the agent throws on every message: ${detail}`);
+        log(`receive failed: ${detail}`);
+        return;
       }
-      if (draining && (command.type === "message" || command.type === "reaction")) throw new Error("the cloud sent a command after drain");
-      if (command.type === "message") {
-        const deliveries: Promise<unknown>[] = [];
-        // Not async: register the promise during receive(), before its fire-and-forget
-        // interceptor returns null. Each command owns its deliveries, even in a burst.
-        let outboundIndex = 0;
-        const deliver = (outbound: Outbound): Promise<void> => {
-          const index = outboundIndex++;
-          const delivery = postRetry(`${session}/outbound`, { conversationId: command.conversationId, outbound }, auth, controller.signal, log, postTimeoutMs, {
-            mode: idempotent ? "idempotent" : "outbound",
-            key: `outbound:${command.conversationId}:${command.messageId}:${index}`,
-            budgetMs: retryBudgetMs,
-            what: "outbound delivery",
-          }).then(() => {});
-          deliveries.push(delivery);
-          // Keep the rejection for the normal conversation's delivery recovery, but
-          // attach a handler immediately for fire-and-forget interceptor sends too.
-          // A tunnel blip (no JSON from the cloud) is not a reason to end the session.
-          watch(delivery, "outbound delivery", true);
-          return delivery;
-        };
-        let taken: string | null;
-        try {
-          taken = agent.receive(command.conversationId, withFiles(command.incoming, options.testsDir, log), deliver, {
-          channel: command.channel,
-          channelName: command.channelName,
-          messageId: command.messageId,
-          });
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : String(error);
-          receiveFails++;
-          // One broken message can time out. An agent that throws on every message would
-          // wait out the whole suite, one run at a time.
-          if (receiveFails >= 3) throw new Error(`the agent throws on every message: ${detail}`);
-          log(`receive failed: ${detail}`);
-          continue;
-        }
-        receiveFails = 0;
-        const receipt: Receipt = { conversationId: command.conversationId, messageId: command.messageId, status: taken === null ? "intercepted" : "taken" };
-        const sendReceipt = () => postRetry(`${session}/receipts`, receipt, auth, controller.signal, log, postTimeoutMs, {
-          mode: idempotent ? "idempotent" : "never",
-          key: `receipt:${receipt.conversationId}:${receipt.messageId}`,
-          budgetMs: retryBudgetMs,
-          what: "delivery receipt",
-        });
-        // An intercepted reply waits until its outbound bodies land. A tunnel blip on one of them
-        // is not a receipt failure: this run can time out, and the later runs still play. A real
-        // refusal still ends the session, the same as a receipt the tunnel rejected.
-        const receiptWork = taken === null
-          ? Promise.all(deliveries).then(sendReceipt, (error: unknown) => { if (!unavailable(error)) throw error; })
-          : sendReceipt();
-        watch(receiptWork, "delivery receipt");
-      } else if (command.type === "reaction") {
-        agent.reacted(command.conversationId, command.emoji, command.toText);
-      } else if (command.type === "run") {
-        runs.push(command.run);
-        options.onRun?.(command.run);
-      } else if (command.type === "drain") {
-        if (draining) throw new Error("the cloud sent drain twice");
-        draining = true;
-        pauseIdle();
-        await drainWork();
-        await postRetry(`${session}/drained`, {}, auth, controller.signal, log, postTimeoutMs, {
-          mode: idempotent ? "idempotent" : "never",
-          key: `drained:${opened.sessionId}`,
-          budgetMs: retryBudgetMs,
-          what: "drained",
-        });
-        drained = true;
-        arm();
-      } else if (command.type === "finished") {
-        pauseIdle();
-        if (!drained) await drainWork();
-        return command.summary;
-      } else if (command.type === "failed") {
-        throw new Error(`the cloud stopped the session: ${command.error}`);
+      receiveFails = 0;
+      const receipt: Receipt = { conversationId: command.conversationId, messageId: command.messageId, status: taken === null ? "intercepted" : "taken" };
+      const sendReceipt = () => postRetry(`${session}/receipts`, receipt, auth, controller.signal, log, postTimeoutMs, {
+        mode: idempotent ? "idempotent" : "never",
+        key: `receipt:${receipt.conversationId}:${receipt.messageId}`,
+        budgetMs: retryBudgetMs,
+        what: "delivery receipt",
+      });
+      // An intercepted reply waits until its outbound bodies land. A tunnel blip on one of them
+      // is not a receipt failure: this run can time out, and the later runs still play. A real
+      // refusal still ends the session, the same as a receipt the tunnel rejected.
+      const receiptWork = taken === null
+        ? Promise.all(deliveries).then(sendReceipt, (error: unknown) => { if (!unavailable(error)) throw error; })
+        : sendReceipt();
+      watch(receiptWork, "delivery receipt");
+    } else if (command.type === "reaction") {
+      agent.reacted(command.conversationId, command.emoji, command.toText);
+    } else if (command.type === "run") {
+      runs.push(command.run);
+      options.onRun?.(command.run);
+    } else if (command.type === "drain") {
+      if (draining) throw new Error("the cloud sent drain twice");
+      draining = true;
+      pauseIdle();
+      await drainWork();
+      await postRetry(`${session}/drained`, {}, auth, controller.signal, log, postTimeoutMs, {
+        mode: idempotent ? "idempotent" : "never",
+        key: `drained:${opened.sessionId}`,
+        budgetMs: retryBudgetMs,
+        what: "drained",
+      });
+      drained = true;
+      arm();
+    } else if (command.type === "finished") {
+      pauseIdle();
+      if (!drained) await drainWork();
+      return command.summary;
+    } else if (command.type === "failed") {
+      throw new Error(`the cloud stopped the session: ${command.error}`);
+    }
+  };
+  /** The stream opened again after the last command handled, with backoff, until the resume window closes. */
+  const reconnect = async (why: string): Promise<IncomingMessage> => {
+    log(`stream ${why}; resuming after command ${lastId}`);
+    const deadline = Date.now() + resumeWindowMs;
+    let last: unknown;
+    for (let attempt = 0; ; attempt++) {
+      const backoff = attempt === 0 ? 0 : Math.min(10_000, 250 * 2 ** attempt) * (0.8 + Math.random() * 0.4);
+      const refused = last instanceof Error && last.cause instanceof PostError ? last.cause : undefined;
+      const wait = Math.max(backoff, refused?.retryAfterMs ?? 0);
+      if (Date.now() + wait >= deadline) {
+        const detail = last instanceof Error ? `; last try: ${last.message}` : "";
+        throw new StreamLost(`the stream did not resume within ${resumeWindowMs / 1000}s (${why})${detail}`);
+      }
+      await pause(wait, controller.signal);
+      if (failure) throw failure;
+      try {
+        return await openStream(streamUrl, { ...auth, "last-event-id": String(lastId) }, controller.signal, Math.max(1, Math.min(postTimeoutMs, deadline - Date.now())));
+      } catch (error) {
+        if (failure) throw failure;
+        const cause = error instanceof Error && error.cause instanceof PostError ? error.cause : error;
+        const code = cause instanceof PostError && cause.code ? ` ${cause.code}` : "";
+        if (!retryable(cause, "idempotent")) throw new StreamLost(`the stream could not resume: ${error instanceof Error ? error.message : String(error)}${code}`, { cause: error });
+        last = error;
       }
     }
+  };
+  for (;;) {
+    const decoder = new TextDecoder();
+    const chunks = stream[Symbol.asyncIterator]();
+    let buffer = "";
+    let lost: unknown;
+    for (;;) {
+      let next: IteratorResult<Buffer>;
+      try {
+        next = await chunks.next();
+      } catch (error) {
+        lost = error;
+        break;
+      }
+      if (next.done) break;
+      arm();
+      buffer += decoder.decode(next.value, { stream: true });
+      let end: number;
+      while ((end = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, end).split("\n");
+        buffer = buffer.slice(end + 2);
+        const data = frame.filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).join("\n");
+        if (!data) continue;
+        const idLine = frame.find((l) => l.startsWith("id:"));
+        const id = idLine === undefined ? NaN : Number(idLine.slice(3).trim());
+        if (Number.isSafeInteger(id) && id > 0) {
+          // Sent again after a resume: it was handled on the stream before.
+          if (id <= lastId) continue;
+          lastId = id;
+        }
+        let command: Command;
+        try {
+          command = JSON.parse(data) as Command;
+        } catch {
+          log("a stream frame was not valid JSON");
+          continue;
+        }
+        const summary = await handle(command);
+        if (summary) return summary;
+      }
+    }
+    if (failure) throw failure;
+    const closed = new StreamLost("the cloud closed the stream before the session finished");
+    if (!resume) throw lost ?? closed;
+    pauseIdle();
+    const why = refreshing ? "refreshed before the tunnel's hour limit" : `lost (${lost instanceof Error ? lost.message : "the cloud closed it"})`;
+    refreshing = false;
+    stream.destroy();
+    stream = await reconnect(why);
+    arm();
+    scheduleRefresh();
   }
-  throw new StreamLost("the cloud closed the stream before the session finished");
   } catch (error) {
     if (error instanceof SessionStopped) throw error;
     const reason = failure ?? (error instanceof Error ? error : new Error(String(error)));
@@ -449,6 +534,7 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
     stopped = true;
     if (timer) clearTimeout(timer);
     if (idle) clearTimeout(idle);
+    if (refresh) clearTimeout(refresh);
     stream?.destroy();
     controller.abort();
     await Promise.all(pending);
@@ -458,17 +544,28 @@ export async function runInCloud(options: ConnectOptions): Promise<SessionSummar
 
 /** The stream on a connection of its own. fetch shares one HTTP/2 connection per origin, and over
  * HTTPS a request behind another open one on it waits until that one finishes: a tool call the
- * cloud has not answered held every later event and reply, and the run ended agent_quiet. */
-function openStream(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<IncomingMessage> {
+ * cloud has not answered held every later event and reply, and the run ended agent_quiet.
+ * A refusal's status and JSON code are its cause, a PostError. A resume waits at most `timeoutMs` for the answer. */
+function openStream(url: string, headers: Record<string, string>, signal: AbortSignal, timeoutMs?: number): Promise<IncomingMessage> {
   const request = url.startsWith("https:") ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
-    request(url, { headers, agent: false, signal }, (response) => {
+    const req = request(url, { headers, agent: false, signal }, (response) => {
+      if (timer) clearTimeout(timer);
       if (response.statusCode === 200) return resolve(response);
-      response.resume();
-      reject(new Error(`could not open the stream (${response.statusCode})`));
-    })
-      .on("error", reject)
-      .end();
+      const status = response.statusCode ?? 0;
+      let text = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => { if (text.length < 4_096) text += chunk; });
+      response.on("error", () => {});
+      response.on("end", () => {
+        let code: string | undefined;
+        try { code = JSON.parse(text).error; } catch { /* the body was not JSON */ }
+        const cause = new PostError(url, status, text, typeof code === "string" ? code : undefined, retryAfterOf(flatHeaders(response.headers)));
+        reject(new Error(`could not open the stream (${status})`, { cause }));
+      });
+    });
+    const timer = timeoutMs === undefined ? undefined : setTimeout(() => req.destroy(new TimeoutError()), timeoutMs);
+    req.on("error", (error) => { if (timer) clearTimeout(timer); reject(error); }).end();
   });
 }
 
