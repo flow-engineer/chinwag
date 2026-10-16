@@ -118,7 +118,61 @@ test("a tool call waits out the simulator's latency, then the POST budget, and a
   } finally { cloud.close(); }
 });
 
-test("on a cloud that does not resume, no bytes for the idle window means the stream is dead, and the run already in is kept", { timeout: 10_000 }, async () => {
+test("a tool call the cloud failed, which the agent started and never awaited, is that run's error and the session plays on", { timeout: 10_000 }, async () => {
+  // An intercept that hands off with `void tool.run(...)` and answers at once: the cloud's
+  // simulator_failed for that call used to crash the CLI as an unhandled rejection.
+  const unhandled: unknown[] = [];
+  let settled!: () => void;
+  const gate = new Promise<void>((done) => { settled = done; });
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); settled(); };
+  process.on("unhandledRejection", onUnhandled);
+  const logs: string[] = [];
+  const received: string[] = [];
+  const say = (conversationId: string, messageId: string): Command => ({ type: "message", conversationId, messageId, channel: { reactions: false, status: false }, incoming: { text: "HUMAN" } });
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+    if (url.endsWith("/tool-calls")) return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: false, error: "simulator_failed" }));
+    if (url.endsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame(say("sms:a", "m1")));
+      // The rest of the session comes once the failed call has been dealt with, one way or the other.
+      void gate.then(() => {
+        res.write(frame(run("r1")));
+        res.write(frame(say("sms:b", "m2")));
+        res.write(frame(run("r2", 2)));
+        res.end(frame({ type: "finished", summary: { sessionId: "s", suiteHash: "h", testModel: "fake", runs: [], dashboard: "d" } }));
+      });
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  const seen: string[] = [];
+  try {
+    await runInCloud({
+      cloud: cloud.url, name: "test", files: [],
+      log: (line) => { logs.push(line); if (/simulator_failed/.test(line)) settled(); },
+      onRun: (r) => seen.push(r.runId),
+      tools: [{ name: "handoff", description: "hand off", input: z.object({}), run: async () => null }],
+      build: ({ tools }: { tools: Tool[] }) => ({
+        channels: () => [], reacted: () => {},
+        receive: (conversationId) => {
+          received.push(conversationId);
+          if (conversationId === "sms:a") void tools[0]!.run({}, { conversationId, person: "p", channel: "sms", callId: "c1", idempotencyKey: "k1", signal: new AbortController().signal });
+          return null;
+        },
+      }),
+    });
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    cloud.close();
+  }
+  assert.deepEqual(unhandled, [], "a call the cloud failed is never an unhandled rejection");
+  assert.deepEqual(received, ["sms:a", "sms:b"], "the next run still plays");
+  assert.deepEqual(seen, ["r1", "r2"]);
+  assert.match(logs.join("\n"), /sms:a: the cloud failed the tool call handoff \(simulator_failed\)/);
+});
+
+test("on a cloud that does not resume, no bytes for the idle window means the stream is dead, and the run already in is kept",{ timeout: 10_000 }, async () => {
   let gets = 0;
   const cloud = await listen(({ url }, res) => {
     if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "http://dash/s" }));
@@ -789,6 +843,65 @@ test("a lost session is opened again at most once, only on a cloud that says reo
         return true;
       });
       assert.equal(cloud.opens.length, item.opens, JSON.stringify(item));
+    } finally { cloud.close(); }
+  }
+});
+
+test("a slow event upload is logged only when verbose", { timeout: 10_000 }, async () => {
+  const cloud = await listen(({ url }, res) => {
+    if (url === "/api/sessions") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d" }));
+    if (url.endsWith("/stream")) return void res.writeHead(200, { "content-type": "text/event-stream" }).end(frame({ type: "drain" }) + frame(finished));
+    // An upload the cloud takes a second to answer is slow by the client's measure.
+    if (url.endsWith("/events")) return void setTimeout(() => res.writeHead(200, { "content-type": "application/json" }).end("{}"), 1_000);
+    res.writeHead(200, { "content-type": "application/json" }).end("{}");
+  });
+  try {
+    for (const verbose of [false, true]) {
+      const logs: string[] = [];
+      await runInCloud({
+        cloud: cloud.url, name: "test", tools: [], files: [], log: (line) => logs.push(line), verbose,
+        build: ({ events }) => {
+          events[0]!({ type: "turn.started", conversationId: "c", at: 0 } as never);
+          return { channels: () => [], receive: () => "m", reacted: () => {} };
+        },
+      });
+      assert.equal(logs.some((line) => line.startsWith("event upload slow")), verbose, logs.join("\n"));
+    }
+  } finally { cloud.close(); }
+});
+
+test("a busy cloud's refused open is sent once more after its Retry-After, only within the cap, and the second open's agent id is passed on", { timeout: 10_000 }, async () => {
+  const busy = { "content-type": "application/json", "retry-after": "0" };
+  const cases = [
+    { refusals: [[503, { error: { type: "capacity", message: "All slots are busy." } }]], cap: 60_000, opens: 2, opened: true },
+    { refusals: [[429, { error: { type: "rate_limited" } }], [429, { error: { type: "rate_limited" } }]], cap: 60_000, opens: 2, opened: false },
+    { refusals: [[429, { error: { type: "rate_limited" } }]], cap: -1, opens: 1, opened: false },
+  ] as const;
+  for (const item of cases) {
+    let opens = 0;
+    const cloud = await listen(({ url }, res) => {
+      if (url === "/api/sessions") {
+        const refusal = item.refusals[opens++];
+        if (refusal) return void res.writeHead(refusal[0], busy).end(JSON.stringify(refusal[1]));
+        return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: "s", token: "t", missing: [], dashboard: "d", agent: "agt_1" }));
+      }
+      if (url.endsWith("/stream")) return void res.writeHead(200, { "content-type": "text/event-stream" }).end(frame(finished));
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+    const logs: string[] = [];
+    let agent: string | undefined;
+    try {
+      const playing = runInCloud({
+        cloud: cloud.url, name: "test", tools: [], files: [], log: (line) => logs.push(line), openRetryCapMs: item.cap,
+        build: () => ({ channels: () => [], receive: () => "m", reacted: () => {} }),
+        onDashboard: (_url, _id, id) => { agent = id; },
+      });
+      if (item.opened) {
+        await playing;
+        assert.equal(agent, "agt_1");
+        assert.match(logs.join("\n"), /^The cloud is busy \(503 capacity\); trying once more in 0 s\.$/m);
+      } else await assert.rejects(playing, /429/);
+      assert.equal(opens, item.opens, JSON.stringify(item));
     } finally { cloud.close(); }
   }
 });

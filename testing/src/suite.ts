@@ -37,21 +37,92 @@ export function suiteHash(files: Array<{ path: string; hash: string }>): string 
   return hashOf(files.map((f) => `${f.path}:${f.hash}`).sort().join("\n"));
 }
 
+/** `{{ now [±<n>m|h|d|w]* [@ HH:MM] [| iso|date|time|weekday] }}`, spaces optional between the parts. */
+const CLOCK = /^\s*now(?:\s*[+-]\s*\d+[mhdw])*(?:\s*@\s*(?:[01]\d|2[0-3]):[0-5]\d)?(?:\s*\|\s*(?:iso|date|time|weekday))?\s*$/;
+
+/** What is wrong with the `{{ now ... }}` placeholders in `text`, or null. A placeholder is the test's clock
+ * (`{{now}}`, `{{now + 7d | date}}`, `{{now + 6d @ 10:00}}`), filled by the cloud per run; any other `{{...}}` is left alone. */
+export function placeholderProblem(text: string): string | null {
+  for (const [whole, inner] of text.matchAll(/\{\{([\s\S]*?)\}\}/g)) {
+    if (/^\s*now\b/.test(inner!) && !CLOCK.test(inner!)) {
+      return `unknown placeholder ${whole}: write it like {{now + 3d}}, {{now - 2h | time}} or {{now + 1w @ 10:00 | date}}`;
+    }
+  }
+  return null;
+}
+
+/** Every string in `value` whose placeholders are wrong, with where it is under `value`. */
+function* placeholderProblems(value: unknown, path: PropertyKey[] = []): Generator<{ path: PropertyKey[]; problem: string }> {
+  if (typeof value === "string") {
+    const problem = placeholderProblem(value);
+    if (problem) yield { path, problem };
+  } else if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) yield* placeholderProblems(value[i], [...path, i]);
+  } else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) yield* placeholderProblems(item, [...path, key]);
+  }
+}
+
+/** A value whose strings may hold placeholders, each checked. */
+const withClock = <T extends z.ZodType>(schema: T) =>
+  schema.superRefine((value, ctx) => {
+    for (const { path, problem } of placeholderProblems(value)) ctx.addIssue({ code: "custom", message: problem, path });
+  });
+
+/** A time zone Intl knows. */
+function isTimeZone(zone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** YYYY-MM-DDTHH:MM[:SS], optionally Z or ±HH:MM, naming a real moment. */
+function isDateTime(text: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(?:Z|[+-](\d{2}):(\d{2}))?$/.exec(text);
+  if (!m) return false;
+  const [y, mo, d, h, mi, s = 0, oh = 0, om = 0] = m.slice(1).map((part) => (part === undefined ? undefined : Number(part)));
+  const day = new Date(Date.UTC(y!, mo! - 1, d!));
+  return day.getUTCFullYear() === y && day.getUTCMonth() === mo! - 1 && day.getUTCDate() === d && h! < 24 && mi! < 60 && s! < 60 && oh! < 24 && om! < 60;
+}
+
+/** A tool call the run must (`calls`) or must not (`never`) make: a tool name, or the tool with input fields it must have. */
+const expectedCall = z.union(
+  [
+    z.string().min(1),
+    z.strictObject({
+      tool: z.string().min(1),
+      /** Each field must equal the call's input field: nested objects in part, arrays and strings exactly. */
+      args: withClock(z.record(z.string(), z.unknown())).optional(),
+    }),
+  ],
+  { error: "a tool name, or { tool: <name>, args: { <field>: <value> } }" },
+);
+
 const scenarioSchema = z.object({
   id: z.string().min(1),
   title: z.string().optional(),
   /** Every platform it runs on; each is a run of its own, with its own result. */
   channels: z.array(z.enum(["sms", "whatsapp", "imessage", "telegram", "web"])).min(1),
+  /** The IANA time zone of the test's clock; UTC when left out. */
+  timezone: z.string().refine(isTimeZone, "not a time zone: use an IANA name such as America/New_York or UTC").optional(),
+  /** The test's clock when each run starts, local to `timezone` unless it has an offset; the real time when left out.
+   * YAML's default schema reads it as a string; a Date from another schema is taken as its UTC time. */
+  now: z
+    .preprocess((v) => (v instanceof Date ? v.toISOString().replace(/\.\d+Z$/, "Z") : v), z.string().refine(isDateTime, "not a date and time: write YYYY-MM-DDTHH:MM, with :SS, Z or an offset such as -04:00 if needed"))
+    .optional(),
   person: z.object({
-    persona: z.string(),
-    goal: z.string(),
-    knows: z.array(z.string()).optional(),
+    persona: withClock(z.string()),
+    goal: withClock(z.string()),
+    knows: z.array(withClock(z.string())).optional(),
   }),
   opening: z
     .array(
       z
         .object({
-          say: z.string().default(""),
+          say: withClock(z.string()).default(""),
           /** A file the person sends with it (say is its caption): a path in the tests folder. */
           attach: z.object({ kind: z.enum(["image", "audio", "document"]), file: z.string().refine(inTests, "a path inside the tests folder, such as fixtures/receipt.jpg") }).optional(),
           after_ms: z.number().int().min(0).optional(),
@@ -59,12 +130,16 @@ const scenarioSchema = z.object({
         .refine((step) => step.say || step.attach, "say something, attach a file, or both"),
     )
     .min(1),
-  world: z.string().optional(),
+  world: withClock(z.string()).optional(),
   max_turns: z.number().int().min(1).max(50).default(8),
   expect: z
     .object({
-      outcome: z.array(z.string()).optional(),
-      judge: z.array(z.string()).optional(),
+      outcome: z.array(withClock(z.string())).optional(),
+      judge: z.array(withClock(z.string())).optional(),
+      /** Each must be called at least once in the run; checked by code from the recorded calls. */
+      calls: z.array(expectedCall).optional(),
+      /** None may be called. */
+      never: z.array(expectedCall).optional(),
     })
     .default({}),
 });
@@ -77,9 +152,9 @@ const toolFileSchema = z.object({
       z.object({
         when: z.string(),
         latency_ms: z.number().int().min(0),
-        input: z.unknown().optional(),
-        output: z.unknown().optional(),
-        error: z.string().optional(),
+        input: withClock(z.unknown()).optional(),
+        output: withClock(z.unknown()).optional(),
+        error: withClock(z.string()).optional(),
       }),
     )
     .min(1),
@@ -98,6 +173,7 @@ export function mimeOf(path: string): string {
 
 export type Scenario = z.infer<typeof scenarioSchema>;
 export type ToolFile = z.infer<typeof toolFileSchema>;
+export type ExpectedCall = z.infer<typeof expectedCall>;
 
 /** Parse and check a scenario. The error has one line per problem: `file:line: field: what is wrong`. */
 export function parseScenario(file: Pick<SuiteFile, "path" | "content">): Scenario {

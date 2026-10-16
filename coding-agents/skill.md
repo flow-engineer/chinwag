@@ -149,6 +149,8 @@ await agent.message({ channel: "whatsapp", from: "+15550100100", message: "hi" }
   `defaultCountryCode` ("+91") so they match the full number WhatsApp gives.
 - With several channels the agent gets a send tool per channel (`send_sms`, `send_web`) and
   answers each message where it came. Don't add your own.
+- Run exactly one copy of the agent per database (one instance, kept warm, CPU always on): a
+  conversation lives in one process, so two copies would run overlapping turns for it.
 - After a restart, `resume()` carries on: cut-off turns run again, background tools that were
   running are reported as interrupted (never rerun).
 - `agent.receive(conversationId, message, deliver)` still works for one channel at a time (the
@@ -167,9 +169,11 @@ Built in, so don't build them as tools: scheduled messages (`schedule_message`, 
 (`add_no_contact`, `remove_no_contact`). STOP, START and HELP are built in on `sms()` and
 `whatsapp()`: don't build them in `intercept`. STOP stops every message the business starts, with
 no model call, until START; set the replies with `keywords: { replies: { stop, start, help } }`.
-`intercept` sees them first, with `message.keyword` `"stop"`, `"start"` or `"help"` (else `null`):
-an agent with its own opt-out flag sets it there
-(`if (message.keyword === "stop") optedOut.add(conversationId)`). Chinwag keeps or lifts the STOP
+`intercept` sees them first, with `message.keyword` `"stop"`, `"start"` or `"help"` (else `null`)
+and `message.channel` (the channel's name in `channels`, on every message): an agent with its own
+opt-out flag sets it there
+(`if (message.keyword === "stop") optedOut.add(conversationId)`; only on SMS:
+`message.channel === "sms" && ...`). Chinwag keeps or lifts the STOP
 whatever the hook returns or throws; a reply it returns goes instead of Chinwag's, never both.
 SMS takes only STOP by default; the words carriers or regulators expect differ by country, so
 check the market's rules (`keywords: US_CARRIER_KEYWORDS` adds STOPALL, UNSUBSCRIBE, CANCEL, END
@@ -286,4 +290,6 @@ gets ids, timing, model calls and tool names but no messages, so nothing to show
 code: `createAgent({ ..., traces: { url, key, content: true, version: "v3" } })`. Traces are sent in the
 background after each turn and a failed send is dropped (logged once), so a dashboard outage never
 touches a chat; call `await agent.flushTraces()` before the process exits. Tests run under
-`node --test` never send from the environment.
+`node --test` never send from the environment. Under `chinwag test` the traces say they are a test's
+(`chinwag.run_kind` is "test", else "production", and each turn names the test session as
+`chinwag.test.session`), so the dashboard keeps them apart from real conversations.

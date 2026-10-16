@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SMS_KEYWORDS, sms, type TemplateDefinition } from "../src/index.ts";
-import { SMS, WHATSAPP, call, last, multi, respond } from "./helpers.ts";
+import { SMS, WEB_APP, WHATSAPP, call, last, multi, respond } from "./helpers.ts";
 
 const SAM = { channel: "sms", address: "+15550100100" };
 
@@ -352,6 +352,23 @@ test("receive() sends a message intercept answers while it runs, and keeps both"
   assert.deepEqual(sent, ["Call 911 now."], "delivered before receive() returned");
   await h.agent.conversation("c1")!.whenIdle();
   assert.deepEqual((await h.agent.transcript("c1")).map((l) => (l.kind === "in" || l.kind === "out") && [l.kind, l.text]), [["in", "chest pain"], ["out", "Call 911 now."]]);
+});
+
+test("intercept is told the channel each message came in on, from a provider, the playground and receive(), keywords included", async () => {
+  const seen: Array<[string, string | null]> = [];
+  const h = multi({
+    channels: { sms: { info: SMS, phone: true, kind: "sms", keywords: SMS_KEYWORDS }, app: { info: WEB_APP } },
+    testPeople: [{ name: "Sam", phone: SAM.address }],
+    intercept: (_id, _text, message) => (seen.push([message.channel, message.keyword]), ""),
+  });
+  await h.message("sms", SAM.address, "STOP");
+  await h.message("app", "u1", "hi");
+  await h.agent.simulate({ person: SAM.address, channel: "app", message: "hi" });
+  await h.agent.simulate({ person: SAM.address, channel: "sms", message: "hi" });
+  h.agent.receive("c1", "hi", () => {}, { channelName: "app" });
+  h.agent.receive("c2", "hi", () => {});
+  assert.deepEqual(seen, [["sms", "stop"], ["app", null], ["app", null], ["sms", null], ["app", null], ["chat", null]]);
+  assert.equal(h.calls.length, 0);
 });
 
 test("with keywords: false, STOP is a message like any other: the hook sees no keyword and the agent answers", async () => {

@@ -41,13 +41,15 @@ export interface AgentOptions {
   context?: (conversationId: string) => Promise<string> | string;
   /**
    * Answer some messages without the model: return the reply, "" to send nothing, or null to let
-   * the agent reply. It sees a channel's STOP, START and HELP first, with `message.keyword` set
-   * (null for other messages), to keep its own state; Chinwag still keeps or lifts the STOP
-   * whatever it returns or throws, and sends its own reply unless this returns one. The message
-   * and the reply are kept in the history (the agent reads them at its next turn) and the
-   * transcript, and are `message.in` and `message.out` events marked `answered: true`.
+   * the agent reply. `message.channel` is the channel it came in on, by the name in `channels`
+   * ("chat" from receive() without a `channelName`). It sees a channel's STOP, START and HELP
+   * first, with `message.keyword` set (null for other messages), to keep its own state; Chinwag
+   * still keeps or lifts the STOP whatever it returns or throws, and sends its own reply unless
+   * this returns one. The message and the reply are kept in the history (the agent reads them at
+   * its next turn) and the transcript, and are `message.in` and `message.out` events marked
+   * `answered: true`.
    */
-  intercept?: (conversationId: string, text: string, message: { keyword: Keyword | null }) => string | null;
+  intercept?: (conversationId: string, text: string, message: { keyword: Keyword | null; channel: string }) => string | null;
   /**
    * Put every skill's full text in the prompt instead of loading skills on demand. Saves a model
    * round trip per skill; worth it when the skills are few and short.
@@ -390,7 +392,7 @@ export class Agent {
     conversation.link({ name: input.channel, info: adapter.info, params: adapter.params, instructions: adapter.instructions, address: input.from, deliver, lastMessageAt: null });
     const text = typeof input.message === "string" ? input.message : input.message.text;
     const kind = keywordIn(adapter.keywords, input.message);
-    const fixed = this.intercepted(conversationId, text, kind);
+    const fixed = this.intercepted(conversationId, text, { keyword: kind, channel: input.channel });
     const answer = kind ? this.keyword(conversation, adapter.keywords!, kind, text, fixed, input.channel, input.messageId) : null;
     const reply = answer ? answer.reply : fixed;
     if (reply === null) return { conversationId, messageId: conversation.receive(input.message, { channel: input.channel, messageId: input.messageId }) };
@@ -401,15 +403,15 @@ export class Agent {
   }
 
   /**
-   * The agent's `intercept`, told whether the message is a keyword. A keyword is handled the same
-   * whatever the hook does, so its error there is logged, not thrown.
+   * The agent's `intercept`, told the message's channel and whether it is a keyword. A keyword is
+   * handled the same whatever the hook does, so its error there is logged, not thrown.
    */
-  private intercepted(conversationId: string, text: string, keyword: Keyword | null): string | null {
-    if (!keyword) return this.options.intercept?.(conversationId, text, { keyword }) ?? null;
+  private intercepted(conversationId: string, text: string, message: { keyword: Keyword | null; channel: string }): string | null {
+    if (!message.keyword) return this.options.intercept?.(conversationId, text, message) ?? null;
     try {
-      return this.options.intercept?.(conversationId, text, { keyword }) ?? null;
+      return this.options.intercept?.(conversationId, text, message) ?? null;
     } catch (error) {
-      console.warn(`chinwag: intercept threw on a ${keyword.toUpperCase()} keyword; Chinwag handled it as usual:`, error);
+      console.warn(`chinwag: intercept threw on a ${message.keyword.toUpperCase()} keyword; Chinwag handled it as usual:`, error);
       return null;
     }
   }
@@ -500,7 +502,7 @@ export class Agent {
     const name = options.channelName ?? "chat";
     const defined = this.channelsByName.get(name);
     const kind = keywordIn(defined?.keywords, message);
-    const fixed = this.intercepted(conversationId, text, kind);
+    const fixed = this.intercepted(conversationId, text, { keyword: kind, channel: name });
     this.mustBeResumed();
     const isNew = !this.conversations.has(conversationId) && !this.rows.has(conversationId);
     const conversation = this.open(conversationId, `${name}:${conversationId}`);
