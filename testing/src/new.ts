@@ -66,13 +66,17 @@ const agentsMd = (name: string) => `# ${name}
 
 A chat agent on Chinwag (https://github.com/flow-engineer/chinwag), started from its café example (Pip).
 
-- Load the skills in \`.claude/skills/\` before changing it: \`chinwag\` to build the agent, \`chinwag-tools\`
-  for its tools and their test files, \`chinwag-tests\` for its test scenarios.
+- Load the skills in \`.claude/skills/\` before changing it: \`chinwag\` to build the agent (and its MCP
+  server and CLI), \`chinwag-tools\` for its tools and their test files, \`chinwag-tests\` for its test
+  scenarios, \`chinwag-context\` to gather what the tools are written from out of an existing
+  codebase, and \`chinwag-auth\` for sign-in.
 - \`agent/AGENTS.md\` is the agent's own prompt, not instructions for coding agents.
 - \`npm start\` runs it in the playground. The owner puts one model key in \`.env\` (never read or
   print it): \`OPENROUTER_API_KEY\`, \`OPENAI_API_KEY\`, \`ANTHROPIC_API_KEY\` or \`GEMINI_API_KEY\`.
   \`npm run typecheck\` checks the types, \`npm test -- --synthetic\` runs the tests in the test
   cloud at https://flow.engineer/observe with the owner's \`CHINWAG_CLOUD_KEY\` (\`npx chinwag --help\`).
+- \`npm run mcp\` serves the same tools as an MCP server (src/mcp.ts) and \`npm run cli -- --help\` is
+  its command line (src/cli.ts). \`npx chinwag check\` checks the tools and the CLI file for both.
 `;
 
 /** Makes `<into>/<name>` (the current folder by default) and returns it. */
@@ -88,9 +92,13 @@ export function newStandalone(name: string, options: { into?: string; root?: str
     const path = join(dir, "src", file);
     const source = readFileSync(path, "utf8")
       .replace(/(["'])(\.\.\/)+src\/index\.ts\1/g, '"chinwag"')
-      .replace(/(["'])(\.\.\/)+simulators\/src\/index\.ts\1/g, '"chinwag/simulators"');
-    if (/["']\.\.\/\.\.\//.test(source)) throw new Error(`chinwag: ${file} imports a file outside the agent; only chinwag's public entries can be rewritten.`);
-    writeFileSync(path, source);
+      .replace(/(["'])(\.\.\/)+simulators\/src\/index\.ts\1/g, '"chinwag/simulators"')
+      .replace(/(["'])(\.\.\/)+mcp\/src\/index\.ts\1/g, '"chinwag/mcp"')
+      .replace(/(["'])(\.\.\/)+cli\/src\/index\.ts\1/g, '"chinwag/cli"');
+    // The CLI is the agent's own command, named after it.
+    const text = file === "cli.ts" ? source.replace(/name: "cafe"/, `name: "${name}"`).replace(/CAFE_SERVER/g, `${name.toUpperCase().replace(/-/g, "_")}_SERVER`) : source;
+    if (/["']\.\.\/\.\.\//.test(text)) throw new Error(`chinwag: ${file} imports a file outside the agent; only chinwag's public entries can be rewritten.`);
+    writeFileSync(path, text);
   }
 
   const own = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -100,9 +108,11 @@ export function newStandalone(name: string, options: { into?: string; root?: str
     private: true,
     description: `${name}: a Chinwag agent, started from the café example.`,
     type: "module",
+    bin: { [name]: "src/cli.ts" },
     engines: own.engines,
-    scripts: { start: "node --env-file-if-exists=.env src/main.ts", test: "chinwag test", typecheck: "tsc --noEmit" },
-    dependencies: { chinwag: `^${own.version}` },
+    scripts: { start: "node --env-file-if-exists=.env src/main.ts", mcp: "node src/mcp.ts", cli: "node src/cli.ts", test: "chinwag test", typecheck: "tsc --noEmit" },
+    // The café serves its tools over MCP (src/mcp.ts) and as a CLI (src/cli.ts): their SDKs, pinned as chinwag pins them.
+    dependencies: { chinwag: `^${own.version}`, ...own.peerDependencies },
     devDependencies: { "@types/node": own.devDependencies["@types/node"], typescript: own.devDependencies.typescript },
   };
   writeFileSync(join(dir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`);

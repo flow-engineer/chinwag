@@ -26,6 +26,7 @@ import { OBSERVE_URL } from "../../src/traces.ts";
 import { cloudHeaders, runInCloud, SessionStopped, type ConnectOptions } from "./client.ts";
 import { runPrinter } from "./print-run.ts";
 import { checkEndpointCli } from "./check-endpoint.ts";
+import { CHECK_LINE as TOOLS_CHECK_LINE, checkCli, mcpUpdateCli } from "./check.ts";
 import { httpAgent } from "./http-agent.ts";
 import { newStandalone, packageRoot } from "./new.ts";
 import { EXIT, finishedOutcome, loadEnv, networkCode, reportError, runVerdict, stoppedOutcome, type JsonReport, type Outcome, type ReportRun, type Verdict } from "./report.ts";
@@ -40,6 +41,10 @@ const TEST_LINE = `  chinwag test [options]    Run the agent's tests in a test c
 const CHECK_LINE = `  chinwag check-endpoint <url> [--token-env NAME] [--json]
                             Check an agent's HTTP endpoint against the contract, for --agent-url
                             (chinwag check-endpoint --help)`;
+const MCP_LINE = `  chinwag mcp update        Write the tools of the MCP servers the agent uses (mcpTools) to
+                            mcp.lock.json, from the agent's folder; commit it after the tests`;
+const CLI_LINE = `  chinwag cli --server <url> <command>
+                            Any MCP server's tools as commands (chinwag cli --server <url> --help)`;
 const NEW_USAGE = `Usage:\n${NEW_LINE}\n\n  -h, --help                Show this help`;
 const TEST_OPTIONS = `Options for test:
   --cloud <url>            The test cloud (default: CHINWAG_CLOUD, else https://flow.engineer/observe)
@@ -91,7 +96,7 @@ Environment (also read from the agent folder's .env, or --dotenv; variables alre
   OPENROUTER_API_KEY       The agent's model key, or OPENAI_API_KEY, ANTHROPIC_API_KEY or
                            GEMINI_API_KEY: the first with a value is used`;
 const TEST_USAGE = `Usage:\n${TEST_LINE}\n\n${TEST_OPTIONS}`;
-const USAGE = `Usage:\n${NEW_LINE}\n${TEST_LINE}\n${SHOW_LINE}\n${CHECK_LINE}\n  chinwag --version         Show the version\n\n${TEST_OPTIONS}`;
+const USAGE = `Usage:\n${NEW_LINE}\n${TEST_LINE}\n${SHOW_LINE}\n${CHECK_LINE}\n${TOOLS_CHECK_LINE}\n${MCP_LINE}\n${CLI_LINE}\n  chinwag --version         Show the version\n\n${TEST_OPTIONS}`;
 
 checkNode(process.versions.node);
 
@@ -101,6 +106,19 @@ if (process.argv[2] === "check-endpoint") {
   process.exit(await checkEndpointCli(process.argv.slice(3)));
 }
 if (process.argv[2] === "show") process.exit(await showCli(process.argv.slice(3)));
+if (process.argv[2] === "check") process.exit(await checkCli(process.argv.slice(3)));
+if (process.argv[2] === "mcp") {
+  if (process.argv[3] !== "update") {
+    console.error(MCP_LINE.trim());
+    process.exit(1);
+  }
+  process.exit(await mcpUpdateCli());
+}
+if (process.argv[2] === "cli") {
+  // Loaded only here: chinwag/cli needs @modelcontextprotocol/client, an optional peer.
+  const { defineCli, runCli } = await import("../../cli/src/index.ts");
+  process.exit(await runCli(defineCli({ name: "chinwag" }), process.argv.slice(3)));
+}
 
 const TEST_FLAGS = {
   cloud: { type: "string" },

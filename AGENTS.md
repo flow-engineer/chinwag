@@ -33,14 +33,36 @@ Telegram or a web or app chat, that feel like a person texting back.
   never in CI, and print what they cost.
 
 ## Coding-agent skills
-- `coding-agents/` teaches coding agents to build on Chinwag (`skill.md`), write tools and their
-  test files (`tools-skill.md`) and write tests (`test-skill.md`). A change to an API, a file
-  format or a convention they describe updates them in the same change.
+- `coding-agents/` teaches coding agents to build on Chinwag (`skill.md`, with MCP and the CLI),
+  write tools and their test files (`tools-skill.md`), write tests (`test-skill.md`), build the
+  context pack from an organization's codebase (`context-skill.md`) and set up sign-in
+  (`auth-skill.md`). A change to an API, a file format or a convention they describe updates them
+  in the same change.
 
 ## Model-facing text
-- Chinwag's own text for the model lives in `src/talk.ts`, `src/conversation.ts`, `src/skills.ts`,
+- Chinwag's own text for the model lives in `src/talk.ts`, `src/conversation.ts`, `src/skills.ts`
+  (also what an MCP host is told about the skills, and `read_skill`),
   and the built-in tools' descriptions and notes in `src/schedules.ts` and `src/nudges.ts`. Keep it
   short; every line costs every turn.
 - `testing/` is the developer's side of testing: the test file formats (`suite.ts`), and the CLI
   and protocol that send an agent's tests to the test cloud. The cloud plays the person and the
   tools and judges the runs; that runtime is not in this repository.
+
+## The surfaces Chinwag generates stay the team's own (hard rule, never broken)
+Chinwag turns an agent's tools and skills into other surfaces: an MCP server, a CLI, and those
+that follow. It sets a standard that is easy to reach, never a ceiling a team cannot pass. Teams
+have their own requirements, and each one must stay possible.
+- **Every generated piece can be overridden or replaced** by the team's own: a command's name,
+  arguments, output and help; an MCP tool's name, description, schema and result; auth; routes;
+  docs and skills. A default exists so a team writes nothing; it never stops a team writing
+  something else.
+- **Generated and hand-written live side by side.** A team can add commands, MCP tools or routes
+  Chinwag knows nothing about next to the generated ones, without leaving the framework.
+- **Nothing is locked inside Chinwag.** What a generated surface is built on (the protocol SDK, the
+  HTTP handler, the command parser) stays reachable, so a team that outgrows the defaults keeps
+  its agent and goes one level down.
+- **Overrides are plain code in the team's repository,** reviewed like the rest of it, checked by
+  `chinwag check` only for what is objectively wrong (a name a host refuses, a field that does not
+  exist), never for taste.
+- A change that removes a way to customize, or makes one harder, is refused, however much simpler
+  it makes Chinwag.

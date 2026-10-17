@@ -6,7 +6,9 @@ description: Write or change a Chinwag agent's tools and their test files (tests
 # Writing tools for a Chinwag agent
 
 Read the `chinwag` skill (`skill.md`) first if you haven't. Tests that use these tool files are
-in the `chinwag-tests` skill (`test-skill.md`).
+in the `chinwag-tests` skill (`test-skill.md`). For a company with an existing app or API, build
+the context pack first (the `chinwag-context` skill, `context-skill.md`) and write the tools from
+it.
 
 ## The tool
 
@@ -48,6 +50,77 @@ export const findSlots = tool({
 - Say what you covered. An agent reads a list as complete: return the range or filter you
   searched ("Mon Oct 12 through Sun Oct 18", "all open times") and never cut results short
   silently. If there are more, say so.
+
+## Tools from the context pack
+
+- One tool per task in `context/workflows.arazzo.yaml`, never one per endpoint: "place an order"
+  is one tool even when it is three API calls. A host or a small model chooses well among a few
+  task-shaped tools and badly among dozens of raw ones.
+- Take the input and output shapes from `context/openapi.yaml` with `context/overlay.yaml` applied,
+  the words and rules from `business.md`, and leave out the personal fields `data.md` marks unless
+  the task needs them.
+- `signIn` and `hints` come from `context/access.yaml` (below).
+- When the team sends a new spec, re-read the overlay and the workflows against it, change only the
+  tools whose operations changed, and run `chinwag check` and the tests.
+
+## The fields MCP and the CLI read
+
+The same tool is served to Claude and ChatGPT over MCP (`chinwag/mcp`) and as a command (`chinwag/cli`).
+These optional fields describe it there. **Chat ignores all of them**: they change nothing on
+WhatsApp, SMS or iMessage.
+
+```ts
+export const placeOrder = tool({
+  name: "place_order",
+  title: "Place an order",                         // default: "Place order", from the name
+  description: "Place a confirmed pickup order. Returns the order number and when it will be ready.",
+  input: z.object({ name: z.string(), items: z.array(item) }),
+  output: z.object({ order_id: z.string(), ready_by: z.string() }),  // the result's shape
+  status: { running: "Placing your order…", done: "Order placed" },  // at most 64 characters each
+  signIn: "required",                              // "required" (default) | "optional" | "none"
+  hints: { readOnly: false, destructive: false, idempotent: false, openWorld: false },
+  run: async (input, context) => pos.place(input, context.idempotencyKey),
+});
+```
+
+- `output`: over MCP the result is checked against it and sent as structured content, and the CLI
+  shows its fields with `--json` and `--fields`. Give it whenever the result has a fixed shape.
+- `signIn`: "none" for what anyone may do signed out (the menu, opening hours), "optional" for what
+  works either way and does more signed in, "required" (the default) for everything about a
+  person's own account. It applies only where sign-in is set up (the `chinwag-auth` skill).
+- `hints` describe the tool to hosts, which ask the person before risky calls; nothing enforces
+  them. `readOnly` (default false: a tool counts as a write), `destructive` (a write that may delete
+  or overwrite; default true for writes), `idempotent` (calling again with the same input changes
+  nothing more; default false), `openWorld` (reaches outside the business's own systems, such as the
+  web; default true). Set them honestly: a read-only tool should say so, or hosts treat it as a
+  write and the CLI asks for `--yes`.
+- `chinwag check` (from the agent's folder) refuses what cannot be served exactly: a name outside
+  1 to 128 of `A-Z a-z 0-9 _ - .`, an empty description, a description naming a chat-only tool
+  (`send_*`, `share_updates`, `load_skill`), an input that is not a `z.object`, an input or output
+  with no exact JSON Schema (`z.date()`, transforms; use an ISO string), `readOnly` with
+  `destructive`, or a status line over 64 characters.
+
+## Tools from another MCP server
+
+An existing MCP server's tools become the agent's own, so the agent uses them on WhatsApp or
+iMessage like any tool:
+
+```ts
+import { mcpTools } from "chinwag/mcp";
+
+export const tools = [
+  ...myTools,
+  ...(await mcpTools({ name: "todoist", url: "https://ai.todoist.net/mcp", headers: { authorization: `Bearer ${process.env.TODOIST_KEY}` } })),
+];
+```
+
+- They are pinned: `chinwag mcp update` (from the agent's folder) writes the server's tools to
+  `mcp.lock.json`, and only those are used. Commit it with the tests. A tool the server changes or
+  removes later is refused with a clear error until the lock is updated, tested and committed; a
+  tool it adds is not offered until then. `only: [...]` keeps a few of its tools, `prefix` keeps
+  two servers' names apart, and `live: true` skips the lock (for a server you do not build around).
+- Each needs a `tests/tools/<tool>.yaml` like any tool. A tool without `readOnlyHint` counts as a
+  write. Keep keys in the environment, never in the lock.
 
 ## The tool's test file
 

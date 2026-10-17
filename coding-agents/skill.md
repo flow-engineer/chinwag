@@ -1,6 +1,6 @@
 ---
 name: chinwag
-description: Build or change a chat agent on Chinwag (WhatsApp, SMS, iMessage, Telegram, web). Load when creating a Chinwag agent, editing its prompt or skills, wiring it into the playground, or when code imports chinwag. Also load the chinwag-tools skill (tools-skill.md) before writing tools and chinwag-tests (test-skill.md) before writing tests.
+description: Build or change a chat agent on Chinwag (WhatsApp, SMS, iMessage, Telegram, web), and serve its tools as an MCP server for Claude and ChatGPT or as a CLI. Load when creating a Chinwag agent, editing its prompt or skills, wiring it into the playground, adding MCP or a CLI, or when code imports chinwag. Also load the chinwag-tools skill (tools-skill.md) before writing tools and chinwag-tests (test-skill.md) before writing tests.
 ---
 
 # Building an agent on Chinwag
@@ -10,8 +10,10 @@ reply, acknowledges people fast, runs tools in parallel and waits for them, movi
 background only when the person writes again or it passes its limit.
 You write the agent's prompt, skills and tools; Chinwag handles the conversation.
 
-Two more skills go with this one: `chinwag-tools` (`tools-skill.md`) before writing or changing a
-tool, and `chinwag-tests` (`test-skill.md`) before writing or changing a test.
+More skills go with this one: `chinwag-tools` (`tools-skill.md`) before writing or changing a
+tool, `chinwag-tests` (`test-skill.md`) before writing or changing a test, `chinwag-context`
+(`context-skill.md`) before writing tools for a company that already has an app, API or database,
+and `chinwag-auth` (`auth-skill.md`) when tools need to know who the person is.
 
 ## Start a new agent
 
@@ -41,6 +43,10 @@ my-agent/
   src/tools.ts                 the agent's tools (see tools-skill.md)
   src/agent.ts                 buildAgent(): the one place the agent is built
   src/main.ts                  runs it in the playground
+  src/mcp.ts                   optional: the tools as an MCP server (below)
+  src/cli.ts                   optional: the CLI file, for the organization's command line (below)
+  context/                     optional: the context pack the tools are written from (context-skill.md)
+  mcp.lock.json                optional: the tools of other MCP servers the agent uses (tools-skill.md)
   tests/tools/*.yaml           how each tool behaves in tests (see tools-skill.md)
   tests/scenarios/*.yaml       the tests (see test-skill.md)
 ```
@@ -319,3 +325,95 @@ touches a chat; call `await agent.flushTraces()` before the process exits. Tests
 `node --test` never send from the environment. Under `chinwag test` the traces say they are a test's
 (`chinwag.run_kind` is "test", else "production", and each turn names the test session as
 `chinwag.test.session`), so the dashboard keeps them apart from real conversations.
+
+## Serve the tools over MCP
+
+The same tools and skills go to Claude, ChatGPT and any MCP host as an MCP server. Install the
+SDK it runs on (`npm i @modelcontextprotocol/server@2.3.1`, the version Chinwag pins) and add
+`src/mcp.ts`:
+
+```ts
+import { createServer } from "node:http";
+import { fileURLToPath } from "node:url";
+import { mcpServer } from "chinwag/mcp";
+import { tools } from "./tools.ts";
+
+export const mcp = mcpServer({
+  name: "acme",
+  version: "1.0.0",
+  tools,
+  dir: fileURLToPath(new URL("../agent", import.meta.url)),   // its skills; AGENTS.md is not sent
+  // auth: { issuer, resource, scopes, verify }               // sign-in: the chinwag-auth skill
+});
+createServer((req, res) => void mcp.node(req, res)).listen(8790);   // Streamable HTTP at /mcp
+```
+
+- `mcp.fetch(request)` serves a web-standard `Request` instead (Cloudflare Workers, Deno, Bun), so
+  it mounts beside the chat agent in one process or runs on its own: it needs no model, channels
+  or store.
+- Hosts get the skills as the server's instructions (each one's description) and read one with the
+  `read_skill` tool. A skill that tells the chat agent to use `send_*` or `share_updates` makes
+  no sense to a host: `chinwag check` warns about it.
+- Every part can be changed: `instructions` replaces the instructions, `descriptor(tool, generated)`
+  changes any tool's MCP descriptor, `extend(server)` adds handlers of your own (resources,
+  prompts) to the SDK's server, `path` moves the endpoint, `allowedHosts` checks the Host header.
+- Try it locally with `claude mcp add --transport http acme http://localhost:8790/mcp`.
+- Run `npx chinwag check` from the agent's folder before serving: it refuses tools that cannot be
+  described exactly (the `chinwag-tools` skill lists the rules).
+
+## A CLI for the organization
+
+The same tools as commands, over the organization's MCP server, with the same sign-in and gating.
+It runs on Stricli (`@stricli/core`, the framework Sentry's CLI is built on). Every tool is already a
+command under its own name (`place_order` is `acme place-order`); a CLI file adds what needs
+judgement. Install `@modelcontextprotocol/client@2.3.1` and `@stricli/core@1.3.0` (the versions
+Chinwag pins) and write `src/cli.ts`:
+
+```ts
+#!/usr/bin/env node
+import { fileURLToPath } from "node:url";
+import { defineCli, runCli } from "chinwag/cli";
+
+export const cli = defineCli({
+  name: "acme",
+  server: process.env.ACME_SERVER ?? "https://acme.example.com/mcp",
+  description: "Acme's orders and customers",
+  groups: { order: "Place and track orders" },
+  commands: {
+    "order list": { tool: "list_orders", columns: ["order_id", "status", "total"], alias: "orders" },
+    "order view": { tool: "get_order", args: ["order_id"], examples: ["acme order view BL-1042 --json"] },
+    "order place": { tool: "place_order" },
+  },
+});
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) process.exit(await runCli(cli, process.argv.slice(2)));
+```
+
+- Words are groups then a verb: `order` is a **command group**, `list`, `view` and `place` its
+  subcommands. `acme order` and `acme order -h` list the group's subcommands, `acme order place -h`
+  that command's flags and examples, and `acme -h` the groups and top-level commands. A word is a
+  group or a command, never both. `groups` gives each group its line in help.
+- `args` are the input fields taken as positional arguments, `columns` a list's table, `view` one
+  record's fields, `alias` another name, `examples` lines for help. Every other input field is a
+  flag (`order_id` is `--order-id`); a list is a repeatable or comma-separated flag; an object or a
+  list of objects takes JSON, or `@file.json`, and its help shows the shape
+  (`JSON list of {item, size, milk?}`).
+- A command of the team's own is any Stricli command: `"report daily": { command: buildCommand({ ... }) }`
+  with `buildCommand` from `@stricli/core`; inside it, `this.cli.call(tool, input)` calls the server's
+  tools and `this.cli.print(value, { json })` prints like the rest.
+- Installed, it is the organization's own command: `"bin": { "acme": "src/cli.ts" }` in its package
+  (node runs `.ts` files outside `node_modules`; publish a compiled `.js` bin to npm). While building
+  it, run it with `npm run cli -- order -h`: npm takes flags before `--` as its own.
+- Every tool command takes `--json` and `--fields a,b`; one that changes things takes `--dry-run`; one
+  that may delete or overwrite asks first in a terminal and needs `--yes` without one. Exit codes: 0
+  done, 1 the tool failed, 2 wrong command or arguments (with the help to read), 3 sign-in needed, 4
+  needs `--yes`, 5 the server could not be reached. `--server <url>` and `--token <token>` work on
+  every command. `acme auth login` signs in on the organization's own login (tokens in
+  `~/.config/acme/`, mode 600), `ACME_TOKEN` is for CI, `acme tools` lists every tool and schema, and
+  `acme skill --write ~/.claude/skills` installs the CLI's SKILL.md, made from the tools and the CLI
+  file, for coding agents. For any MCP server without a CLI file, `npx chinwag cli --server <url> -h`.
+- `npx chinwag check` checks the CLI file against the tools: a command naming a tool that does not
+  exist, an `args` field the input lacks, a `columns` or `view` field the output lacks, two commands
+  with one name, a word that is both a command and a group, or one of the CLI's own words (`auth`,
+  `tools`, `skill`) is an error; a tool no command names is a warning (it keeps its own name).
+

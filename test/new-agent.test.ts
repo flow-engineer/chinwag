@@ -25,18 +25,24 @@ test("chinwag new makes an agent of its own: chinwag imports, a package on this 
   const main = readFileSync(join(dir, "src", "main.ts"), "utf8");
   assert.match(main, /from "chinwag\/simulators"/);
   assert.match(readFileSync(join(dir, "src", "agent.ts"), "utf8"), /from "chinwag"/);
+  assert.match(readFileSync(join(dir, "src", "mcp.ts"), "utf8"), /from "chinwag\/mcp"/);
+  const cli = readFileSync(join(dir, "src", "cli.ts"), "utf8");
+  assert.match(cli, /from "chinwag\/cli"/);
+  assert.match(cli, /name: "my-agent"/, "the CLI is named after the agent");
   assert.doesNotMatch(main + readFileSync(join(dir, "src", "tools.ts"), "utf8"), /\.\.\/\.\.\//);
   const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
   const own = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(pkg.name, "my-agent");
   assert.equal(pkg.dependencies.chinwag, `^${own.version}`);
+  assert.equal(pkg.dependencies["@modelcontextprotocol/server"], own.peerDependencies["@modelcontextprotocol/server"], "the MCP SDK at the version chinwag pins");
   assert.equal(pkg.scripts.test, "chinwag test");
+  assert.deepEqual(pkg.bin, { "my-agent": "src/cli.ts" }, "installed, the CLI is a command of its own");
   assert.equal(pkg.engines.node, own.engines.node);
   assert.equal(readFileSync(join(dir, ".npmrc"), "utf8"), "engine-strict=true\n");
   // The key and each test session's results (.chinwag/last-session.json) stay out of git.
   assert.deepEqual(readFileSync(join(dir, ".gitignore"), "utf8").split("\n").filter(Boolean), ["node_modules/", ".env", ".chinwag/"]);
   assert.equal(JSON.parse(readFileSync(join(dir, "tsconfig.json"), "utf8")).extends, undefined);
-  for (const skill of ["chinwag", "chinwag-tools", "chinwag-tests"]) assert.ok(existsSync(join(dir, ".claude", "skills", skill, "SKILL.md")), skill);
+  for (const skill of ["chinwag", "chinwag-tools", "chinwag-tests", "chinwag-context", "chinwag-auth"]) assert.ok(existsSync(join(dir, ".claude", "skills", skill, "SKILL.md")), skill);
   assert.equal(readFileSync(join(dir, "CLAUDE.md"), "utf8"), "@AGENTS.md\n");
   assert.ok(existsSync(join(dir, "tests", "scenarios")));
   const env = readFileSync(join(dir, ".env.example"), "utf8");

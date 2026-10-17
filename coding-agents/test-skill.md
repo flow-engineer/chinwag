@@ -5,7 +5,9 @@ description: Write or change tests for a Chinwag agent (tests/scenarios/*.yaml).
 
 # Writing tests for a Chinwag agent
 
-Read the `chinwag` skill (`skill.md`) first if you haven't.
+Read the `chinwag` skill (`skill.md`) first if you haven't. Turn the situations in
+`context/examples/` (the `chinwag-context` skill) into scenarios, and run `npx chinwag check`
+before the tests when the agent serves MCP or a CLI.
 
 A test is a scenario: a situation to put the agent in, played through a platform simulator by a
 model acting as the person, with the agent's tools played by a model from `tests/tools/*.yaml`

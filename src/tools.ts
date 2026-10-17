@@ -36,6 +36,34 @@ export interface Tool<Input = any> {
   run(input: Input, context: ToolContext): Promise<unknown> | unknown;
   /** The longest the reply waits for this tool before it moves to the background (default: the agent's, 60 s). */
   deadlineMs?: number;
+  // The fields below describe the tool to the other surfaces (MCP, the CLI). Chat ignores them all.
+  /** A name for people ("Place an order"); derived from `name` when absent. */
+  title?: string;
+  /** The result's shape. Over MCP the result is checked against it and sent as structured content too. */
+  output?: z.ZodType;
+  /** Short lines a host shows while the tool runs and once it is done (at most 64 characters each). */
+  status?: { running?: string; done?: string };
+  /**
+   * Whether the person must be signed in. "required" (the default) refuses a call without sign-in,
+   * "optional" runs either way, "none" never needs it. It applies only where sign-in is set up (an
+   * MCP server with `auth`); everywhere else every tool runs.
+   */
+  signIn?: SignIn;
+  /** How the tool behaves, for hosts to decide what to ask the person first. Nothing enforces them. */
+  hints?: ToolHints;
+}
+
+export type SignIn = "required" | "optional" | "none";
+
+export interface ToolHints {
+  /** It changes nothing (default false: a tool counts as a write). */
+  readOnly?: boolean;
+  /** A write that may delete or overwrite (default true for writes; always false for reads). */
+  destructive?: boolean;
+  /** Calling it again with the same input changes nothing more (default false). */
+  idempotent?: boolean;
+  /** It reaches things outside the business's own systems, such as the web (default true). */
+  openWorld?: boolean;
 }
 
 /**
@@ -48,8 +76,15 @@ export function tool<Input>(definition: Tool<Input>): Tool<Input> {
   return definition;
 }
 
+/**
+ * Marks a tool whose input schema is given as JSON Schema (a tool another MCP server defines): the
+ * model is shown that schema exactly, not one rebuilt from the zod that validates it.
+ */
+export const INPUT_SCHEMA = Symbol("chinwag.inputSchema");
+
 export function toSpec(t: Tool): ToolSpec {
-  const { $schema: _ignored, ...parameters } = z.toJSONSchema(t.input) as Record<string, unknown>;
+  const given = (t as { [INPUT_SCHEMA]?: Record<string, unknown> })[INPUT_SCHEMA];
+  const { $schema: _ignored, ...parameters } = given ?? (z.toJSONSchema(t.input) as Record<string, unknown>);
   return { name: t.name, description: t.description, parameters };
 }
 

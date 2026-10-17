@@ -492,6 +492,43 @@ It sends a fixed set of synthetic messages (a typed message, a double text, a ph
 
 The café's agent as an HTTP endpoint, with its two tools and one model through any OpenAI-compatible API (the same key variables as `openAICompatible`, `MODEL` for the model; `FAKE_MODEL=1` for a fixed reply and no model call): [`examples/http-agent-python`](examples/http-agent-python) (standard library only) and [`examples/http-agent-go`](examples/http-agent-go) (standard library only).
 
+## The same tools in Claude, ChatGPT and a CLI
+
+The tools and skills you write for the chat agent are also an MCP server, so people use them from
+Claude, ChatGPT or any MCP host, and a command line for your organization. Each needs the official
+MCP SDK, an optional peer installed only when you use it.
+
+```ts
+import { mcpServer } from "chinwag/mcp";            // npm i @modelcontextprotocol/server@2.3.1
+
+const mcp = mcpServer({ name: "cafe", version: "1.0.0", tools, dir: "agent" });
+createServer((req, res) => void mcp.node(req, res)).listen(8790);   // Streamable HTTP at /mcp
+```
+
+- Every tool becomes an MCP tool with every field filled from the tool: `title`, `output` (sent as
+  structured content), `status` lines, and `hints` (`readOnly`, `destructive`, `idempotent`,
+  `openWorld`) as MCP annotations. Chat ignores all of these. Skills go as the server's
+  instructions and a `read_skill` tool.
+- Sign-in is the host's OAuth against your own authorization server: `auth: { issuer, scopes,
+  verify }`, with `signIn: "required" | "optional" | "none"` per tool. A call that needs sign-in gets
+  HTTP 401 and the host's sign-in prompt; the person is `context.key` in the tool.
+- Another MCP server's tools become your agent's with `mcpTools({ name, url })`, pinned to
+  `mcp.lock.json` (`npx chinwag mcp update`), so a change on that server never reaches your
+  customers before your tests do.
+- `chinwag/cli` makes your organization's command line from the same server, on Stricli (the
+  framework Sentry's CLI uses): every tool is a command, a `defineCli` file adds command groups
+  (`acme order -h` lists `place`, `status`), arguments and columns, and every command takes `--json`,
+  `--fields`, `--dry-run` and `--yes`. `npx chinwag cli --server <url> -h` works for any MCP server.
+- `npx chinwag check` checks it all by rule before you ship: tools that cannot be described
+  exactly, a CLI file that no longer matches the tools, skills that name chat-only tools.
+- Every generated piece can be replaced: the instructions, any tool's descriptor, your own MCP
+  handlers (`extend`), your own commands.
+
+The coding-agent skills in [`coding-agents/`](https://github.com/flow-engineer/chinwag/tree/main/coding-agents)
+cover it end to end: `context-skill.md` builds the context the tools are written from (OpenAPI,
+workflows, business rules, access) out of your existing codebase, and `auth-skill.md` sets up
+sign-in for your stack (an OAuth provider, Firebase, Supabase, your own login page).
+
 ## Models
 
 Any OpenAI-compatible API. With no `apiKey` or `baseURL`, `openAICompatible` uses the first key that has a value: `OPENROUTER_API_KEY` (OpenRouter), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), then `GEMINI_API_KEY` (Gemini); with none it stops at once and names them. `MODEL` sets the model id; each key has its own default. Pass `baseURL` and `apiKey` for any other address; a local server that needs no key needs only `baseURL`. Give `contextTokens` (the model's window) and a long chat's history is kept within it: the latest messages go to every call, older ones are left out (the agent is told).
@@ -544,6 +581,8 @@ For agents with tools we recommend **Claude Haiku 5.5** (`anthropic/claude-haiku
 | `src/` | The runtime (`chinwag`) |
 | `simulators/` | The playground (`chinwag/simulators`): SMS, WhatsApp, iMessage, Telegram and web, with each platform's rules |
 | `testing/` | Test file formats and the `chinwag` command (`chinwag/testing`) |
+| `mcp/` | Tools and skills as an MCP server, and other MCP servers' tools (`chinwag/mcp`) |
+| `cli/` | An organization's command line over its MCP server (`chinwag/cli`) |
 | `examples/cafe/` | Pip, an ordering assistant, with tests |
 | `coding-agents/` | Skills for coding agents |
 

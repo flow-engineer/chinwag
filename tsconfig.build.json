@@ -11,6 +11,8 @@
   "include": [
     "src",
     "simulators/src",
+    "mcp/src",
+    "cli/src",
     "testing/src/index.ts",
     "testing/src/client.ts",
     "testing/src/http-agent.ts",

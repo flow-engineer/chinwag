@@ -58,6 +58,29 @@ export function loadInstructions(files: AgentFiles, skills: Skill[], inline = fa
   return `${base}\n\n## Skills\nLoad a skill with load_skill before doing what it covers; call it together with the first other tool you need, not on its own.\n${list}`;
 }
 
+/** What an MCP server tells a host about its skills when it connects (chinwag/mcp). */
+export function mcpInstructions(skills: Skill[]): string | undefined {
+  if (!skills.length) return undefined;
+  const list = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
+  return `This server's skills are rules for one kind of request each. Read a skill with read_skill before doing what it covers.\n${list}`;
+}
+
+/** The MCP server's way to read a skill: a tool, since every host calls tools. */
+export function readSkillTool(skills: Skill[]): Tool {
+  const names = skills.map((s) => s.name);
+  return tool({
+    name: "read_skill",
+    title: "Read a skill",
+    description: "Read one of this server's skills in full. Read it before doing what its description covers.",
+    input: z.object({ name: z.enum(names as [string, ...string[]]) }),
+    signIn: "none",
+    hints: { readOnly: true, openWorld: false },
+    run({ name }) {
+      return skills.find((s) => s.name === name)?.body ?? `No skill named ${name}.`;
+    },
+  });
+}
+
 export function skillTool(skills: Skill[], onLoad: (conversationId: string, name: string) => void): Tool {
   const names = skills.map((s) => s.name);
   return tool({
